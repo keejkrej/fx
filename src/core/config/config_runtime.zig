@@ -1339,7 +1339,7 @@ fn parseProfileOnlyFields(
 
     if (root.object.get("provider")) |provider_value| {
         if (provider_value != .string) return error.InvalidProviderType;
-        settings.provider = model_backend.parse(provider_value.string) orelse return error.InvalidProvider;
+        settings.provider = model_backend.parse(provider_value.string);
     }
 
     if (root.object.get("openai_compatible")) |openai_value| {

@@ -14,9 +14,6 @@ pub const mcp_credentials_dir_name = "mcp-credentials";
 pub const mcp_credentials_file_name = "credentials.json";
 pub const providers_dir_name = "providers";
 pub const openai_compatible_dir_name = "openai_compatible";
-pub const chatgpt_dir_name = "chatgpt";
-pub const grok_dir_name = "grok";
-pub const cursor_dir_name = "cursor";
 pub const init_lua_name = "init.lua";
 pub const lua_dir_name = "lua";
 pub const pack_dir_name = "pack";
@@ -114,63 +111,6 @@ pub fn openaiCompatibleApiKeyPath(alloc: Allocator, home: []const u8) ![]u8 {
         providers_dir_name,
         openai_compatible_dir_name,
         api_key_file_name,
-    });
-}
-
-pub fn chatgptDir(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{
-        home,
-        root_dir_name,
-        providers_dir_name,
-        chatgpt_dir_name,
-    });
-}
-
-pub fn chatgptAuthPath(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{
-        home,
-        root_dir_name,
-        providers_dir_name,
-        chatgpt_dir_name,
-        auth_file_name,
-    });
-}
-
-pub fn grokDir(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{
-        home,
-        root_dir_name,
-        providers_dir_name,
-        grok_dir_name,
-    });
-}
-
-pub fn grokAuthPath(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{
-        home,
-        root_dir_name,
-        providers_dir_name,
-        grok_dir_name,
-        auth_file_name,
-    });
-}
-
-pub fn cursorDir(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{
-        home,
-        root_dir_name,
-        providers_dir_name,
-        cursor_dir_name,
-    });
-}
-
-pub fn cursorAuthPath(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{
-        home,
-        root_dir_name,
-        providers_dir_name,
-        cursor_dir_name,
-        auth_file_name,
     });
 }
 
@@ -279,48 +219,6 @@ test "profile path helpers preserve current default locations" {
     try std.testing.expectEqualStrings(
         "/tmp/fake-home/.fx/providers/openai_compatible/api-key",
         openai_key,
-    );
-
-    const chatgpt_dir = try chatgptDir(alloc, "/tmp/fake-home");
-    defer alloc.free(chatgpt_dir);
-    try std.testing.expectEqualStrings(
-        "/tmp/fake-home/.fx/providers/chatgpt",
-        chatgpt_dir,
-    );
-
-    const chatgpt_auth = try chatgptAuthPath(alloc, "/tmp/fake-home");
-    defer alloc.free(chatgpt_auth);
-    try std.testing.expectEqualStrings(
-        "/tmp/fake-home/.fx/providers/chatgpt/auth.json",
-        chatgpt_auth,
-    );
-
-    const grok_dir = try grokDir(alloc, "/tmp/fake-home");
-    defer alloc.free(grok_dir);
-    try std.testing.expectEqualStrings(
-        "/tmp/fake-home/.fx/providers/grok",
-        grok_dir,
-    );
-
-    const grok_auth = try grokAuthPath(alloc, "/tmp/fake-home");
-    defer alloc.free(grok_auth);
-    try std.testing.expectEqualStrings(
-        "/tmp/fake-home/.fx/providers/grok/auth.json",
-        grok_auth,
-    );
-
-    const cursor_dir = try cursorDir(alloc, "/tmp/fake-home");
-    defer alloc.free(cursor_dir);
-    try std.testing.expectEqualStrings(
-        "/tmp/fake-home/.fx/providers/cursor",
-        cursor_dir,
-    );
-
-    const cursor_auth = try cursorAuthPath(alloc, "/tmp/fake-home");
-    defer alloc.free(cursor_auth);
-    try std.testing.expectEqualStrings(
-        "/tmp/fake-home/.fx/providers/cursor/auth.json",
-        cursor_auth,
     );
 
     const init_lua = try initLuaPath(alloc, "/tmp/fake-home");

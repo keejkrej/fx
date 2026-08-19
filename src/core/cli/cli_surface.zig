@@ -25,10 +25,6 @@ const oauth_transport = @import("../auth/oauth_transport.zig");
 const secret = @import("../auth/secret.zig");
 const providers_config = @import("../providers/config.zig");
 const openai_secret = @import("../providers/openai_secret.zig");
-const chatgpt_auth = @import("../providers/chatgpt_auth.zig");
-const grok_auth = @import("../providers/grok_auth.zig");
-const cursor_auth = @import("../providers/cursor_auth.zig");
-const model_backend = @import("../providers/model_backend.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
@@ -731,155 +727,50 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
-            const target = parseLoginTargetArgs(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|chatgpt|grok|cursor]\n");
+            if (rest.len != 0) {
+                try writeStderr(deps, "usage: fx login\n");
+                return .handled_failure;
+            }
+            login_flow.runLogin(
+                alloc,
+                cfg.gateway_provider.oauth_transport,
+                cfg.url_opener,
+            ) catch |err| {
+                const message = switch (err) {
+                    error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
+                    error.AccessDenied => "fx login: authorization denied\n",
+                    error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
+                    else => "fx login: failed to sign in\n",
+                };
+                try writeStderr(deps, message);
                 return .handled_failure;
             };
-            switch (target) {
-                .vercel => {
-                    login_flow.runLogin(
-                        alloc,
-                        cfg.gateway_provider.oauth_transport,
-                        cfg.url_opener,
-                    ) catch |err| {
-                        const message = switch (err) {
-                            error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
-                            error.AccessDenied => "fx login: authorization denied\n",
-                            error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
-                            else => "fx login: failed to sign in\n",
-                        };
-                        try writeStderr(deps, message);
-                        return .handled_failure;
-                    };
-                    return .handled_success;
-                },
-                .chatgpt => {
-                    chatgpt_auth.runLogin(alloc, .{
-                        .url_opener = cfg.url_opener,
-                    }) catch |err| {
-                        const message = switch (err) {
-                            error.AccessDenied => "fx login chatgpt: authorization denied\n",
-                            error.Cancelled => "fx login chatgpt: authorization cancelled\n",
-                            error.LoopbackUnavailable => "fx login chatgpt: could not bind the local callback port\n",
-                            error.InteractiveAuthorizationUnsupported => "fx login chatgpt: interactive ChatGPT login is unavailable in this runtime\n",
-                            else => "fx login chatgpt: failed to sign in\n",
-                        };
-                        try writeStderr(deps, message);
-                        return .handled_failure;
-                    };
-                    try persistProvider(alloc, deps, .chatgpt);
-                    return .handled_success;
-                },
-                .grok => {
-                    grok_auth.runLogin(alloc, .{
-                        .url_opener = cfg.url_opener,
-                    }) catch |err| {
-                        const message = switch (err) {
-                            error.AccessDenied => "fx login grok: authorization denied\n",
-                            error.Cancelled => "fx login grok: authorization cancelled\n",
-                            error.LoginTimedOut, error.ExpiredToken => "fx login grok: authorization expired; run fx login grok again\n",
-                            error.InteractiveAuthorizationUnsupported => "fx login grok: interactive Grok login is unavailable in this runtime\n",
-                            else => "fx login grok: failed to sign in\n",
-                        };
-                        try writeStderr(deps, message);
-                        return .handled_failure;
-                    };
-                    try persistProvider(alloc, deps, .grok);
-                    return .handled_success;
-                },
-                .cursor => {
-                    cursor_auth.runLogin(alloc, .{
-                        .url_opener = cfg.url_opener,
-                    }) catch |err| {
-                        const message = switch (err) {
-                            error.AccessDenied => "fx login cursor: authorization denied\n",
-                            error.Cancelled => "fx login cursor: authorization cancelled\n",
-                            error.LoopbackUnavailable => "fx login cursor: could not bind the local callback port\n",
-                            error.InteractiveAuthorizationUnsupported => "fx login cursor: interactive Cursor login is unavailable in this runtime\n",
-                            error.AuthorizationFailed => "fx login cursor: failed to sign in\n",
-                            else => "fx login cursor: failed to sign in\n",
-                        };
-                        try writeStderr(deps, message);
-                        return .handled_failure;
-                    };
-                    try persistProvider(alloc, deps, .cursor);
-                    return .handled_success;
-                },
-            }
+            return .handled_success;
         },
         .logout => |rest| {
-            const target = parseLoginTargetArgs(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|chatgpt|grok|cursor]\n");
+            if (rest.len != 0) {
+                try writeStderr(deps, "usage: fx logout\n");
                 return .handled_failure;
-            };
-            switch (target) {
-                .vercel => {
-                    const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
-                        error.SessionDeleteFailed => {
-                            try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
-                            return .handled_failure;
-                        },
-                    };
-                    if (result.local_durability_failed) {
-                        try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
-                    } else {
-                        try writeStdout(
-                            deps,
-                            if (result.session_deleted) "Signed out of fx.\n" else "No fx login session found.\n",
-                        );
-                    }
-                    if (result.remote_revocation_failed) {
-                        try writeStderr(deps, login_flow.remote_revocation_warning);
-                        try writeStderr(deps, "\n");
-                    }
-                    return if (result.local_durability_failed) .handled_failure else .handled_success;
-                },
-                .chatgpt => {
-                    const result = chatgpt_auth.logout(alloc) catch {
-                        try writeStderr(deps, "fx logout chatgpt: failed to durably remove the ChatGPT session\n");
-                        return .handled_failure;
-                    };
-                    if (result.local_durability_failed) {
-                        try writeStderr(deps, "fx logout chatgpt: failed to durably remove the ChatGPT session\n");
-                        return .handled_failure;
-                    }
-                    try writeStdout(
-                        deps,
-                        if (result.session_deleted) "Signed out of ChatGPT.\n" else "No ChatGPT session found.\n",
-                    );
-                    return .handled_success;
-                },
-                .grok => {
-                    const result = grok_auth.logout(alloc) catch {
-                        try writeStderr(deps, "fx logout grok: failed to durably remove the Grok session\n");
-                        return .handled_failure;
-                    };
-                    if (result.local_durability_failed) {
-                        try writeStderr(deps, "fx logout grok: failed to durably remove the Grok session\n");
-                        return .handled_failure;
-                    }
-                    try writeStdout(
-                        deps,
-                        if (result.session_deleted) "Signed out of Grok.\n" else "No Grok session found.\n",
-                    );
-                    return .handled_success;
-                },
-                .cursor => {
-                    const result = cursor_auth.logout(alloc) catch {
-                        try writeStderr(deps, "fx logout cursor: failed to durably remove the Cursor session\n");
-                        return .handled_failure;
-                    };
-                    if (result.local_durability_failed) {
-                        try writeStderr(deps, "fx logout cursor: failed to durably remove the Cursor session\n");
-                        return .handled_failure;
-                    }
-                    try writeStdout(
-                        deps,
-                        if (result.session_deleted) "Signed out of Cursor.\n" else "No Cursor session found.\n",
-                    );
-                    return .handled_success;
-                },
             }
+            const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
+                error.SessionDeleteFailed => {
+                    try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
+                    return .handled_failure;
+                },
+            };
+            if (result.local_durability_failed) {
+                try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
+            } else {
+                try writeStdout(
+                    deps,
+                    if (result.session_deleted) "Signed out of fx.\n" else "No fx login session found.\n",
+                );
+            }
+            if (result.remote_revocation_failed) {
+                try writeStderr(deps, login_flow.remote_revocation_warning);
+                try writeStderr(deps, "\n");
+            }
+            return if (result.local_durability_failed) .handled_failure else .handled_success;
         },
         .teams => |rest| {
             if (rest.len != 0) {
@@ -901,66 +792,11 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .setup => |rest| {
-            if (rest.len == 1 and std.mem.eql(u8, rest[0], "openai-compatible")) {
-                return if (try runOpenaiCompatibleSetup(alloc, deps)) .handled_success else .handled_failure;
+            if (rest.len == 0 or (rest.len == 1 and std.mem.eql(u8, rest[0], "openai-compatible"))) {
+                return if (try runOpenaiCompatibleSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
             }
-            if (rest.len == 1 and std.mem.eql(u8, rest[0], "chatgpt")) {
-                chatgpt_auth.runLogin(alloc, .{
-                    .url_opener = cfg.url_opener,
-                }) catch |err| {
-                    const message = switch (err) {
-                        error.AccessDenied => "fx setup chatgpt: authorization denied\n",
-                        error.Cancelled => "fx setup chatgpt: authorization cancelled\n",
-                        error.LoopbackUnavailable => "fx setup chatgpt: could not bind the local callback port\n",
-                        error.InteractiveAuthorizationUnsupported => "fx setup chatgpt: interactive ChatGPT login is unavailable in this runtime\n",
-                        else => "fx setup chatgpt: failed to sign in\n",
-                    };
-                    try writeStderr(deps, message);
-                    return .handled_failure;
-                };
-                try persistProvider(alloc, deps, .chatgpt);
-                return .handled_success;
-            }
-            if (rest.len == 1 and std.mem.eql(u8, rest[0], "grok")) {
-                grok_auth.runLogin(alloc, .{
-                    .url_opener = cfg.url_opener,
-                }) catch |err| {
-                    const message = switch (err) {
-                        error.AccessDenied => "fx setup grok: authorization denied\n",
-                        error.Cancelled => "fx setup grok: authorization cancelled\n",
-                        error.LoginTimedOut, error.ExpiredToken => "fx setup grok: authorization expired; run fx setup grok again\n",
-                        error.InteractiveAuthorizationUnsupported => "fx setup grok: interactive Grok login is unavailable in this runtime\n",
-                        else => "fx setup grok: failed to sign in\n",
-                    };
-                    try writeStderr(deps, message);
-                    return .handled_failure;
-                };
-                try persistProvider(alloc, deps, .grok);
-                return .handled_success;
-            }
-            if (rest.len == 1 and std.mem.eql(u8, rest[0], "cursor")) {
-                cursor_auth.runLogin(alloc, .{
-                    .url_opener = cfg.url_opener,
-                }) catch |err| {
-                    const message = switch (err) {
-                        error.AccessDenied => "fx setup cursor: authorization denied\n",
-                        error.Cancelled => "fx setup cursor: authorization cancelled\n",
-                        error.LoopbackUnavailable => "fx setup cursor: could not bind the local callback port\n",
-                        error.InteractiveAuthorizationUnsupported => "fx setup cursor: interactive Cursor login is unavailable in this runtime\n",
-                        error.AuthorizationFailed => "fx setup cursor: failed to sign in\n",
-                        else => "fx setup cursor: failed to sign in\n",
-                    };
-                    try writeStderr(deps, message);
-                    return .handled_failure;
-                };
-                try persistProvider(alloc, deps, .cursor);
-                return .handled_success;
-            }
-            if (rest.len != 0) {
-                try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
-                return .handled_failure;
-            }
-            return if (try runPasteSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
+            try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
+            return .handled_failure;
         },
         .status => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
@@ -1634,22 +1470,6 @@ fn runGithubWorkflow(
     return .handled_success;
 }
 
-fn parseLoginTargetArgs(rest: []const [:0]const u8) !model_backend.LoginTarget {
-    if (rest.len == 0) return .vercel;
-    if (rest.len != 1) return error.InvalidLoginTarget;
-    return model_backend.parseLoginTarget(rest[0]) orelse error.InvalidLoginTarget;
-}
-
-fn persistProvider(alloc: Allocator, deps: RunDeps, backend: model_backend.ModelBackend) !void {
-    var outcome = config_runtime.attemptUserPreferences(alloc, .{ .provider = backend });
-    defer outcome.deinit(alloc);
-    providers_config.invalidateRemembered();
-    switch (outcome) {
-        .failure => try writeStderr(deps, "Signed in, but fx could not persist the provider in ~/.fx/settings.json.\n"),
-        .outcome => {},
-    }
-}
-
 fn writeStdout(deps: RunDeps, text: []const u8) !void {
     try deps.write_stdout(deps.stdout_ctx, text);
 }
@@ -1707,8 +1527,13 @@ fn runPasteSetup(
 
 fn runOpenaiCompatibleSetup(
     alloc: Allocator,
+    secret_store: host.SecretStore,
     deps: RunDeps,
 ) !bool {
+    if (secret_store.isDisabled()) {
+        try writeStderr(deps, "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n");
+        return false;
+    }
     if (!deps.setup_terminal_available(deps.setup_ctx)) {
         try writeStderr(deps, "fx setup: an interactive terminal is required to configure an OpenAI-compatible backend\n");
         return false;
@@ -3442,18 +3267,6 @@ test "parse recognizes every top-level command and preserves unknown commands" {
         .setup => |rest| try std.testing.expectEqualStrings("openai-compatible", rest[0]),
         else => return error.TestExpectedEqual,
     }
-    switch (parse(command_catalog, &.{ @constCast("login"), @constCast("chatgpt") })) {
-        .login => |rest| try std.testing.expectEqualStrings("chatgpt", rest[0]),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("login"), @constCast("grok") })) {
-        .login => |rest| try std.testing.expectEqualStrings("grok", rest[0]),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("login"), @constCast("cursor") })) {
-        .login => |rest| try std.testing.expectEqualStrings("cursor", rest[0]),
-        else => return error.TestExpectedEqual,
-    }
     switch (parse(command_catalog, &.{@constCast("login")})) {
         .login => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
         else => return error.TestExpectedEqual,
@@ -4229,7 +4042,7 @@ test "runIfRequested version flags reject extra args" {
     }
 }
 
-test "setup is a paste-only stored-key adapter" {
+test "setup rejects extra unknown tokens" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
     var cfg = testConfig();
@@ -4237,38 +4050,14 @@ test "setup is a paste-only stored-key adapter" {
 
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
-        &.{@constCast("setup")},
+        &.{ @constCast("setup"), @constCast("chatgpt") },
         cfg,
         capture.deps(),
     );
 
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expectEqual(@as(usize, 1), capture.setup_store_calls);
-    try std.testing.expectEqual(@as(usize, 1), capture.setup_read_calls);
-    try std.testing.expect(capture.setup_value_matched);
-    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "Paste AI Gateway API key") != null);
-    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "Vercel CLI") == null);
-    try std.testing.expect(std.mem.find(u8, capture.stdout.written(), cfg.secret_store.backend_label) != null);
-}
-
-test "setup delegates secure input to an interactive host store" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    capture.setup_interactive_store = true;
-    var cfg = testConfig();
-    cfg.secret_store = capture.secretStore();
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{@constCast("setup")},
-        cfg,
-        capture.deps(),
-    );
-
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expectEqual(@as(usize, 1), capture.setup_store_calls);
+    try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
-    try std.testing.expect(!capture.setup_value_matched);
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "usage: fx setup") != null);
 }
 
 test "setup preserves the disabled secret-store failure" {

@@ -27,51 +27,24 @@ curl -fsSL https://fx.sh/setup.sh | bash
 
 ## Run fx
 
-To get started, sign in with Vercel:
-
-```bash
-fx login
-```
-
-Or add an AI Gateway API key:
+To get started, point fx at an OpenAI-compatible Chat Completions server:
 
 ```bash
 fx setup
 ```
 
-To use a ChatGPT subscription instead of Vercel AI Gateway:
+That saves a base URL and API key under `~/.fx/settings.json` and `~/.fx/providers/openai_compatible/`. `fx setup openai-compatible` is the same command.
+
+Or set `FX_OPENAI_BASE_URL` and `FX_OPENAI_API_KEY`. Those values are profile-owned (`~/.fx/settings.json`) and are ignored from project `.fx.json`.
+
+A hosted subscription proxy that speaks Chat Completions works the same way. Example:
 
 ```bash
-fx login chatgpt
+export FX_OPENAI_BASE_URL=https://your-proxy.example/v1
+export FX_OPENAI_API_KEY=sk-sub-...
 ```
 
-That stores the session under `~/.fx/providers/chatgpt/` and is billed to ChatGPT, not Vercel. Interactive `/login chatgpt` and the `/setup` ChatGPT option run the same flow.
-
-To use a Grok Build / SuperGrok subscription:
-
-```bash
-fx login grok
-```
-
-That runs device-code login against xAI, stores the session under `~/.fx/providers/grok/`, and sends Chat Completions traffic with the subscription token. Interactive `/login grok` and the `/setup` Grok option run the same flow. Grok usage is billed to that subscription, not Vercel.
-
-To use a Cursor subscription:
-
-```bash
-fx login cursor
-```
-
-That runs PKCE loopback login, stores the session under `~/.fx/providers/cursor/`, and sends OpenAI-compatible Chat Completions traffic with Cursor's required headers. Interactive `/login cursor` and the `/setup` Cursor option run the same flow. If Cursor rejects unofficial clients, login prints their error body and exits. Cursor usage is billed to that subscription, not Vercel.
-
-Bare `fx login` and `/login` stay Vercel.
-
-fx talks to Vercel AI Gateway by default. To use an OpenAI-compatible Chat Completions server instead, save a base URL and API key:
-
-```bash
-fx setup openai-compatible
-```
-
-Or set `FX_PROVIDER=openai_compatible`, `FX_OPENAI_BASE_URL`, and `FX_OPENAI_API_KEY`. Those values are profile-owned (`~/.fx/settings.json`) and are ignored from project `.fx.json`. Set `FX_PROVIDER=chatgpt`, `FX_PROVIDER=grok`, or `FX_PROVIDER=cursor` after the matching login if you need to reselect that backend.
+Model names come from that server (`GET /v1/models`). Prefixed ids such as `chatgpt/gpt-5` or `grok/grok-4.6` are valid when the proxy advertises them.
 
 Run fx from a project:
 
