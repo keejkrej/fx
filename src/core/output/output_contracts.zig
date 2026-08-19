@@ -1334,6 +1334,7 @@ pub const CreditsSnapshot = struct {
     plan: ?[]const u8 = null,
     raw_json: ?[]const u8 = null,
     err_message: ?[]const u8 = null,
+    notice: ?[]const u8 = null,
 
     /// Frees provider-owned fields. `raw_json` remains borrowed presentation
     /// input and is not released here.
@@ -1342,6 +1343,7 @@ pub const CreditsSnapshot = struct {
         if (self.used) |value| alloc.free(value);
         if (self.plan) |value| alloc.free(value);
         if (self.err_message) |value| alloc.free(value);
+        if (self.notice) |value| alloc.free(value);
         self.* = undefined;
     }
 
@@ -1358,6 +1360,10 @@ pub const CreditsSnapshot = struct {
 
         if (self.err_message) |msg| {
             try out.writer.print("[credits] error: {s}\n", .{msg});
+            return try out.toOwnedSlice();
+        }
+        if (self.notice) |msg| {
+            try out.writer.print("[credits] {s}\n", .{msg});
             return try out.toOwnedSlice();
         }
 
@@ -1387,6 +1393,7 @@ pub const CreditsSnapshot = struct {
         defer out.deinit();
 
         if (self.err_message) |msg| return alloc.dupe(u8, msg);
+        if (self.notice) |msg| return alloc.dupe(u8, msg);
         var wrote_field = false;
         if (self.balance) |balance| {
             try out.writer.print("balance={s}", .{balance});
@@ -1420,6 +1427,12 @@ pub const CreditsSnapshot = struct {
 
         if (self.err_message) |msg| {
             try out.writer.writeAll(",\"error\":");
+            try std.json.Stringify.value(msg, .{}, &out.writer);
+            try out.writer.writeByte('}');
+            return try out.toOwnedSlice();
+        }
+        if (self.notice) |msg| {
+            try out.writer.writeAll(",\"notice\":");
             try std.json.Stringify.value(msg, .{}, &out.writer);
             try out.writer.writeByte('}');
             return try out.toOwnedSlice();
@@ -2624,6 +2637,21 @@ test "core credits snapshot renders error output" {
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"credits\",\"error\":\"gateway unavailable\"}",
+        json,
+    );
+}
+
+test "core credits snapshot renders a backend notice without an error" {
+    const snapshot = CreditsSnapshot{ .notice = "this backend has no gateway balance" };
+
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("[credits] this backend has no gateway balance\n", text);
+
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"credits\",\"notice\":\"this backend has no gateway balance\"}",
         json,
     );
 }
