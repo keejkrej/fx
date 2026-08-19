@@ -115,7 +115,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn provider(_: *anyopaque) []const u8 {
-            return "vercel_gateway";
+            return "openai_compatible";
         }
 
         fn getOpt(raw: *anyopaque, alloc: Allocator, key: []const u8) anyerror!?[]u8 {
@@ -126,10 +126,10 @@ pub fn Runtime(comptime App: type) type {
             if (std.mem.eql(u8, key, "provider")) {
                 const workspace = if (comptime @hasField(App, "workspace_root")) app.workspace_root else "";
                 var settings = config_runtime.loadMergedSettings(alloc, workspace) catch {
-                    return try alloc.dupe(u8, "vercel_gateway");
+                    return try alloc.dupe(u8, "openai_compatible");
                 };
                 defer settings.deinit(alloc);
-                const name = if (settings.provider) |value| value.persistedName() else "vercel_gateway";
+                const name = if (settings.provider) |value| value.persistedName() else "openai_compatible";
                 return try alloc.dupe(u8, name);
             }
             if (std.mem.eql(u8, key, "permission_mode")) {

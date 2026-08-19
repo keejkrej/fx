@@ -319,33 +319,13 @@ test "parse recognizes logout" {
     }
 }
 
-test "parse extracts login and logout backend payloads" {
-    switch (parse(testSlashRegistry(), "/login chatgpt")) {
-        .login => |rest| try std.testing.expectEqualStrings("chatgpt", rest),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/login grok")) {
-        .login => |rest| try std.testing.expectEqualStrings("grok", rest),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/login cursor")) {
-        .login => |rest| try std.testing.expectEqualStrings("cursor", rest),
-        else => return error.TestExpectedEqual,
-    }
+test "parse recognizes login and logout" {
     switch (parse(testSlashRegistry(), "/login")) {
         .login => |rest| try std.testing.expectEqualStrings("", rest),
         else => return error.TestExpectedEqual,
     }
-    switch (parse(testSlashRegistry(), "/logout chatgpt")) {
-        .logout => |rest| try std.testing.expectEqualStrings("chatgpt", rest),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/logout grok")) {
-        .logout => |rest| try std.testing.expectEqualStrings("grok", rest),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/logout cursor")) {
-        .logout => |rest| try std.testing.expectEqualStrings("cursor", rest),
+    switch (parse(testSlashRegistry(), "/logout")) {
+        .logout => |rest| try std.testing.expectEqualStrings("", rest),
         else => return error.TestExpectedEqual,
     }
 }

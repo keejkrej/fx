@@ -792,7 +792,7 @@ fn apiProvider(L: ?*lua.State) callconv(.c) c_int {
     if (comptime !enabled) return 0;
     const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
     const value = rt.host.get_opt(rt.host.ctx, rt.alloc, "provider") catch {
-        lua.pushslice(L, "vercel_gateway");
+        lua.pushslice(L, "openai_compatible");
         return 1;
     } orelse {
         lua.pushslice(L, rt.host.provider(rt.host.ctx));

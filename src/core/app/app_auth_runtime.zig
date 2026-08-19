@@ -11,10 +11,6 @@ const secret = @import("../auth/secret.zig");
 const types = @import("../shared/types.zig");
 const providers_config = @import("../providers/config.zig");
 const openai_secret = @import("../providers/openai_secret.zig");
-const chatgpt_auth = @import("../providers/chatgpt_auth.zig");
-const grok_auth = @import("../providers/grok_auth.zig");
-const cursor_auth = @import("../providers/cursor_auth.zig");
-const model_backend = @import("../providers/model_backend.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
     return runtime_profile.allows(App, .native_auth) or
@@ -24,70 +20,15 @@ fn oauthAuthEnabled(comptime App: type) bool {
 pub fn Runtime(comptime App: type) type {
     return struct {
         fn ensurePromptCredential(app: *App) !bool {
-            const backend = providers_config.resolveActive().kind;
-            if (backend == .openai_compatible) {
-                if (providers_config.resolveActive().hasApiKey()) return true;
-                if (!app.auth.pickerView().active) {
-                    try app.auth.refreshSourceInventory(app.alloc);
-                    app.auth.openPicker(app.alloc);
-                }
-                app.shell.render_requests.request(.footer);
-                return false;
-            }
-            if (backend == .chatgpt) {
-                if (providers_config.resolveActive().hasChatgptSession()) return true;
-                try app.writeDomainNotice(.{
-                    .topic = "auth",
-                    .tone = .@"error",
-                    .body = chatgpt_auth.missing_interactive_session_message,
-                }, true);
-                if (!app.auth.pickerView().active) {
-                    try app.auth.refreshSourceInventory(app.alloc);
-                    app.auth.openPicker(app.alloc);
-                }
-                app.shell.render_requests.request(.footer);
-                return false;
-            }
-            if (backend == .grok) {
-                if (providers_config.resolveActive().hasGrokSession()) return true;
-                try app.writeDomainNotice(.{
-                    .topic = "auth",
-                    .tone = .@"error",
-                    .body = grok_auth.missing_interactive_session_message,
-                }, true);
-                if (!app.auth.pickerView().active) {
-                    try app.auth.refreshSourceInventory(app.alloc);
-                    app.auth.openPicker(app.alloc);
-                }
-                app.shell.render_requests.request(.footer);
-                return false;
-            }
-            if (backend == .cursor) {
-                if (providers_config.resolveActive().hasCursorSession()) return true;
-                try app.writeDomainNotice(.{
-                    .topic = "auth",
-                    .tone = .@"error",
-                    .body = cursor_auth.missing_interactive_session_message,
-                }, true);
-                if (!app.auth.pickerView().active) {
-                    try app.auth.refreshSourceInventory(app.alloc);
-                    app.auth.openPicker(app.alloc);
-                }
-                app.shell.render_requests.request(.footer);
-                return false;
-            }
-            if (app.auth.credentialSource() != null) return true;
-
-            const auth_view = app.auth.view();
-            if (auth_view.onboarding_skipped) {
-                try app.writeDomainNotice(.{
-                    .topic = "auth",
-                    .tone = .@"error",
-                    .body = credentials.missing_interactive_credential_message,
-                }, true);
-            } else if (!app.auth.pickerView().active) {
+            if (providers_config.resolveActive().hasApiKey()) return true;
+            try app.writeDomainNotice(.{
+                .topic = "auth",
+                .tone = .@"error",
+                .body = providers_config.missing_openai_interactive_credential_message,
+            }, true);
+            if (!app.auth.pickerView().active) {
                 try app.auth.refreshSourceInventory(app.alloc);
-                app.auth.openOnboardingPicker(app.alloc);
+                app.auth.openPicker(app.alloc);
             }
             app.shell.render_requests.request(.footer);
             return false;
@@ -102,20 +43,15 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            const target = model_backend.parseLoginTarget(rest) orelse {
+            if (std.mem.trim(u8, rest, " \t\r\n").len != 0) {
                 try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "usage: /login [vercel|chatgpt|grok|cursor]",
+                    .body = "usage: /login",
                 });
                 return;
-            };
-            switch (target) {
-                .vercel => try beginSignIn(app, false),
-                .chatgpt => try beginChatgptSignIn(app),
-                .grok => try beginGrokSignIn(app),
-                .cursor => try beginCursorSignIn(app),
             }
+            try beginSignIn(app, false);
         }
 
         pub fn runLogoutCommand(app: *App, rest: []const u8) !void {
@@ -127,117 +63,26 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            const target = model_backend.parseLoginTarget(rest) orelse {
+            if (std.mem.trim(u8, rest, " \t\r\n").len != 0) {
                 try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "usage: /logout [vercel|chatgpt|grok|cursor]",
+                    .body = "usage: /logout",
                 });
                 return;
-            };
-            try app.flushBeforeBlockingExternalWork();
-            switch (target) {
-                .vercel => {
-                    const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
-                        error.SessionDeleteFailed => {
-                            try writeAuthNotice(app, .{
-                                .topic = "auth",
-                                .tone = .@"error",
-                                .body = "Could not complete fx logout. The current source is unchanged.",
-                            });
-                            return;
-                        },
-                    };
-                    try applyLogoutResult(app, result);
-                },
-                .chatgpt => {
-                    const result = chatgpt_auth.logout(app.alloc) catch {
-                        try writeAuthNotice(app, .{
-                            .topic = "auth",
-                            .tone = .@"error",
-                            .body = "Could not complete ChatGPT logout. The current source is unchanged.",
-                        });
-                        return;
-                    };
-                    providers_config.invalidateRemembered();
-                    try writeAuthNotice(app, if (result.local_durability_failed)
-                        .{
-                            .topic = "auth",
-                            .tone = .warning,
-                            .body = "Could not confirm durable ChatGPT logout.",
-                        }
-                    else if (result.session_deleted)
-                        .{
-                            .topic = "auth",
-                            .tone = .neutral,
-                            .body = "Signed out of ChatGPT.",
-                        }
-                    else
-                        .{
-                            .topic = "auth",
-                            .tone = .neutral,
-                            .body = "No ChatGPT session found.",
-                        });
-                },
-                .grok => {
-                    const result = grok_auth.logout(app.alloc) catch {
-                        try writeAuthNotice(app, .{
-                            .topic = "auth",
-                            .tone = .@"error",
-                            .body = "Could not complete Grok logout. The current source is unchanged.",
-                        });
-                        return;
-                    };
-                    providers_config.invalidateRemembered();
-                    try writeAuthNotice(app, if (result.local_durability_failed)
-                        .{
-                            .topic = "auth",
-                            .tone = .warning,
-                            .body = "Could not confirm durable Grok logout.",
-                        }
-                    else if (result.session_deleted)
-                        .{
-                            .topic = "auth",
-                            .tone = .neutral,
-                            .body = "Signed out of Grok.",
-                        }
-                    else
-                        .{
-                            .topic = "auth",
-                            .tone = .neutral,
-                            .body = "No Grok session found.",
-                        });
-                },
-                .cursor => {
-                    const result = cursor_auth.logout(app.alloc) catch {
-                        try writeAuthNotice(app, .{
-                            .topic = "auth",
-                            .tone = .@"error",
-                            .body = "Could not complete Cursor logout. The current source is unchanged.",
-                        });
-                        return;
-                    };
-                    providers_config.invalidateRemembered();
-                    try writeAuthNotice(app, if (result.local_durability_failed)
-                        .{
-                            .topic = "auth",
-                            .tone = .warning,
-                            .body = "Could not confirm durable Cursor logout.",
-                        }
-                    else if (result.session_deleted)
-                        .{
-                            .topic = "auth",
-                            .tone = .neutral,
-                            .body = "Signed out of Cursor.",
-                        }
-                    else
-                        .{
-                            .topic = "auth",
-                            .tone = .neutral,
-                            .body = "No Cursor session found.",
-                        });
-                },
             }
+            try app.flushBeforeBlockingExternalWork();
+            const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
+                error.SessionDeleteFailed => {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Could not complete fx logout. The current source is unchanged.",
+                    });
+                    return;
+                },
+            };
+            try applyLogoutResult(app, result);
         }
 
         pub fn openSetupHub(app: *App) !void {
@@ -302,39 +147,6 @@ pub fn Runtime(comptime App: type) type {
                 .source => |source| try applySourceChoice(app, source),
                 .action => |action| switch (action) {
                     .login => try beginSignIn(app, true),
-                    .chatgpt => {
-                        if (comptime !runtime_profile.allows(App, .native_auth)) {
-                            try app.writeDomainNotice(.{
-                                .topic = "auth",
-                                .tone = .warning,
-                                .body = "ChatGPT login is unavailable in this WASM session.",
-                            }, true);
-                            return;
-                        }
-                        try beginChatgptSignIn(app);
-                    },
-                    .grok => {
-                        if (comptime !runtime_profile.allows(App, .native_auth)) {
-                            try app.writeDomainNotice(.{
-                                .topic = "auth",
-                                .tone = .warning,
-                                .body = "Grok login is unavailable in this WASM session.",
-                            }, true);
-                            return;
-                        }
-                        try beginGrokSignIn(app);
-                    },
-                    .cursor => {
-                        if (comptime !runtime_profile.allows(App, .native_auth)) {
-                            try app.writeDomainNotice(.{
-                                .topic = "auth",
-                                .tone = .warning,
-                                .body = "Cursor login is unavailable in this WASM session.",
-                            }, true);
-                            return;
-                        }
-                        try beginCursorSignIn(app);
-                    },
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
                             try app.writeDomainNotice(.{
@@ -749,66 +561,6 @@ pub fn Runtime(comptime App: type) type {
             }, true);
         }
 
-        fn beginChatgptSignIn(app: *App) !void {
-            try app.flushBeforeBlockingExternalWork();
-            chatgpt_auth.runLogin(app.alloc, .{
-                .url_opener = app.urlOpener(),
-            }) catch |err| {
-                debug_trace.logf("auth", "chatgpt login failed err={s}", .{@errorName(err)});
-                try writeChatgptLoginError(app, err);
-                return;
-            };
-            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .provider = .chatgpt });
-            defer attempt.deinit(app.alloc);
-            providers_config.invalidateRemembered();
-            app.auth.closePicker(app.alloc);
-            try writeAuthNotice(app, .{
-                .topic = "auth",
-                .tone = .neutral,
-                .body = "Signed in to ChatGPT.",
-            });
-        }
-
-        fn beginGrokSignIn(app: *App) !void {
-            try app.flushBeforeBlockingExternalWork();
-            grok_auth.runLogin(app.alloc, .{
-                .url_opener = app.urlOpener(),
-            }) catch |err| {
-                debug_trace.logf("auth", "grok login failed err={s}", .{@errorName(err)});
-                try writeGrokLoginError(app, err);
-                return;
-            };
-            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .provider = .grok });
-            defer attempt.deinit(app.alloc);
-            providers_config.invalidateRemembered();
-            app.auth.closePicker(app.alloc);
-            try writeAuthNotice(app, .{
-                .topic = "auth",
-                .tone = .neutral,
-                .body = "Signed in to Grok.",
-            });
-        }
-
-        fn beginCursorSignIn(app: *App) !void {
-            try app.flushBeforeBlockingExternalWork();
-            cursor_auth.runLogin(app.alloc, .{
-                .url_opener = app.urlOpener(),
-            }) catch |err| {
-                debug_trace.logf("auth", "cursor login failed err={s}", .{@errorName(err)});
-                try writeCursorLoginError(app, err);
-                return;
-            };
-            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .provider = .cursor });
-            defer attempt.deinit(app.alloc);
-            providers_config.invalidateRemembered();
-            app.auth.closePicker(app.alloc);
-            try writeAuthNotice(app, .{
-                .topic = "auth",
-                .tone = .neutral,
-                .body = "Signed in to Cursor.",
-            });
-        }
-
         fn beginSignIn(app: *App, from_root: bool) !void {
             try app.flushBeforeBlockingExternalWork();
 
@@ -935,39 +687,6 @@ pub fn Runtime(comptime App: type) type {
                 error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied. The current credential is unchanged." },
                 error.ExpiredToken, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "The Vercel sign-in code expired. The current credential is unchanged; run /login to try again." },
                 else => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in failed. The current credential is unchanged." },
-            };
-            try writeAuthNotice(app, notice);
-        }
-
-        fn writeChatgptLoginError(app: *App, err: anyerror) !void {
-            const notice: types.SemanticNotice = switch (err) {
-                error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "ChatGPT sign-in was denied. The current credential is unchanged." },
-                error.Cancelled => .{ .topic = "auth", .tone = .warning, .body = "ChatGPT sign-in was cancelled." },
-                error.LoopbackUnavailable => .{ .topic = "auth", .tone = .@"error", .body = "Could not bind the local ChatGPT callback. The current credential is unchanged." },
-                error.InteractiveAuthorizationUnsupported => .{ .topic = "auth", .tone = .warning, .body = "ChatGPT login is unavailable in this runtime." },
-                else => .{ .topic = "auth", .tone = .@"error", .body = "ChatGPT sign-in failed. The current credential is unchanged." },
-            };
-            try writeAuthNotice(app, notice);
-        }
-
-        fn writeGrokLoginError(app: *App, err: anyerror) !void {
-            const notice: types.SemanticNotice = switch (err) {
-                error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in was denied. The current credential is unchanged." },
-                error.Cancelled => .{ .topic = "auth", .tone = .warning, .body = "Grok sign-in was cancelled." },
-                error.LoginTimedOut, error.ExpiredToken => .{ .topic = "auth", .tone = .warning, .body = "The Grok sign-in code expired. The current credential is unchanged; run /login grok to try again." },
-                error.InteractiveAuthorizationUnsupported => .{ .topic = "auth", .tone = .warning, .body = "Grok login is unavailable in this runtime." },
-                else => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in failed. The current credential is unchanged." },
-            };
-            try writeAuthNotice(app, notice);
-        }
-
-        fn writeCursorLoginError(app: *App, err: anyerror) !void {
-            const notice: types.SemanticNotice = switch (err) {
-                error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Cursor sign-in was denied. The current credential is unchanged." },
-                error.Cancelled => .{ .topic = "auth", .tone = .warning, .body = "Cursor sign-in was cancelled." },
-                error.LoopbackUnavailable => .{ .topic = "auth", .tone = .@"error", .body = "Could not bind the local Cursor callback. The current credential is unchanged." },
-                error.InteractiveAuthorizationUnsupported => .{ .topic = "auth", .tone = .warning, .body = "Cursor login is unavailable in this runtime." },
-                else => .{ .topic = "auth", .tone = .@"error", .body = "Cursor sign-in failed. The current credential is unchanged." },
             };
             try writeAuthNotice(app, notice);
         }

@@ -4,9 +4,6 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const secret = @import("../auth/secret.zig");
 const model_backend = @import("model_backend.zig");
 const openai_secret = @import("openai_secret.zig");
-const chatgpt_auth = @import("chatgpt_auth.zig");
-const grok_auth = @import("grok_auth.zig");
-const cursor_auth = @import("cursor_auth.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -22,12 +19,6 @@ pub const missing_openai_credential_message =
 pub const missing_openai_interactive_credential_message =
     "Fx needs an OpenAI-compatible API key. Run /setup to add a URL and key, or set FX_OPENAI_BASE_URL and FX_OPENAI_API_KEY.";
 pub const unimplemented_backend_message = "that model backend is not implemented yet";
-pub const missing_chatgpt_credential_message = chatgpt_auth.missing_session_message;
-pub const missing_chatgpt_interactive_credential_message = chatgpt_auth.missing_interactive_session_message;
-pub const missing_grok_credential_message = grok_auth.missing_session_message;
-pub const missing_grok_interactive_credential_message = grok_auth.missing_interactive_session_message;
-pub const missing_cursor_credential_message = cursor_auth.missing_session_message;
-pub const missing_cursor_interactive_credential_message = cursor_auth.missing_interactive_session_message;
 
 pub const OpenAiCompatibleSettings = struct {
     base_url: ?[]const u8 = null,
@@ -41,7 +32,7 @@ pub const EnvOverrides = struct {
 };
 
 pub const Resolved = struct {
-    kind: ModelBackend = .vercel_gateway,
+    kind: ModelBackend = .openai_compatible,
     openai_compatible: OpenAiCompatibleSettings = .{},
     openai_api_key_present: bool = false,
 
@@ -72,18 +63,6 @@ pub const Resolved = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return null,
         };
-    }
-
-    pub fn hasChatgptSession(self: Resolved) bool {
-        return self.kind == .chatgpt and chatgpt_auth.hasSession();
-    }
-
-    pub fn hasGrokSession(self: Resolved) bool {
-        return self.kind == .grok and grok_auth.hasSession();
-    }
-
-    pub fn hasCursorSession(self: Resolved) bool {
-        return self.kind == .cursor and cursor_auth.hasSession();
     }
 
     pub fn hasApiKey(self: Resolved) bool {
@@ -202,9 +181,9 @@ fn copyRemembered(value: []const u8, buf: []u8, len: *usize) void {
 
 pub fn resolveWith(settings: SettingsView, env: EnvOverrides) Resolved {
     const kind = if (env.provider) |value|
-        model_backend.parse(value) orelse settings.provider orelse .vercel_gateway
+        model_backend.parse(value) orelse settings.provider orelse .openai_compatible
     else
-        settings.provider orelse .vercel_gateway;
+        settings.provider orelse .openai_compatible;
     var openai_compatible = OpenAiCompatibleSettings{
         .base_url = settings.openai_compatible_base_url,
         .api_key_env = settings.openai_compatible_api_key_env,
@@ -279,7 +258,7 @@ fn joinEndpoint(alloc: Allocator, base_url: []const u8, suffix: []const u8) ![]u
 
 test "resolver prefers FX_PROVIDER over a remembered backend" {
     const resolved = resolveWith(.{
-        .provider = .vercel_gateway,
+        .provider = .openai_compatible,
         .openai_compatible_base_url = "https://example.invalid/v1",
     }, .{
         .provider = "openai_compatible",
@@ -289,9 +268,9 @@ test "resolver prefers FX_PROVIDER over a remembered backend" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8080/v1", resolved.openai_compatible.base_url.?);
 }
 
-test "resolver defaults to Vercel Gateway" {
+test "resolver defaults to OpenAI-compatible" {
     const resolved = resolveWith(.{}, .{});
-    try std.testing.expectEqual(ModelBackend.vercel_gateway, resolved.kind);
+    try std.testing.expectEqual(ModelBackend.openai_compatible, resolved.kind);
     try std.testing.expect(resolved.openai_compatible.base_url == null);
     try std.testing.expect(!resolved.hasApiKey());
 }

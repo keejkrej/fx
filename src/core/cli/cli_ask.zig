@@ -7,9 +7,6 @@ const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const providers_config = @import("../providers/config.zig");
-const chatgpt_auth = @import("../providers/chatgpt_auth.zig");
-const grok_auth = @import("../providers/grok_auth.zig");
-const cursor_auth = @import("../providers/cursor_auth.zig");
 const secret = @import("../auth/secret.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const background_runtime = @import("../background/background_runtime.zig");
@@ -1291,15 +1288,6 @@ pub fn runPromptCapture(alloc: Allocator, prompt: []const u8, auto_permission: b
     });
 }
 
-fn missingCredentialResult(alloc: Allocator, options: RunOptions) !PromptRunResult {
-    try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: " ++ credentials.missing_credential_message ++ "\n");
-    return .{
-        .exit_code = 1,
-        .assistant_output = try alloc.dupe(u8, ""),
-        .error_code = "MissingCredentials",
-    };
-}
-
 fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: ?PermissionMode, cfg: Config, options: RunOptions) !PromptRunResult {
     var owned_prompt = try alloc.dupe(u8, prompt);
     defer alloc.free(owned_prompt);
@@ -1344,10 +1332,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         cfg.saved_directories_suppressed,
     );
     try checkHeadlessCancellation(options.deps);
-
-    if (!options.continue_recovery and startup.credential == null) {
-        return missingCredentialResult(alloc, options);
-    }
 
     var owned_resumed_model: ?[]u8 = null;
     defer if (owned_resumed_model) |model| alloc.free(model);
@@ -1427,101 +1411,25 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 
     var owned_openai_key: ?[]u8 = null;
     defer if (owned_openai_key) |key| secret.zeroAndFree(alloc, key);
-    var owned_chatgpt_token: ?[]u8 = null;
-    defer if (owned_chatgpt_token) |key| secret.zeroAndFree(alloc, key);
-    var owned_grok_token: ?[]u8 = null;
-    defer if (owned_grok_token) |key| secret.zeroAndFree(alloc, key);
-    var owned_cursor_token: ?[]u8 = null;
-    defer if (owned_cursor_token) |key| secret.zeroAndFree(alloc, key);
     const resolved_backend = providers_config.resolveActive();
-    if (resolved_backend.kind == .chatgpt) {
-        const token = chatgpt_auth.loadAccessToken(alloc) catch {
-            try options.deps.write_stderr(
-                options.deps.stderr_ctx,
-                "fx ask: " ++ providers_config.missing_chatgpt_credential_message ++ "\n",
-            );
-            return .{
-                .exit_code = 1,
-                .assistant_output = try alloc.dupe(u8, ""),
-                .error_code = "MissingCredentials",
-            };
-        };
-        owned_chatgpt_token = token;
-        const api_key = token orelse {
-            try options.deps.write_stderr(
-                options.deps.stderr_ctx,
-                "fx ask: " ++ providers_config.missing_chatgpt_credential_message ++ "\n",
-            );
-            return .{
-                .exit_code = 1,
-                .assistant_output = try alloc.dupe(u8, ""),
-                .error_code = "MissingCredentials",
-            };
-        };
-        ctx.api_key = api_key;
-        ctx.gateway_team = null;
-        ctx.credential_source = null;
-        ctx.model_catalog_access = .{ .public_only = .no_credential };
-    } else if (resolved_backend.kind == .grok) {
-        const token = grok_auth.loadAccessToken(alloc) catch {
-            try options.deps.write_stderr(
-                options.deps.stderr_ctx,
-                "fx ask: " ++ providers_config.missing_grok_credential_message ++ "\n",
-            );
-            return .{
-                .exit_code = 1,
-                .assistant_output = try alloc.dupe(u8, ""),
-                .error_code = "MissingCredentials",
-            };
-        };
-        owned_grok_token = token;
-        const api_key = token orelse {
-            try options.deps.write_stderr(
-                options.deps.stderr_ctx,
-                "fx ask: " ++ providers_config.missing_grok_credential_message ++ "\n",
-            );
-            return .{
-                .exit_code = 1,
-                .assistant_output = try alloc.dupe(u8, ""),
-                .error_code = "MissingCredentials",
-            };
-        };
-        ctx.api_key = api_key;
-        ctx.gateway_team = null;
-        ctx.credential_source = null;
-        ctx.model_catalog_access = .{ .public_only = .no_credential };
-    } else if (resolved_backend.kind == .cursor) {
-        const token = cursor_auth.loadAccessToken(alloc) catch {
-            try options.deps.write_stderr(
-                options.deps.stderr_ctx,
-                "fx ask: " ++ providers_config.missing_cursor_credential_message ++ "\n",
-            );
-            return .{
-                .exit_code = 1,
-                .assistant_output = try alloc.dupe(u8, ""),
-                .error_code = "MissingCredentials",
-            };
-        };
-        owned_cursor_token = token;
-        const api_key = token orelse {
-            try options.deps.write_stderr(
-                options.deps.stderr_ctx,
-                "fx ask: " ++ providers_config.missing_cursor_credential_message ++ "\n",
-            );
-            return .{
-                .exit_code = 1,
-                .assistant_output = try alloc.dupe(u8, ""),
-                .error_code = "MissingCredentials",
-            };
-        };
-        ctx.api_key = api_key;
-        ctx.gateway_team = null;
-        ctx.credential_source = null;
-        ctx.model_catalog_access = .{ .public_only = .no_credential };
-    } else if (resolved_backend.kind == .openai_compatible) {
+    {
         const openai_key = try resolved_backend.loadApiKey(alloc);
         owned_openai_key = openai_key;
-        const api_key = openai_key orelse {
+        if (openai_key) |api_key| {
+            ctx.api_key = api_key;
+            ctx.gateway_team = null;
+            ctx.credential_source = null;
+            ctx.model_catalog_access = .{ .public_only = .no_credential };
+        } else if (startup.credential) |credential| {
+            ctx.api_key = credential.token;
+            ctx.gateway_team = credential.gatewayTeam();
+            ctx.credential_source = credential.source;
+            ctx.model_catalog_access = credentials.catalogAccessForCredential(
+                credential.source,
+                credential.token,
+                credential.gatewayTeam(),
+            );
+        } else {
             try options.deps.write_stderr(
                 options.deps.stderr_ctx,
                 "fx ask: " ++ providers_config.missing_openai_credential_message ++ "\n",
@@ -1531,19 +1439,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
                 .assistant_output = try alloc.dupe(u8, ""),
                 .error_code = "MissingCredentials",
             };
-        };
-        ctx.api_key = api_key;
-        ctx.gateway_team = null;
-        ctx.credential_source = null;
-        ctx.model_catalog_access = .{ .public_only = .no_credential };
-    } else {
-        const credential = startup.credential orelse
-            return missingCredentialResult(alloc, options);
-        const api_key = credential.token;
-        ctx.api_key = api_key;
-        ctx.gateway_team = credential.gatewayTeam();
-        ctx.credential_source = credential.source;
-        ctx.model_catalog_access = credentials.catalogAccessForCredential(credential.source, api_key, credential.gatewayTeam());
+        }
     }
 
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
@@ -8586,7 +8482,7 @@ test "json run with missing API key prints diagnostic then final object" {
     const exit_code = try runWithDeps(alloc, &.{ "--json", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testMissingKeyStartup));
 
     try std.testing.expectEqual(@as(u8, 1), exit_code);
-    try std.testing.expectEqualStrings("fx ask: " ++ credentials.missing_credential_message ++ "\n", stderr_capture.bytes.items);
+    try std.testing.expectEqualStrings("fx ask: " ++ providers_config.missing_openai_credential_message ++ "\n", stderr_capture.bytes.items);
     try std.testing.expectEqualStrings(
         "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"MissingCredentials\"}\n",
         stdout_capture.bytes.items,
