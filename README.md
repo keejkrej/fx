@@ -80,7 +80,7 @@ cd your_project
 fx
 ```
 
-The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
+The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands. Paste a screenshot with Ctrl+V, drop a png/jpg/gif/webp file into the prompt, or run `/paste` and `/image <path>` to attach it as vision input.
 
 List saved sessions with `fx sessions`. Resume the latest session for the current workspace, or select an exact session ID, through the same command group:
 
