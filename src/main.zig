@@ -452,6 +452,13 @@ const App = struct {
             composed_gateway_provider.agent_stream;
     }
 
+    pub fn modelCatalogProvider(_: *const Self) @TypeOf(composed_gateway_provider.model_catalog) {
+        return if (comptime host_target.is_wasm)
+            js_host_model_catalog.provider
+        else
+            composed_gateway_provider.model_catalog;
+    }
+
     pub fn cooperativeTransportPulse(self: *Self) !void {
         if (comptime !host_target.is_wasm) return;
         if (try event_loop.pump_ready_input(
@@ -1712,7 +1719,7 @@ const App = struct {
     pub fn fetchModelIds(self: *App) !std.ArrayList([]u8) {
         return AgentAppRuntime.fetchModelIds(
             self,
-            if (comptime host_target.is_wasm) js_host_model_catalog.provider else builtin_gateway.model_catalog_provider,
+            self.modelCatalogProvider(),
             builtin_gateway.models_path,
         );
     }
@@ -1724,12 +1731,12 @@ const App = struct {
                 return;
             }
             self.model_cache.loadCooperative(
-                js_host_model_catalog.provider,
+                self.modelCatalogProvider(),
                 self.auth.modelCatalogAccess(),
             );
         } else {
             self.model_cache.startWarmup(
-                builtin_gateway.model_catalog_provider,
+                self.modelCatalogProvider(),
                 self.auth.modelCatalogAccess(),
             );
         }
@@ -3200,6 +3207,13 @@ test "interactive app keeps notification handlers registered for live preference
     try std.testing.expect(preferences.max);
     try std.testing.expect(app.soundMaxEnabled());
     try std.testing.expect(!@hasField(App, "notification_player"));
+}
+
+test "native interactive model catalog uses the openai-compatible provider" {
+    var app = App{ .alloc = std.testing.allocator };
+    const provider = app.modelCatalogProvider();
+    try std.testing.expect(provider.fetch_fn == openai_compatible_provider.provider.model_catalog.fetch_fn);
+    try std.testing.expect(provider.fetch_fn != builtin_gateway.model_catalog_provider.fetch_fn);
 }
 
 test "native app preserves the built-in tool set without workspace metadata" {
