@@ -39,6 +39,7 @@ benchmarks/baseline.json
 .crush/
 .factory/
 .goose/
+.grok/
 .iflow/
 .junie/
 .kilocode/
