@@ -15,6 +15,12 @@
 - **Command discovery:** Rank exact, prefix, and substring slash-command matches and highlight the selected help description
 - **Terminal attention bells:** Emit one terminal bell when fx pauses for permission or other input so terminal multiplexers can flag waiting panes
 - **Transcript scrollback:** Preserve retained transcript rows in native scrollback across pruning, resize, and reflow
+- **Workspace identity:** Show the active working directory and Git branch
+- **Terminal tab titles:** Include session context in terminal tab titles
+- **Session list:** Show saved session names and humanize session metadata
+- **Help spacing:** Cap help description spacing on wide terminals
+- **Command prefixes:** Hide no-op cwd command prefixes
+- **MCP reload status:** Use user-facing language for MCP reload progress
 
 ### Bug Fixes
 
@@ -29,6 +35,8 @@
 - **Process cleanup:** Cancel and reap headless terminal commands on SIGTERM, preserve signal status, and tolerate short-lived Linux processes disappearing during cleanup
 - **Model output limits:** Omit invalid limits that consume a model's full context window
 - **Terminal lease transitions:** Reject write payloads on lease acquisition, release, and revocation before session state changes
+- **Screenshot prompts:** Recover from a rejected vision prefill so adding screenshots does not crash
+- **Unknown terminal escapes:** Ignore unknown terminal escape sequences instead of treating them as Escape
 
 <!-- release:end -->
 
