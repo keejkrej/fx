@@ -13,7 +13,9 @@ zig-pkg/
 sdk/dist/
 
 # Workspace-local runtime state
-/skills/
+/skills/*
+!/skills/fork-release/
+!/skills/fork-release/**
 
 # Local environment files
 .env
