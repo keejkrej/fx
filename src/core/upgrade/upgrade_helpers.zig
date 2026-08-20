@@ -18,13 +18,26 @@ fn setRecvTimeout(conn: *std.http.Client.Connection) void {
     std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 }
 
-pub const cdn_base = "https://releases.fx.sh";
+pub const release_repo = "keejkrej/fx";
+pub const github_release_base = "https://github.com/" ++ release_repo ++ "/releases";
+pub const github_latest_download_base = github_release_base ++ "/latest/download";
+pub const github_download_base = github_release_base ++ "/download";
+pub const github_user_agent = "fx-upgrade (+https://github.com/" ++ release_repo ++ ")";
+
+pub const cdn_base = github_latest_download_base;
 
 pub fn resolveCdnBase() []const u8 {
     if (io_mod.getenv("FX_E2E_UPGRADE_BASE_URL")) |url| {
         if (isLoopbackE2eUpgradeBase(url)) return url;
     }
     return cdn_base;
+}
+
+fn requestHeaders() std.http.Client.Request.Headers {
+    return .{
+        .user_agent = .{ .override = github_user_agent },
+        .accept_encoding = .omit,
+    };
 }
 
 fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
@@ -78,7 +91,7 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8) !Ta
         .dev => blk: {
             var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
             defer client.deinit();
-            const url = try std.fmt.allocPrint(alloc, "{s}/dev.json", .{base_url});
+            const url = try std.fmt.allocPrint(alloc, "{s}/download/dev/dev.json", .{github_release_base});
             defer alloc.free(url);
             const manifest = try fetchTextBounded(
                 &client,
@@ -120,7 +133,10 @@ fn fetchTextBounded(
 ) ![]u8 {
     const uri = std.Uri.parse(url) catch return error.FetchFailed;
 
-    var req = client.request(.GET, uri, .{}) catch return error.FetchFailed;
+    var req = client.request(.GET, uri, .{
+        .headers = requestHeaders(),
+        .keep_alive = false,
+    }) catch return error.FetchFailed;
     defer req.deinit();
 
     if (req.connection) |conn| setRecvTimeout(conn);
@@ -166,7 +182,10 @@ pub fn downloadFileStreamingWithProgress(client: *std.http.Client, url: []const 
     var file_writer: std.Io.File.Writer = .initStreaming(file, io_mod.getIo(), &write_buf);
 
     const uri = std.Uri.parse(url) catch return error.DownloadFailed;
-    var req = client.request(.GET, uri, .{}) catch return error.DownloadFailed;
+    var req = client.request(.GET, uri, .{
+        .headers = requestHeaders(),
+        .keep_alive = false,
+    }) catch return error.DownloadFailed;
     defer req.deinit();
 
     if (req.connection) |conn| setRecvTimeout(conn);
@@ -329,8 +348,20 @@ test "E2E upgrade base accepts only explicit IPv4 loopback origins" {
     try std.testing.expect(!isLoopbackE2eUpgradeBase("http://localhost:1234"));
 }
 
-test "production upgrade base uses the fx release domain" {
-    try std.testing.expectEqualStrings("https://releases.fx.sh", resolveCdnBase());
+test "production upgrade base uses this fork's GitHub latest assets" {
+    try std.testing.expectEqualStrings(github_latest_download_base, resolveCdnBase());
+}
+
+test "GitHub upgrade URLs stay on this fork" {
+    try std.testing.expectEqualStrings("keejkrej/fx", release_repo);
+    try std.testing.expectEqualStrings(
+        "https://github.com/keejkrej/fx/releases/latest/download",
+        github_latest_download_base,
+    );
+    try std.testing.expectEqualStrings(
+        "https://github.com/keejkrej/fx/releases/download",
+        github_download_base,
+    );
 }
 
 test "extractChecksumHex parses sha256sum format" {
