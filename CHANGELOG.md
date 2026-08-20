@@ -34,8 +34,21 @@
 
 ## 0.0.3
 
+### Breaking Changes
+
+- **Subscription login:** Remove ChatGPT, Grok Build, and Cursor subscription OAuth. Configure an OpenAI-compatible endpoint with `fx setup` or `FX_OPENAI_BASE_URL` and `FX_OPENAI_API_KEY`
+
+### New Features
+
+- **OpenAI-compatible models:** Talk to any OpenAI-compatible Chat Completions server and load the model picker from that catalog
+- **Lua commands and hooks:** Embed Lua 5.4 for commands, keymaps, and hooks
+- **Read-only code viewer:** Open files and the latest edit hunks in a read-only viewer
+- **Pasted images:** Attach pasted screenshots and image files as vision chips
+- **Lua language server:** Start a user-installed language server from Lua and show diagnostics in the viewer
+
 ### Improvements
 
+- **Fork upgrades:** Fetch `fx upgrade` binaries from this repository's GitHub Releases
 - **JSON recovery progress:** Report retry, recovery, and safety-pause status on stderr during `fx ask --json` while keeping stdout parseable
 - **Notification sounds:** Use clearer 48 kHz AAC cues with full tails and the intended volume differences between actions
 
