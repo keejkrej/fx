@@ -56,6 +56,8 @@ jobs:
             target: aarch64-linux
           - name: macos-x86_64
             target: x86_64-macos
+          - name: macos-aarch64
+            target: aarch64-macos
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -84,18 +86,8 @@ jobs:
             fx-${{ matrix.name }}.tar.gz
             fx-${{ matrix.name }}.tar.gz.sha256
 
-  build-macos-arm64:
-    needs: check-version
-    if: needs.check-version.outputs.needed == 'true'
-    permissions:
-      actions: read
-      contents: read
-    uses: ./.github/workflows/pgso-macos-arm64.yml
-    with:
-      package_release: true
-
   release:
-    needs: [check-version, build, build-macos-arm64]
+    needs: [check-version, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -107,6 +99,18 @@ jobs:
         with:
           pattern: fx-*
           merge-multiple: true
+
+      - name: Write latest.txt and require archives
+        env:
+          RELEASE_TAG: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          echo -n "$RELEASE_TAG" > latest.txt
+          for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
+            test -f "fx-${platform}.tar.gz"
+            test -f "fx-${platform}.tar.gz.sha256"
+          done
 
       - name: Create git tag
         env:
@@ -133,6 +137,7 @@ jobs:
           tag_name: ${{ needs.check-version.outputs.version }}
           body_path: /tmp/release-notes.md
           files: |
+            latest.txt
             fx-*.tar.gz
             fx-*.tar.gz.sha256
 
@@ -143,6 +148,10 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          if [ -z "${BLOB_READ_WRITE_TOKEN:-}" ]; then
+            echo "BLOB_READ_WRITE_TOKEN is unset; skipping official CDN publish"
+            exit 0
+          fi
           CDN_BASE="cli"
 
           for FILE in fx-*.tar.gz fx-*.tar.gz.sha256; do
