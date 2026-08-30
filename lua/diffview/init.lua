@@ -1,22 +1,23 @@
--- Diff-view plugin demo for fx's Lua plugin system.
--- Registers `/diffview`, then opens the built-in code viewer on a canned
--- old/new pair. That is the whole point: a real plugin that registers,
--- renders, and lets you move around a diff (j/k, [/] hunks, t layout, q).
+-- In-TUI diff review plugin. This is the Lua plugin-system demo: it registers
+-- `/diffview`, then opens fx's existing code-viewer owner (not a child
+-- terminal) on a multi-file review. Side-by-side, a file list, hunk jumps,
+-- and add/remove highlighting are the Lumen-shaped bits; the rest stays
+-- inside fx's TUI.
 
 local M = {}
 
-local DEMO_PATH = "lua/diffview/demo.lua"
-
-local DEMO_OLD = [[local function greet(name)
+local FILES = {
+  {
+    path = "lua/diffview/demo.lua",
+    old = [[local function greet(name)
   return "hello, " .. name
 end
 
 print(greet("world"))
 print("DIFFVIEW_DEMO_KEEP")
 print("DIFFVIEW_DEMO_OLD")
-]]
-
-local DEMO_NEW = [[local function greet(name)
+]],
+    new = [[local function greet(name)
   return "hello, " .. name .. "!"
 end
 
@@ -24,26 +25,45 @@ print(greet("fx"))
 print("DIFFVIEW_DEMO_KEEP")
 print("DIFFVIEW_DEMO_NEW")
 print("lua plugin demo")
-]]
+]],
+  },
+  {
+    path = "README.md",
+    old = [[# fx
 
-local function trim(text)
-  return (text:match("^%s*(.-)%s*$")) or ""
-end
+A terminal coding agent.
+]],
+    new = [[# fx
 
-function M.open(payload)
-  local path = DEMO_PATH
-  if type(payload) == "string" then
-    local labeled = trim(payload)
-    if labeled ~= "" then
-      path = labeled
-    end
-  end
-  fx.view.diff(path, DEMO_OLD, DEMO_NEW, { line = 2 })
+A terminal coding agent with an in-TUI diff review.
+
+See `/diffview` and DIFFVIEW_FILE_README.
+]],
+  },
+  {
+    path = "src/greet.zig",
+    old = [[pub fn greet() []const u8 {
+    return "hi";
+}
+]],
+    new = [[pub fn greet(name: []const u8) []const u8 {
+    _ = name;
+    return "hello from DIFFVIEW_FILE_ZIG";
+}
+]],
+  },
+}
+
+function M.open()
+  fx.view.diff({
+    files = FILES,
+    layout = "side",
+  })
 end
 
 function M.setup()
   fx.command("diffview", M.open, {
-    desc = "Open the Lua plugin diff-view demo",
+    desc = "Open the in-TUI Lua diff-view demo",
   })
 end
 

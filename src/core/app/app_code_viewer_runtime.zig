@@ -28,6 +28,20 @@ pub const OpenSpec = struct {
     want_diff: bool = false,
 };
 
+pub const DiffFile = struct {
+    path: []const u8,
+    old_text: []const u8,
+    new_text: []const u8,
+};
+
+const StoredFile = struct {
+    path: []u8,
+    old_text: []u8,
+    new_text: []u8,
+    added: u32 = 0,
+    removed: u32 = 0,
+};
+
 pub const Session = struct {
     alloc: Allocator = std.heap.page_allocator,
     kind: Kind = .file,
@@ -41,6 +55,9 @@ pub const Session = struct {
     diff_lines: []diff_mod.DiffLine = &.{},
     hunks: std.ArrayList(code_viewer_layout.Hunk) = .empty,
     pairs: std.ArrayList(code_viewer_layout.Pair) = .empty,
+    files: std.ArrayList(StoredFile) = .empty,
+    file_index: usize = 0,
+    show_file_list: bool = false,
     cursor: usize = 0,
     scroll: usize = 0,
     mode: Mode = .browse,
@@ -62,6 +79,7 @@ pub const Session = struct {
         self.highlighted_lines.deinit(self.alloc);
         self.hunks.deinit(self.alloc);
         self.pairs.deinit(self.alloc);
+        self.files.deinit(self.alloc);
         self.query.deinit(self.alloc);
         self.matches.deinit(self.alloc);
         self.goto_buf.deinit(self.alloc);
@@ -73,32 +91,11 @@ pub const Session = struct {
     }
 
     pub fn clear(self: *Session) void {
-        if (self.path.len > 0) self.alloc.free(self.path);
-        if (self.source.len > 0) self.alloc.free(self.source);
-        if (self.old_text.len > 0) self.alloc.free(self.old_text);
-        if (self.new_text.len > 0) self.alloc.free(self.new_text);
-        if (self.highlighted.len > 0) self.alloc.free(self.highlighted);
-        if (self.diff_lines.len > 0) self.alloc.free(self.diff_lines);
-        self.path = &.{};
-        self.source = &.{};
-        self.old_text = &.{};
-        self.new_text = &.{};
-        self.highlighted = &.{};
-        self.diff_lines = &.{};
-        self.lines.clearRetainingCapacity();
-        self.highlighted_lines.clearRetainingCapacity();
-        self.hunks.clearRetainingCapacity();
-        self.pairs.clearRetainingCapacity();
-        self.query.clearRetainingCapacity();
-        self.matches.clearRetainingCapacity();
-        self.goto_buf.clearRetainingCapacity();
-        self.cursor = 0;
-        self.scroll = 0;
-        self.mode = .browse;
-        self.match_index = 0;
-        self.hunk_index = 0;
+        self.resetDiffDisplay();
+        self.freeStoredFiles();
+        self.file_index = 0;
+        self.show_file_list = false;
         self.diff_layout = .unified;
-        self.language = "";
         self.kind = .file;
     }
 
@@ -120,21 +117,53 @@ pub const Session = struct {
         new_text: []const u8,
         line: ?u32,
     ) !void {
+        const spec = [_]DiffFile{.{ .path = path, .old_text = old_text, .new_text = new_text }};
+        try self.loadReview(&spec, false, line);
+        self.show_file_list = false;
+    }
+
+    pub fn loadReview(self: *Session, files: []const DiffFile, side_by_side: bool, line: ?u32) !void {
+        if (files.len == 0) return error.EmptyDiffReview;
         self.clear();
         errdefer self.clear();
-        self.kind = .diff;
-        self.path = try self.alloc.dupe(u8, path);
-        self.old_text = try self.alloc.dupe(u8, old_text);
-        self.new_text = try self.alloc.dupe(u8, new_text);
-        self.diff_lines = try diff_mod.compute(self.alloc, self.old_text, self.new_text);
-        try code_viewer_layout.collectHunks(self.diff_lines, &self.hunks, self.alloc);
-        try code_viewer_layout.pairDiffLines(self.diff_lines, &self.pairs, self.alloc);
-        if (line) |target| {
-            self.jumpToNewLine(target);
-        } else if (self.hunks.items.len > 0) {
-            self.hunk_index = 0;
-            self.cursor = self.hunks.items[0].first_change;
+        for (files) |spec| {
+            try self.files.append(self.alloc, try storeFile(self.alloc, spec));
         }
+        self.diff_layout = if (side_by_side) .side_by_side else .unified;
+        self.show_file_list = files.len > 1;
+        try self.reloadCurrentFile(line);
+    }
+
+    pub fn fileList(self: *const Session, buf: []code_viewer_screen.FileListEntry) []code_viewer_screen.FileListEntry {
+        const n = @min(self.files.items.len, buf.len);
+        for (self.files.items[0..n], 0..) |file, i| {
+            buf[i] = .{
+                .path = file.path,
+                .added = file.added,
+                .removed = file.removed,
+            };
+        }
+        return buf[0..n];
+    }
+
+    pub fn nextFile(self: *Session) !void {
+        if (self.files.items.len < 2) return;
+        self.file_index = (self.file_index + 1) % self.files.items.len;
+        try self.reloadCurrentFile(null);
+    }
+
+    pub fn previousFile(self: *Session) !void {
+        if (self.files.items.len < 2) return;
+        self.file_index = if (self.file_index == 0)
+            self.files.items.len - 1
+        else
+            self.file_index - 1;
+        try self.reloadCurrentFile(null);
+    }
+
+    pub fn toggleFileList(self: *Session) void {
+        if (self.files.items.len < 2) return;
+        self.show_file_list = !self.show_file_list;
     }
 
     pub fn displayLineCount(self: *const Session) usize {
@@ -397,6 +426,64 @@ pub const Session = struct {
         };
     }
 
+    fn freeStoredFiles(self: *Session) void {
+        for (self.files.items) |file| {
+            if (file.path.len > 0) self.alloc.free(file.path);
+            if (file.old_text.len > 0) self.alloc.free(file.old_text);
+            if (file.new_text.len > 0) self.alloc.free(file.new_text);
+        }
+        self.files.clearRetainingCapacity();
+    }
+
+    fn resetDiffDisplay(self: *Session) void {
+        if (self.path.len > 0) self.alloc.free(self.path);
+        if (self.source.len > 0) self.alloc.free(self.source);
+        if (self.old_text.len > 0) self.alloc.free(self.old_text);
+        if (self.new_text.len > 0) self.alloc.free(self.new_text);
+        if (self.highlighted.len > 0) self.alloc.free(self.highlighted);
+        if (self.diff_lines.len > 0) self.alloc.free(self.diff_lines);
+        self.path = &.{};
+        self.source = &.{};
+        self.old_text = &.{};
+        self.new_text = &.{};
+        self.highlighted = &.{};
+        self.diff_lines = &.{};
+        self.lines.clearRetainingCapacity();
+        self.highlighted_lines.clearRetainingCapacity();
+        self.hunks.clearRetainingCapacity();
+        self.pairs.clearRetainingCapacity();
+        self.query.clearRetainingCapacity();
+        self.matches.clearRetainingCapacity();
+        self.goto_buf.clearRetainingCapacity();
+        self.cursor = 0;
+        self.scroll = 0;
+        self.mode = .browse;
+        self.match_index = 0;
+        self.hunk_index = 0;
+        self.language = "";
+    }
+
+    fn reloadCurrentFile(self: *Session, line: ?u32) !void {
+        if (self.files.items.len == 0) return;
+        const file = self.files.items[self.file_index];
+        self.resetDiffDisplay();
+        errdefer self.resetDiffDisplay();
+        self.kind = .diff;
+        self.path = try self.alloc.dupe(u8, file.path);
+        self.old_text = try self.alloc.dupe(u8, file.old_text);
+        self.new_text = try self.alloc.dupe(u8, file.new_text);
+        self.diff_lines = try diff_mod.compute(self.alloc, self.old_text, self.new_text);
+        try code_viewer_layout.collectHunks(self.diff_lines, &self.hunks, self.alloc);
+        try code_viewer_layout.pairDiffLines(self.diff_lines, &self.pairs, self.alloc);
+        self.language = code_viewer_layout.profileLabelForPath(self.path);
+        if (line) |target| {
+            self.jumpToNewLine(target);
+        } else if (self.hunks.items.len > 0) {
+            self.hunk_index = 0;
+            self.cursorForHunk();
+        }
+    }
+
     fn jumpToNewLine(self: *Session, line: u32) void {
         if (line == 0) {
             self.cursor = 0;
@@ -426,6 +513,31 @@ pub const Session = struct {
         }
     }
 };
+
+fn storeFile(alloc: Allocator, spec: DiffFile) !StoredFile {
+    var stored = StoredFile{
+        .path = try alloc.dupe(u8, spec.path),
+        .old_text = try alloc.dupe(u8, spec.old_text),
+        .new_text = try alloc.dupe(u8, spec.new_text),
+    };
+    errdefer {
+        alloc.free(stored.path);
+        alloc.free(stored.old_text);
+        alloc.free(stored.new_text);
+    }
+    const lines = try diff_mod.compute(alloc, stored.old_text, stored.new_text);
+    defer alloc.free(lines);
+    var added: u32 = 0;
+    var removed: u32 = 0;
+    for (lines) |line| switch (line.op) {
+        .add => added += 1,
+        .remove => removed += 1,
+        .equal => {},
+    };
+    stored.added = added;
+    stored.removed = removed;
+    return stored;
+}
 
 pub const ParsedOpen = struct {
     path: []const u8 = "",
@@ -670,13 +782,24 @@ pub fn Runtime(comptime App: type) type {
             new_text: []const u8,
             line: ?u32,
         ) !void {
+            const spec = [_]DiffFile{.{ .path = path, .old_text = old_text, .new_text = new_text }};
+            try openReview(app, &spec, false, line);
+        }
+
+        pub fn openReview(
+            app: *App,
+            files: []const DiffFile,
+            side_by_side: bool,
+            line: ?u32,
+        ) !void {
             if (comptime @hasField(App, "code_viewer") and @hasField(App, "terminal")) {
+                const label = if (files.len > 0) files[0].path else "diff";
                 prepareScreen(app) catch |err| {
-                    try noticePathError(app, path, err);
+                    try noticePathError(app, label, err);
                     return;
                 };
-                app.code_viewer.loadDiff(path, old_text, new_text, line) catch |err| {
-                    try noticePathError(app, path, err);
+                app.code_viewer.loadReview(files, side_by_side, line) catch |err| {
+                    try noticePathError(app, label, err);
                     return;
                 };
                 try enterScreen(app);
@@ -871,6 +994,23 @@ test "session search goto and hunk navigation stay in range" {
     diff_session.toggleDiffLayout();
     try std.testing.expectEqual(DiffLayout.side_by_side, diff_session.diff_layout);
     try std.testing.expectEqual(@as(usize, 1), diff_session.cursor);
+
+    var review = Session.init(alloc);
+    defer review.deinit();
+    const files = [_]DiffFile{
+        .{ .path = "a.lua", .old_text = "old-a\n", .new_text = "new-a\n" },
+        .{ .path = "b.md", .old_text = "keep\n", .new_text = "keep\nchanged\n" },
+    };
+    try review.loadReview(&files, true, null);
+    try std.testing.expect(review.show_file_list);
+    try std.testing.expectEqual(DiffLayout.side_by_side, review.diff_layout);
+    try std.testing.expectEqualStrings("a.lua", review.path);
+    try review.nextFile();
+    try std.testing.expectEqualStrings("b.md", review.path);
+    try review.previousFile();
+    try std.testing.expectEqualStrings("a.lua", review.path);
+    review.toggleFileList();
+    try std.testing.expect(!review.show_file_list);
 }
 
 test "last viewable tool prefers a completed read_file" {

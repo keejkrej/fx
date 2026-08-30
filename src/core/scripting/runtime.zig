@@ -29,6 +29,18 @@ pub const LspStartSpec = struct {
     root: []const u8,
 };
 
+pub const DiffFile = struct {
+    path: []const u8,
+    old_text: []const u8,
+    new_text: []const u8,
+};
+
+pub const DiffReview = struct {
+    files: []const DiffFile,
+    line: ?u32 = null,
+    side_by_side: bool = true,
+};
+
 pub const Host = struct {
     ctx: *anyopaque = undefined,
     notify: *const fn (ctx: *anyopaque, message: []const u8, tone: types.NoticeTone) void = silentNotify,
@@ -44,6 +56,7 @@ pub const Host = struct {
         new_text: []const u8,
         line: ?u32,
     ) anyerror!void = rejectDiff,
+    open_review: *const fn (ctx: *anyopaque, review: DiffReview) anyerror!void = rejectReview,
     allow_process: *const fn (ctx: *anyopaque) bool = denyProcess,
     start_lsp: *const fn (ctx: *anyopaque, spec: LspStartSpec) anyerror!void = rejectLsp,
     stop_lsp: *const fn (ctx: *anyopaque, name: []const u8) anyerror!void = rejectLspStop,
@@ -618,6 +631,9 @@ fn rejectView(_: *anyopaque, _: []const u8, _: ?u32) anyerror!void {
 fn rejectDiff(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8, _: ?u32) anyerror!void {
     return error.Unsupported;
 }
+fn rejectReview(_: *anyopaque, _: DiffReview) anyerror!void {
+    return error.Unsupported;
+}
 fn rejectLsp(_: *anyopaque, _: LspStartSpec) anyerror!void {
     return error.LspUnavailable;
 }
@@ -876,6 +892,7 @@ fn apiViewOpen(L: ?*lua.State) callconv(.c) c_int {
 fn apiViewDiff(L: ?*lua.State) callconv(.c) c_int {
     if (comptime !enabled) return 0;
     const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    if (lua.istable(L, 1)) return apiViewDiffReview(L, rt);
     lua.luaL_checktype(L, 1, lua.TSTRING);
     lua.luaL_checktype(L, 2, lua.TSTRING);
     lua.luaL_checktype(L, 3, lua.TSTRING);
@@ -887,6 +904,104 @@ fn apiViewDiff(L: ?*lua.State) callconv(.c) c_int {
         return lua.raise(L, @errorName(err));
     };
     return 0;
+}
+
+fn apiViewDiffReview(L: ?*lua.State, rt: *Runtime) c_int {
+    _ = lua.lua_getfield(L, 1, "files");
+    if (!lua.istable(L, -1)) {
+        lua.pop(L, 1);
+        return lua.raise(L, "files required");
+    }
+    const files_idx = lua.lua_absindex(L, -1);
+    var files: std.ArrayList(DiffFile) = .empty;
+    defer files.deinit(rt.alloc);
+    var owned: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned.items) |item| rt.alloc.free(item);
+        owned.deinit(rt.alloc);
+    }
+
+    var i: lua.Integer = 1;
+    while (true) : (i += 1) {
+        _ = lua.lua_rawgeti(L, files_idx, i);
+        if (lua.isnoneornil(L, -1)) {
+            lua.pop(L, 1);
+            break;
+        }
+        if (!lua.istable(L, -1)) {
+            lua.pop(L, 1);
+            return lua.raise(L, "file entry must be a table");
+        }
+        const path = dupField(L, rt, -1, "path") catch {
+            lua.pop(L, 1);
+            return lua.raise(L, "file path required");
+        };
+        owned.append(rt.alloc, path) catch {
+            rt.alloc.free(path);
+            lua.pop(L, 1);
+            return lua.raise(L, "OutOfMemory");
+        };
+        const old_text = dupFieldOrEmpty(L, rt, -1, "old") catch {
+            lua.pop(L, 1);
+            return lua.raise(L, "OutOfMemory");
+        };
+        owned.append(rt.alloc, old_text) catch {
+            rt.alloc.free(old_text);
+            lua.pop(L, 1);
+            return lua.raise(L, "OutOfMemory");
+        };
+        const new_text = dupFieldOrEmpty(L, rt, -1, "new") catch {
+            lua.pop(L, 1);
+            return lua.raise(L, "OutOfMemory");
+        };
+        owned.append(rt.alloc, new_text) catch {
+            rt.alloc.free(new_text);
+            lua.pop(L, 1);
+            return lua.raise(L, "OutOfMemory");
+        };
+        files.append(rt.alloc, .{
+            .path = path,
+            .old_text = old_text,
+            .new_text = new_text,
+        }) catch {
+            lua.pop(L, 1);
+            return lua.raise(L, "OutOfMemory");
+        };
+        lua.pop(L, 1);
+    }
+    lua.pop(L, 1);
+    if (files.items.len == 0) return lua.raise(L, "files required");
+
+    var side_by_side = true;
+    _ = lua.lua_getfield(L, 1, "layout");
+    if (lua.tostring(L, -1)) |layout_name| {
+        if (std.mem.eql(u8, layout_name, "unified")) side_by_side = false;
+    }
+    lua.pop(L, 1);
+
+    rt.host.open_review(rt.host.ctx, .{
+        .files = files.items,
+        .line = optionalLineArg(L, 1),
+        .side_by_side = side_by_side,
+    }) catch |err| {
+        return lua.raise(L, @errorName(err));
+    };
+    return 0;
+}
+
+fn dupField(L: ?*lua.State, rt: *Runtime, idx: c_int, key: [*:0]const u8) error{ Missing, OutOfMemory }![]u8 {
+    _ = lua.lua_getfield(L, idx, key);
+    defer lua.pop(L, 1);
+    const text = lua.tostring(L, -1) orelse return error.Missing;
+    if (text.len == 0) return error.Missing;
+    return rt.alloc.dupe(u8, text);
+}
+
+fn dupFieldOrEmpty(L: ?*lua.State, rt: *Runtime, idx: c_int, key: [*:0]const u8) error{OutOfMemory}![]u8 {
+    _ = lua.lua_getfield(L, idx, key);
+    defer lua.pop(L, 1);
+    const text = lua.tostring(L, -1) orelse "";
+    return rt.alloc.dupe(u8, text);
 }
 
 fn apiWorkspaceIndex(L: ?*lua.State) callconv(.c) c_int {
@@ -1439,6 +1554,61 @@ test "fx.view.diff calls the host with old and new text" {
     try std.testing.expectEqualStrings("keep\nold\n", ctx.old_text.items);
     try std.testing.expectEqualStrings("keep\nnew\n", ctx.new_text.items);
     try std.testing.expectEqual(@as(?u32, 2), ctx.line);
+}
+
+test "fx.view.diff review table calls the host with every file" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.command("showreview", function()
+        \\  fx.view.diff({
+        \\    files = {
+        \\      { path = "a.lua", old = "old-a", new = "new-a" },
+        \\      { path = "b.md", old = "old-b", new = "new-b" },
+        \\    },
+        \\    layout = "side",
+        \\  })
+        \\end)
+        \\
+    );
+
+    const Ctx = struct {
+        count: usize = 0,
+        first_path: std.ArrayList(u8) = .empty,
+        second_path: std.ArrayList(u8) = .empty,
+        side_by_side: bool = false,
+        alloc: Allocator,
+        fn review(raw: *anyopaque, spec: DiffReview) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.count = spec.files.len;
+            ctx.side_by_side = spec.side_by_side;
+            if (spec.files.len >= 1) try ctx.first_path.appendSlice(ctx.alloc, spec.files[0].path);
+            if (spec.files.len >= 2) try ctx.second_path.appendSlice(ctx.alloc, spec.files[1].path);
+        }
+    };
+    var ctx = Ctx{ .alloc = alloc };
+    defer ctx.first_path.deinit(alloc);
+    defer ctx.second_path.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .open_review = Ctx.review,
+    });
+    runtime.loadInit(null, workspace);
+    runtime.invokeCommand("/showreview", "");
+    try std.testing.expectEqual(@as(usize, 2), ctx.count);
+    try std.testing.expect(ctx.side_by_side);
+    try std.testing.expectEqualStrings("a.lua", ctx.first_path.items);
+    try std.testing.expectEqualStrings("b.md", ctx.second_path.items);
 }
 
 test "workspace lua plugin can require and register a command" {

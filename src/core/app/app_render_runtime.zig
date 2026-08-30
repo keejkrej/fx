@@ -2681,6 +2681,8 @@ pub fn Runtime(comptime App: type) type {
                         });
                     }
                 }
+                var file_list_buf: [32]code_viewer_screen.FileListEntry = undefined;
+                const file_list = app.code_viewer.fileList(&file_list_buf);
                 var screen = try code_viewer_screen.paint(app.alloc, .{
                     .rows = app.shell.layout.rows,
                     .cols = app.shell.layout.cols,
@@ -2706,6 +2708,9 @@ pub fn Runtime(comptime App: type) type {
                         .hunk_index = app.code_viewer.hunk_index,
                         .display = app.code_viewer.diff_layout,
                     },
+                    .file_list = file_list,
+                    .file_index = app.code_viewer.file_index,
+                    .show_file_list = app.code_viewer.show_file_list,
                     .clear_display = clear_display,
                 });
                 defer screen.deinit(app.alloc);

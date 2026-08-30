@@ -94,6 +94,7 @@ pub fn Runtime(comptime App: type) type {
                 .set_opt = setOpt,
                 .open_view = openView,
                 .open_diff = openDiff,
+                .open_review = openReview,
                 .allow_process = allowProcess,
                 .start_lsp = startLsp,
                 .stop_lsp = stopLsp,
@@ -210,6 +211,32 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             try noticeViewerUnavailable(app, path);
+        }
+
+        fn openReview(raw: *anyopaque, review: scripting.DiffReview) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(raw));
+            if (comptime @hasField(App, "code_viewer")) {
+                const app_code_viewer_runtime = @import("app_code_viewer_runtime.zig");
+                var files: std.ArrayList(app_code_viewer_runtime.DiffFile) = .empty;
+                defer files.deinit(app.alloc);
+                try files.ensureTotalCapacity(app.alloc, review.files.len);
+                for (review.files) |file| {
+                    files.appendAssumeCapacity(.{
+                        .path = file.path,
+                        .old_text = file.old_text,
+                        .new_text = file.new_text,
+                    });
+                }
+                try app_code_viewer_runtime.Runtime(App).openReview(
+                    app,
+                    files.items,
+                    review.side_by_side,
+                    review.line,
+                );
+                return;
+            }
+            const label = if (review.files.len > 0) review.files[0].path else "diff";
+            try noticeViewerUnavailable(app, label);
         }
 
         fn noticeViewerUnavailable(app: *App, path: []const u8) !void {
