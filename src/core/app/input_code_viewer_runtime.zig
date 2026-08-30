@@ -35,6 +35,7 @@ const ViewerKey = union(enum) {
     previous_file,
     toggle_layout,
     toggle_file_list,
+    comment,
     confirm,
     cancel,
     prompt_byte: u8,
@@ -74,7 +75,14 @@ pub fn Runtime(comptime App: type) type {
                                 return;
                             },
                             .cancel => owned_app.code_viewer.cancelPrompt(),
-                            .confirm => owned_app.code_viewer.confirmPrompt(),
+                            .confirm => {
+                                if (owned_app.code_viewer.mode == .comment) {
+                                    try submitDiffComment(App, owned_app);
+                                    return;
+                                }
+                                owned_app.code_viewer.confirmPrompt();
+                            },
+                            .comment => owned_app.code_viewer.beginComment(),
                             .prompt_byte => |byte| try owned_app.code_viewer.appendPromptByte(byte),
                             .prompt_delete => try owned_app.code_viewer.deletePromptByte(),
                             .move => |delta| owned_app.code_viewer.moveBy(delta),
@@ -113,6 +121,22 @@ pub fn Runtime(comptime App: type) type {
     };
 }
 
+fn submitDiffComment(comptime App: type, app: *App) !void {
+    if (comptime !@hasField(App, "code_viewer")) return;
+    const snippet = try app.code_viewer.formatDiffComment(app.alloc);
+    defer app.alloc.free(snippet);
+    if (comptime @hasField(App, "input_runtime")) {
+        const merged = try app_code_viewer_runtime.mergeComposerContext(
+            app.alloc,
+            app.input_runtime.edit_state.input.items,
+            snippet,
+        );
+        defer app.alloc.free(merged);
+        try app.input_runtime.textReplacementState().replace(app.alloc, merged);
+    }
+    try app_code_viewer_runtime.Runtime(App).close(app);
+}
+
 fn keyForByte(mode: app_code_viewer_runtime.Mode, byte: u8) ?ViewerKey {
     if (mode != .browse) {
         return switch (byte) {
@@ -146,6 +170,7 @@ fn keyForByte(mode: app_code_viewer_runtime.Mode, byte: u8) ?ViewerKey {
         'h' => .previous_file,
         '\t' => .toggle_file_list,
         't', 'T' => .toggle_layout,
+        'c', 'C', 'i' => .comment,
         else => null,
     };
 }

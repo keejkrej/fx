@@ -95,6 +95,7 @@ pub fn Runtime(comptime App: type) type {
                 .open_view = openView,
                 .open_diff = openDiff,
                 .open_review = openReview,
+                .append_input = appendInput,
                 .allow_process = allowProcess,
                 .start_lsp = startLsp,
                 .stop_lsp = stopLsp,
@@ -237,6 +238,28 @@ pub fn Runtime(comptime App: type) type {
             }
             const label = if (review.files.len > 0) review.files[0].path else "diff";
             try noticeViewerUnavailable(app, label);
+        }
+
+        fn appendInput(raw: *anyopaque, text: []const u8) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(raw));
+            if (comptime !@hasField(App, "input_runtime")) return;
+            const app_code_viewer_runtime = @import("app_code_viewer_runtime.zig");
+            const merged = try app_code_viewer_runtime.mergeComposerContext(
+                app.alloc,
+                app.input_runtime.edit_state.input.items,
+                text,
+            );
+            defer app.alloc.free(merged);
+            try app.input_runtime.textReplacementState().replace(app.alloc, merged);
+            if (comptime @hasField(App, "shell")) {
+                if (comptime @hasField(App, "terminal")) {
+                    if (!app.terminal.codeViewerScreenActive()) {
+                        app.shell.render_requests.request(.footer);
+                    }
+                } else {
+                    app.shell.render_requests.request(.footer);
+                }
+            }
         }
 
         fn noticeViewerUnavailable(app: *App, path: []const u8) !void {

@@ -2696,6 +2696,7 @@ pub fn Runtime(comptime App: type) type {
                     .matches = app.code_viewer.matches.items,
                     .match_index = app.code_viewer.match_index,
                     .goto_buf = app.code_viewer.goto_buf.items,
+                    .comment_buf = app.code_viewer.comment_buf.items,
                     .file = .{
                         .lines = app.code_viewer.lines.items,
                         .highlighted = app.code_viewer.highlighted_lines.items,

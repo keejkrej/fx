@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { REPO_ROOT } from "../evals/eval-helpers";
-import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { composerContains, hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 30_000;
@@ -124,6 +124,48 @@ describe.skipIf(SKIP)("tui: Lua init.lua", () => {
       await session.sendKeys("q");
       const after = await session.waitForComposer(10_000);
       expect(hasEmptyComposer(after)).toBe(true);
+      expect(session.paneStatus()).toEqual({ dead: false, status: null });
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/diffview comment injects a hunk note into the agent input",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-lua-diffview-comment-"));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      writeFileSync(join(home, ".fx", "init.lua"), "-- profile empty\n");
+      writeFileSync(stderrPath, "");
+      tempDirs.push(root);
+      const terminal = await TmuxSession.create({
+        cwd: REPO_ROOT,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_PERMISSION_MODE: undefined,
+          FX_SKIP_ONBOARDING: "1",
+          VERCEL_OIDC_TOKEN: undefined,
+        },
+      });
+      session = terminal;
+      await session.waitForComposer(10_000);
+      await session.sendText("/diffview");
+      await session.waitForText("DIFFVIEW_DEMO_OLD", 5_000);
+      await session.sendKeys("c");
+      await session.waitForText("send to agent", 5_000);
+      await session.sendLiteralText("DIFFVIEW_COMMENT_NOTE");
+      await session.sendKeys("Enter");
+      const pane = await session.waitForText("DIFFVIEW_COMMENT_NOTE", 10_000);
+      expect(pane).toContain("Diff comment on lua/diffview/demo.lua");
+      expect(pane).toContain("```diff");
+      expect(pane).toContain("DIFFVIEW_COMMENT_NOTE");
+      expect(composerContains(pane, "DIFFVIEW_COMMENT_NOTE") || pane.includes("DIFFVIEW_COMMENT_NOTE")).toBe(true);
       expect(session.paneStatus()).toEqual({ dead: false, status: null });
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },

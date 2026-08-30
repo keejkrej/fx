@@ -8,7 +8,7 @@ const vt_emulator = @import("../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const Mode = enum { browse, search, goto_line };
+pub const Mode = enum { browse, search, goto_line, comment };
 
 pub const Kind = enum { file, diff };
 
@@ -54,6 +54,7 @@ pub const PaintInput = struct {
     matches: []const usize = &.{},
     match_index: usize = 0,
     goto_buf: []const u8 = "",
+    comment_buf: []const u8 = "",
     file: FileModel = .{ .lines = &.{} },
     diff: DiffModel = .{ .lines = &.{} },
     file_list: []const FileListEntry = &.{},
@@ -127,7 +128,12 @@ pub fn paint(alloc: Allocator, input: PaintInput) !Paint {
     } else {
         const cursor_row = if (placed.status_row > 0) placed.status_row else input.rows;
         const prefix_width: u16 = 1;
-        const typed = if (input.mode == .search) input.query else input.goto_buf;
+        const typed = switch (input.mode) {
+            .browse => "",
+            .search => input.query,
+            .goto_line => input.goto_buf,
+            .comment => input.comment_buf,
+        };
         const cursor_col: u16 = prefix_width +| @as(u16, @intCast(@min(typed.len, @as(usize, input.cols -| 1))));
         try writeCursor(&out.writer, cursor_row, cursor_col +| 1);
         try out.writer.writeAll("\x1b[?25h");
@@ -462,6 +468,10 @@ fn composeStatus(alloc: Allocator, input: PaintInput) !std.ArrayList(u8) {
             try row.append(alloc, ':');
             try row_text.appendClipped(alloc, &row, input.goto_buf, input.cols -| 1);
         },
+        .comment => {
+            try row.append(alloc, '>');
+            try row_text.appendClipped(alloc, &row, input.comment_buf, input.cols -| 1);
+        },
     }
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
@@ -474,13 +484,14 @@ fn composeHint(alloc: Allocator, input: PaintInput) !std.ArrayList(u8) {
     const text = switch (input.mode) {
         .browse => if (input.kind == .diff)
             if (input.file_list.len > 1)
-                "q quit  {/} hunk  h/l file  tab files  t layout  j/k"
+                "q quit  {/} hunk  h/l file  tab files  t layout  c comment"
             else
-                "q quit  {/} hunk  t layout  j/k scroll  / search"
+                "q quit  {/} hunk  t layout  c comment  / search"
         else
             "q quit  / search  : line  n/N next  d def  j/k scroll",
         .search => "enter find  n/N next  esc clear",
         .goto_line => "enter jump  esc cancel",
+        .comment => "enter send to agent  esc cancel",
     };
     try row_text.appendClipped(alloc, &row, text, input.cols);
     try row.appendSlice(alloc, ui_render.reset_style);
@@ -814,4 +825,39 @@ test "diff review paints a file list beside the hunks" {
     try grid.rowTextTrimmed(10, &hint);
     try std.testing.expect(std.mem.find(u8, hint.items, "h/l file") != null);
     try std.testing.expect(std.mem.find(u8, hint.items, "{/} hunk") != null);
+    try std.testing.expect(std.mem.find(u8, hint.items, "c comment") != null);
+}
+
+test "diff comment prompt paints the note and send-to-agent hint" {
+    const alloc = std.testing.allocator;
+    const lines = [_]diff_mod.DiffLine{
+        .{ .op = .remove, .old_num = 1, .text = "old" },
+        .{ .op = .add, .new_num = 1, .text = "new" },
+    };
+    var screen = try paint(alloc, .{
+        .rows = 8,
+        .cols = 60,
+        .kind = .diff,
+        .path = "demo.lua",
+        .cursor = 0,
+        .scroll = 0,
+        .mode = .comment,
+        .comment_buf = "look at this hunk",
+        .diff = .{ .lines = &lines },
+    });
+    defer screen.deinit(alloc);
+
+    var grid = try vt_emulator.Grid.init(alloc, 60, 8);
+    defer grid.deinit();
+    try grid.feed(screen.bytes);
+
+    var status: std.ArrayList(u8) = .empty;
+    defer status.deinit(alloc);
+    try grid.rowTextTrimmed(7, &status);
+    try std.testing.expect(std.mem.find(u8, status.items, ">look at this hunk") != null);
+
+    var hint: std.ArrayList(u8) = .empty;
+    defer hint.deinit(alloc);
+    try grid.rowTextTrimmed(8, &hint);
+    try std.testing.expect(std.mem.find(u8, hint.items, "enter send to agent") != null);
 }

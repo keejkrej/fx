@@ -1,8 +1,10 @@
 -- In-TUI diff review plugin. This is the Lua plugin-system demo: it registers
 -- `/diffview`, then opens fx's existing code-viewer owner (not a child
 -- terminal) on a multi-file review. Side-by-side, a file list, hunk jumps,
--- and add/remove highlighting are the Lumen-shaped bits; the rest stays
--- inside fx's TUI.
+-- and add/remove highlighting are the Lumen-shaped bits. The key interaction
+-- is review comments: `c` (or `i`) on a hunk types a note, Enter closes the
+-- viewer, and the quoted hunk plus note land in the main agent input box.
+-- No separate chat; comments are agent context, ready to send.
 
 local M = {}
 
@@ -63,7 +65,7 @@ end
 
 function M.setup()
   fx.command("diffview", M.open, {
-    desc = "Open the in-TUI Lua diff-view demo",
+    desc = "Open the in-TUI Lua diff-view demo; c comments a hunk into the agent input",
   })
 end
 

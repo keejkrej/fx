@@ -57,6 +57,7 @@ pub const Host = struct {
         line: ?u32,
     ) anyerror!void = rejectDiff,
     open_review: *const fn (ctx: *anyopaque, review: DiffReview) anyerror!void = rejectReview,
+    append_input: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void = rejectInput,
     allow_process: *const fn (ctx: *anyopaque) bool = denyProcess,
     start_lsp: *const fn (ctx: *anyopaque, spec: LspStartSpec) anyerror!void = rejectLsp,
     stop_lsp: *const fn (ctx: *anyopaque, name: []const u8) anyerror!void = rejectLspStop,
@@ -534,6 +535,11 @@ pub const Runtime = struct {
         lua.lua_setfield(L, -2, "view");
 
         lua.newtable(L);
+        lua.pushcfunction(L, apiInputAppend);
+        lua.lua_setfield(L, -2, "append");
+        lua.lua_setfield(L, -2, "input");
+
+        lua.newtable(L);
         lua.pushcfunction(L, apiLspStart);
         lua.lua_setfield(L, -2, "start");
         lua.pushcfunction(L, apiLspStop);
@@ -632,6 +638,9 @@ fn rejectDiff(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8, _: ?u3
     return error.Unsupported;
 }
 fn rejectReview(_: *anyopaque, _: DiffReview) anyerror!void {
+    return error.Unsupported;
+}
+fn rejectInput(_: *anyopaque, _: []const u8) anyerror!void {
     return error.Unsupported;
 }
 fn rejectLsp(_: *anyopaque, _: LspStartSpec) anyerror!void {
@@ -984,6 +993,17 @@ fn apiViewDiffReview(L: ?*lua.State, rt: *Runtime) c_int {
         .line = optionalLineArg(L, 1),
         .side_by_side = side_by_side,
     }) catch |err| {
+        return lua.raise(L, @errorName(err));
+    };
+    return 0;
+}
+
+fn apiInputAppend(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    lua.luaL_checktype(L, 1, lua.TSTRING);
+    const text = lua.tostring(L, 1) orelse return lua.raise(L, "text required");
+    rt.host.append_input(rt.host.ctx, text) catch |err| {
         return lua.raise(L, @errorName(err));
     };
     return 0;
@@ -1669,6 +1689,45 @@ test "workspace lua plugin can require and register a command" {
     try std.testing.expectEqualStrings("demo.lua", ctx.path.items);
     try std.testing.expectEqualStrings("old", ctx.old_text.items);
     try std.testing.expectEqualStrings("new", ctx.new_text.items);
+}
+
+test "fx.input.append calls the host with composer text" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.command("say", function()
+        \\  fx.input.append("hello from lua")
+        \\end)
+        \\
+    );
+
+    const Ctx = struct {
+        text: std.ArrayList(u8) = .empty,
+        alloc: Allocator,
+        fn append(raw: *anyopaque, text: []const u8) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            try ctx.text.appendSlice(ctx.alloc, text);
+        }
+    };
+    var ctx = Ctx{ .alloc = alloc };
+    defer ctx.text.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .append_input = Ctx.append,
+    });
+    runtime.loadInit(null, workspace);
+    runtime.invokeCommand("/say", "");
+    try std.testing.expectEqualStrings("hello from lua", ctx.text.items);
 }
 
 test "fx.lsp.start passes name cmd and workspace root to the host" {
