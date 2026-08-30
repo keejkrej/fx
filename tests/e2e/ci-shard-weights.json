@@ -6,6 +6,7 @@
   { "file": "lua-init.test.ts", "weight": 6 },
   { "file": "ci-shards.test.ts", "weight": 15 },
   { "file": "cli.test.ts", "weight": 19 },
+  { "file": "clipboard-image.test.ts", "weight": 6 },
   { "file": "config-persistence.test.ts", "weight": 64 },
   { "file": "context-limits-live.test.ts", "weight": 1 },
   { "file": "file-tool-paths.test.ts", "weight": 6 },

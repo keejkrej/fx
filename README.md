@@ -8,7 +8,7 @@ What this fork is for:
 
 - **Drop the Gateway requirement.** Point fx at a base URL and API key. No Vercel account, no AI Gateway billing, no `fx login` just to run the agent.
 - **Use a normal OpenAI-compatible endpoint.** `fx setup` (or `FX_OPENAI_BASE_URL` and `FX_OPENAI_API_KEY`) is the primary path. Model names come from that server.
-- **Add features on top.** Embedded Lua 5.4 for commands, keymaps, and hooks (`/lua`), plus a read-only `/view`er. `lua/diffview` is a working plugin: `/diffview` opens an in-TUI review (file list, side-by-side or unified hunks, add/remove color) inside fx, not a separate terminal. Press `c` on a hunk, type a note, and Enter injects that comment (path, line range, quoted lines, and the note) into the main agent input box as context.
+- **Add features on top.** Embedded Lua 5.4 for commands, keymaps, and hooks (`/lua`), plus a read-only `/view`er. `lua/diffview` is a working plugin: `/diffview` opens an in-TUI review (file list, side-by-side or unified hunks, add/remove color) inside fx, not a separate terminal. Press `c` on a hunk, type a note, and Enter injects that comment (path, line range, quoted lines, and the note) into the main agent input box as context. Clipboard **image-buffer** paste (Ctrl+V or `/paste`) attaches screenshot bytes from the clipboard as `[Image N]` on Linux (wl-paste / xclip) and Windows, not just macOS. A grim/hyprshot/Win+Shift+S copy is enough; you do not save a PNG to disk first.
 
 Install and upgrade from [this repo's GitHub Releases](https://github.com/keejkrej/fx/releases), not the official `curl | bash` from fx.sh.
 

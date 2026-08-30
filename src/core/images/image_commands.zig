@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const image_attachments = @import("image_attachments.zig");
 const types = @import("../shared/types.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
@@ -85,14 +86,57 @@ pub fn Commands(comptime App: type) type {
 
         pub fn attachClipboard(app: *App) !void {
             var loaded = image_attachments.loadClipboardImageAttachment(app.alloc) catch |err| {
-                if (err == error.NoClipboardImage) {
-                    try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "no image found on clipboard" }, true);
-                } else if (err != error.Unsupported) {
-                    const line = try std.fmt.allocPrint(app.alloc, "failed to paste clipboard image: {s}", .{@errorName(err)});
-                    defer app.alloc.free(line);
-                    try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = line }, true);
+                switch (err) {
+                    error.NoClipboardImage => {
+                        try app.writeDomainNotice(.{
+                            .topic = "images",
+                            .tone = .neutral,
+                            .body = "no image found on clipboard",
+                        }, true);
+                        return;
+                    },
+                    error.ClipboardToolMissing => {
+                        try app.writeDomainNotice(.{
+                            .topic = "images",
+                            .tone = .@"error",
+                            .body = image_attachments.clipboardToolMissingNotice(),
+                        }, true);
+                        return;
+                    },
+                    error.ImageTooLarge => {
+                        try app.writeDomainNotice(.{
+                            .topic = "images",
+                            .tone = .@"error",
+                            .body = image_attachments.image_too_large_notice,
+                        }, true);
+                        return;
+                    },
+                    error.UnsupportedImageType => {
+                        try app.writeDomainNotice(.{
+                            .topic = "images",
+                            .tone = .@"error",
+                            .body = "clipboard did not contain a PNG, JPEG, GIF, or WebP image",
+                        }, true);
+                        return;
+                    },
+                    else => switch (builtin.os.tag) {
+                        .macos, .linux, .windows => {
+                            const line = try std.fmt.allocPrint(
+                                app.alloc,
+                                "failed to paste clipboard image: {s}",
+                                .{@errorName(err)},
+                            );
+                            defer app.alloc.free(line);
+                            try app.writeDomainNotice(.{
+                                .topic = "images",
+                                .tone = .@"error",
+                                .body = line,
+                            }, true);
+                            return;
+                        },
+                        else => return,
+                    },
                 }
-                return;
             };
             defer loaded.deinit(app.alloc);
             switch (try insertImageAtCursor(App, app, loaded.takeAttachment(), .temporary)) {
@@ -974,7 +1018,10 @@ test "managePending reports empty lists populated lists and clear" {
 }
 
 test "attachClipboard is silent on unsupported platforms" {
-    if (@import("builtin").os.tag == .macos) return;
+    switch (builtin.os.tag) {
+        .macos, .linux, .windows => return,
+        else => {},
+    }
 
     const alloc = std.testing.allocator;
     var app = FakeApp{ .alloc = alloc };
