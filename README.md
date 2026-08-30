@@ -1,3 +1,19 @@
+## About this fork
+
+This is **keejkrej/fx**, a fork of [vercel-labs/fx](https://github.com/vercel-labs/fx) (the public `fx` project from Vercel).
+
+Upstream fx is built around Vercel AI Gateway. This line is not. The agent talks to a normal OpenAI-compatible Chat Completions API: any server that speaks `POST /v1/chat/completions`, local or hosted.
+
+What this fork is for:
+
+- **Drop the Gateway requirement.** Point fx at a base URL and API key. No Vercel account, no AI Gateway billing, no `fx login` just to run the agent.
+- **Use a normal OpenAI-compatible endpoint.** `fx setup` (or `FX_OPENAI_BASE_URL` and `FX_OPENAI_API_KEY`) is the primary path. Model names come from that server.
+- **Add features on top.** Embedded Lua 5.4 for commands, keymaps, and hooks (`/lua`), plus a read-only `/view`er.
+
+Install and upgrade from [this repo's GitHub Releases](https://github.com/keejkrej/fx/releases), not the official `curl | bash` from fx.sh.
+
+The rest of this README is upstream's. For this fork, start with `fx setup`, not `fx login`.
+
 ```
  ⠀⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀
  ⠀⠀⠀⠀⠀⢰⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
