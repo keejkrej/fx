@@ -1714,6 +1714,10 @@ pub const ClipboardImageAttachment = struct {
     }
 };
 
+/// Persist clipboard image *bytes* as a normal file under `/tmp/fx-image-snapshots-*`
+/// (for example `clipboard.png`), then load it with `loadImageAttachment`.
+/// That temp path is the only bridge from screenshot clipboard buffers into the
+/// existing `[Image N]` attach pipeline. Do not add a parallel vision channel.
 pub fn persistImageBytes(alloc: std.mem.Allocator, bytes: []const u8) !ClipboardImageAttachment {
     if (bytes.len > max_image_bytes) return error.ImageTooLarge;
     const media_type = detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType;
@@ -1818,6 +1822,8 @@ fn loadLinuxClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAt
         switch (try fetchLinuxClipboardImage(alloc, backend)) {
             .bytes => |bytes| {
                 defer alloc.free(bytes);
+                // Bytes from wl-paste/xclip/xsel become a temp file, then a
+                // normal ImageAttachment. attachClipboard consumes that path.
                 return persistImageBytes(alloc, bytes);
             },
             .missing_tool => {},
@@ -2764,6 +2770,12 @@ test "persistImageBytes writes a snapshot source for png jpeg gif and webp" {
         const attachment = persisted.attachment orelse return error.TestExpectedEqual;
         try std.testing.expectEqualStrings(case.media_type, attachment.media_type);
         try std.testing.expect(std.fs.path.isAbsolute(attachment.path));
+        try std.testing.expect(std.mem.find(u8, attachment.path, "fx-image-snapshots-") != null);
+        try std.testing.expectEqualStrings(clipboardFileName(case.media_type), std.fs.path.basename(attachment.path));
+        const reloaded = try loadImageAttachment(alloc, attachment.path);
+        defer types.freeImageAttachment(alloc, reloaded);
+        try std.testing.expectEqualStrings(case.media_type, reloaded.media_type);
+        try std.testing.expectEqualStrings(attachment.path, reloaded.path);
     }
 
     try std.testing.expectError(error.UnsupportedImageType, persistImageBytes(alloc, "not-an-image"));
@@ -2858,6 +2870,11 @@ test "linux clipboard image buffer paste reads png bytes from xclip" {
     defer loaded.deinit(alloc);
     const attachment = loaded.attachment orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("image/png", attachment.media_type);
+    try std.testing.expect(std.mem.find(u8, attachment.path, "fx-image-snapshots-") != null);
+    try std.testing.expectEqualStrings("clipboard.png", std.fs.path.basename(attachment.path));
+    const reloaded = try loadImageAttachment(alloc, attachment.path);
+    defer types.freeImageAttachment(alloc, reloaded);
+    try std.testing.expectEqualStrings(attachment.path, reloaded.path);
     var header: [16]u8 = undefined;
     const stored = try readImageHeaderBytes(attachment.path, &header);
     try std.testing.expectEqualStrings("image/png", detectMediaTypeFromBytes(stored).?);

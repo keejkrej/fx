@@ -85,6 +85,9 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn attachClipboard(app: *App) !void {
+            // Screenshot clipboard buffers are written to a temp file by
+            // loadClipboardImageAttachment, then attached as a normal image
+            // path. This is the same [Image N] pipeline as /image <path>.
             var loaded = image_attachments.loadClipboardImageAttachment(app.alloc) catch |err| {
                 switch (err) {
                     error.NoClipboardImage => {
@@ -818,6 +821,46 @@ test "temporary image source is removed after insertion and remapped to its snap
         .{},
     );
     defer verified.deinit(alloc);
+}
+
+test "clipboard buffer paste attaches a temp snapshot file through the image pipeline" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try realTmpPath(alloc, &tmp, ".");
+    defer alloc.free(root);
+    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    defer alloc.free(snapshot_dir);
+
+    var persisted = try image_attachments.persistImageBytes(alloc, "\x89PNG\r\n\x1a\nclipboard-buffer");
+    const source_path = try alloc.dupe(u8, persisted.attachment.?.path);
+    defer alloc.free(source_path);
+    try std.testing.expect(std.mem.find(u8, source_path, "fx-image-snapshots-") != null);
+    try std.testing.expectEqualStrings("clipboard.png", std.fs.path.basename(source_path));
+
+    var app = FakeApp{
+        .alloc = alloc,
+        .snapshot_dir = snapshot_dir,
+    };
+    defer app.deinit();
+    const result = try Commands(FakeApp).insertImageAtCursor(
+        FakeApp,
+        &app,
+        persisted.takeAttachment(),
+        .temporary,
+    );
+    persisted.deinit(alloc);
+
+    try std.testing.expectEqual(InsertImageResult.inserted, result);
+    try std.testing.expectEqualStrings("[Image #1]", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    const pending = app.pending_images.items[0];
+    try std.testing.expectEqualStrings("image/png", pending.media_type);
+    try std.testing.expectEqualStrings(pending.snapshot_path.?, pending.path);
+    try std.testing.expect(std.fs.path.isAbsolute(pending.path));
+    const agent_path = try image_attachments.loadImageAttachment(alloc, pending.path);
+    defer types.freeImageAttachment(alloc, agent_path);
+    try std.testing.expectEqualStrings("image/png", agent_path.media_type);
 }
 
 test "temporary image source is removed on input full rejection and capture failure" {
