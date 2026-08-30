@@ -8,7 +8,7 @@ What this fork is for:
 
 - **Drop the Gateway requirement.** Point fx at a base URL and API key. No Vercel account, no AI Gateway billing, no `fx login` just to run the agent.
 - **Use a normal OpenAI-compatible endpoint.** `fx setup` (or `FX_OPENAI_BASE_URL` and `FX_OPENAI_API_KEY`) is the primary path. Model names come from that server.
-- **Add features on top.** Embedded Lua 5.4 for commands, keymaps, and hooks (`/lua`), plus a read-only `/view`er.
+- **Add features on top.** Embedded Lua 5.4 for commands, keymaps, and hooks (`/lua`), plus a read-only `/view`er. `lua/diffview` is a working plugin, not a doc sample: `/diffview` opens a code-review style diff in that viewer.
 
 Install and upgrade from [this repo's GitHub Releases](https://github.com/keejkrej/fx/releases), not the official `curl | bash` from fx.sh.
 
@@ -166,7 +166,7 @@ fx.command("hello", function()
 end)
 ```
 
-`fx.command`, `fx.keymap`, `fx.hook`, `fx.notify`, `fx.opt`, `fx.model`, `fx.provider`, `fx.view.open`, and `fx.lsp.start` are the v1 API. `/view [path]` opens the read-only code viewer; `/view --diff` opens the latest edit hunks. `fx.view.open(path, { line = n })` opens the same viewer. `fx.lsp.start({ name = "zls", cmd = { "zls" }, root = fx.workspace.root })` starts a user-installed language server. Diagnostics show in the viewer; `d` jumps to definition and reopens the viewer. fx does not bundle language servers. LSP process spawn is permission-gated: yolo and auto allow it, ask requires an `lsp` allow rule. Lua file reads stay inside `~/.fx/lua`, `~/.fx/pack`, and the workspace `.fx/` tree. `os.execute` and `io.popen` stay blocked unless permission mode is yolo. WebAssembly and NAPI hosts skip Lua.
+`fx.command`, `fx.keymap`, `fx.hook`, `fx.notify`, `fx.opt`, `fx.model`, `fx.provider`, `fx.view.open`, `fx.view.diff`, and `fx.lsp.start` are the v1 API. `/view [path]` opens the read-only code viewer; `/view --diff` opens the latest edit hunks. `fx.view.open(path, { line = n })` opens the same viewer. `fx.view.diff(path, old, new, { line = n })` opens it on a unified diff of two strings. Workspace `lua/?/init.lua` is on `package.path`, so a plugin like `lua/diffview` can `require("diffview")` from `.fx/init.lua`. This repo ships that plugin as `/diffview`. `fx.lsp.start({ name = "zls", cmd = { "zls" }, root = fx.workspace.root })` starts a user-installed language server. Diagnostics show in the viewer; `d` jumps to definition and reopens the viewer. fx does not bundle language servers. LSP process spawn is permission-gated: yolo and auto allow it, ask requires an `lsp` allow rule. Lua file reads stay inside `~/.fx/lua`, `~/.fx/pack`, the workspace `.fx/` tree, and workspace `lua/`. `os.execute` and `io.popen` stay blocked unless permission mode is yolo. WebAssembly and NAPI hosts skip Lua.
 
 ## Documentation
 

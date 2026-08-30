@@ -93,6 +93,7 @@ pub fn Runtime(comptime App: type) type {
                 .get_opt = getOpt,
                 .set_opt = setOpt,
                 .open_view = openView,
+                .open_diff = openDiff,
                 .allow_process = allowProcess,
                 .start_lsp = startLsp,
                 .stop_lsp = stopLsp,
@@ -192,6 +193,26 @@ pub fn Runtime(comptime App: type) type {
                 try app_code_viewer_runtime.Runtime(App).openPath(app, path, line);
                 return;
             }
+            try noticeViewerUnavailable(app, path);
+        }
+
+        fn openDiff(
+            raw: *anyopaque,
+            path: []const u8,
+            old_text: []const u8,
+            new_text: []const u8,
+            line: ?u32,
+        ) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(raw));
+            if (comptime @hasField(App, "code_viewer")) {
+                const app_code_viewer_runtime = @import("app_code_viewer_runtime.zig");
+                try app_code_viewer_runtime.Runtime(App).openDiff(app, path, old_text, new_text, line);
+                return;
+            }
+            try noticeViewerUnavailable(app, path);
+        }
+
+        fn noticeViewerUnavailable(app: *App, path: []const u8) !void {
             const message = try std.fmt.allocPrint(
                 app.alloc,
                 "code viewer is unavailable ({s})",

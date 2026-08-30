@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { REPO_ROOT } from "../evals/eval-helpers";
 import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const SKIP = !tmuxAvailable();
@@ -77,6 +78,53 @@ describe.skipIf(SKIP)("tui: Lua init.lua", () => {
       expect(pane).toContain("hello from lua");
       expect(session.paneStatus()).toEqual({ dead: false, status: null });
       expect(readFileSync(launched.stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/diffview Lua plugin opens a code-review diff",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-lua-diffview-"));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      writeFileSync(join(home, ".fx", "init.lua"), "-- profile empty\n");
+      writeFileSync(stderrPath, "");
+      tempDirs.push(root);
+      const terminal = await TmuxSession.create({
+        cwd: REPO_ROOT,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_PERMISSION_MODE: undefined,
+          FX_SKIP_ONBOARDING: "1",
+          VERCEL_OIDC_TOKEN: undefined,
+        },
+      });
+      session = terminal;
+      await session.waitForComposer(10_000);
+      await session.sendText("/lua");
+      const status = await session.waitForText("/diffview", 5_000);
+      expect(status).toContain("Open the Lua plugin diff-view demo");
+      await session.sendText("/diffview");
+      const pane = await session.waitForText("DIFFVIEW_DEMO_OLD", 5_000);
+      expect(pane).toContain("diff  lua/diffview/demo.lua");
+      expect(pane).toContain("DIFFVIEW_DEMO_KEEP");
+      expect(pane).toMatch(/hunk\s+1\/3/);
+      expect(pane).toContain("[/] hunk");
+      expect(pane).toContain("q quit");
+      await session.sendKeys("G");
+      const moved = await session.waitForText("11/11", 5_000);
+      expect(moved).toContain("lua plugin demo");
+      await session.sendKeys("q");
+      const after = await session.waitForComposer(10_000);
+      expect(hasEmptyComposer(after)).toBe(true);
+      expect(session.paneStatus()).toEqual({ dead: false, status: null });
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
   );

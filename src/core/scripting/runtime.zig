@@ -37,6 +37,13 @@ pub const Host = struct {
     get_opt: *const fn (ctx: *anyopaque, alloc: Allocator, key: []const u8) anyerror!?[]u8 = missingOpt,
     set_opt: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void = rejectOpt,
     open_view: *const fn (ctx: *anyopaque, path: []const u8, line: ?u32) anyerror!void = rejectView,
+    open_diff: *const fn (
+        ctx: *anyopaque,
+        path: []const u8,
+        old_text: []const u8,
+        new_text: []const u8,
+        line: ?u32,
+    ) anyerror!void = rejectDiff,
     allow_process: *const fn (ctx: *anyopaque) bool = denyProcess,
     start_lsp: *const fn (ctx: *anyopaque, spec: LspStartSpec) anyerror!void = rejectLsp,
     stop_lsp: *const fn (ctx: *anyopaque, name: []const u8) anyerror!void = rejectLspStop,
@@ -474,6 +481,8 @@ pub const Runtime = struct {
             try appendPackageEntry(&out.writer, &first, self.workspace_root, ".fx/lua/?.lua");
             try appendPackageEntry(&out.writer, &first, self.workspace_root, ".fx/lua/?/init.lua");
             try appendPackageEntry(&out.writer, &first, self.workspace_root, ".fx/?/init.lua");
+            try appendPackageEntry(&out.writer, &first, self.workspace_root, "lua/?.lua");
+            try appendPackageEntry(&out.writer, &first, self.workspace_root, "lua/?/init.lua");
         }
         return out.toOwnedSlice();
     }
@@ -507,6 +516,8 @@ pub const Runtime = struct {
         lua.newtable(L);
         lua.pushcfunction(L, apiViewOpen);
         lua.lua_setfield(L, -2, "open");
+        lua.pushcfunction(L, apiViewDiff);
+        lua.lua_setfield(L, -2, "diff");
         lua.lua_setfield(L, -2, "view");
 
         lua.newtable(L);
@@ -542,6 +553,7 @@ pub const Runtime = struct {
         }
         if (self.workspace_root.len > 0) {
             if (underJoin(self.alloc, self.workspace_root, ".fx", path)) return true;
+            if (underJoin(self.alloc, self.workspace_root, "lua", path)) return true;
         }
         return false;
     }
@@ -601,6 +613,9 @@ fn rejectOpt(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
     return error.Unsupported;
 }
 fn rejectView(_: *anyopaque, _: []const u8, _: ?u32) anyerror!void {
+    return error.Unsupported;
+}
+fn rejectDiff(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8, _: ?u32) anyerror!void {
     return error.Unsupported;
 }
 fn rejectLsp(_: *anyopaque, _: LspStartSpec) anyerror!void {
@@ -836,23 +851,39 @@ fn apiOptNewindex(L: ?*lua.State) callconv(.c) c_int {
     return 0;
 }
 
+fn optionalLineArg(L: ?*lua.State, idx: c_int) ?u32 {
+    if (lua.lua_gettop(L) < idx or !lua.istable(L, idx)) return null;
+    _ = lua.lua_getfield(L, idx, "line");
+    defer lua.pop(L, 1);
+    if (lua.lua_type(L, -1) != lua.TNUMBER) return null;
+    const value = lua.tointeger(L, -1);
+    if (value > 0 and value <= std.math.maxInt(u32)) return @intCast(value);
+    return null;
+}
+
 fn apiViewOpen(L: ?*lua.State) callconv(.c) c_int {
     if (comptime !enabled) return 0;
     const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
     lua.luaL_checktype(L, 1, lua.TSTRING);
     const path = lua.tostring(L, 1) orelse return lua.raise(L, "path required");
-    var line: ?u32 = null;
-    if (lua.lua_gettop(L) >= 2 and lua.istable(L, 2)) {
-        _ = lua.lua_getfield(L, 2, "line");
-        if (lua.lua_type(L, -1) == lua.TNUMBER) {
-            const value = lua.tointeger(L, -1);
-            if (value > 0 and value <= std.math.maxInt(u32)) {
-                line = @intCast(value);
-            }
-        }
-        lua.pop(L, 1);
-    }
+    const line = optionalLineArg(L, 2);
     rt.host.open_view(rt.host.ctx, path, line) catch |err| {
+        return lua.raise(L, @errorName(err));
+    };
+    return 0;
+}
+
+fn apiViewDiff(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    lua.luaL_checktype(L, 1, lua.TSTRING);
+    lua.luaL_checktype(L, 2, lua.TSTRING);
+    lua.luaL_checktype(L, 3, lua.TSTRING);
+    const path = lua.tostring(L, 1) orelse return lua.raise(L, "path required");
+    const old_text = lua.tostring(L, 2) orelse return lua.raise(L, "old text required");
+    const new_text = lua.tostring(L, 3) orelse return lua.raise(L, "new text required");
+    const line = optionalLineArg(L, 4);
+    rt.host.open_diff(rt.host.ctx, path, old_text, new_text, line) catch |err| {
         return lua.raise(L, @errorName(err));
     };
     return 0;
@@ -1352,6 +1383,122 @@ test "fx.view.open calls the host with an optional line" {
     runtime.invokeCommand("/openit", "");
     try std.testing.expectEqualStrings("src/main.zig", ctx.path.items);
     try std.testing.expectEqual(@as(?u32, 12), ctx.line);
+}
+
+test "fx.view.diff calls the host with old and new text" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.command("showdiff", function()
+        \\  fx.view.diff("demo.lua", "keep\nold\n", "keep\nnew\n", { line = 2 })
+        \\end)
+        \\
+    );
+
+    const Ctx = struct {
+        path: std.ArrayList(u8) = .empty,
+        old_text: std.ArrayList(u8) = .empty,
+        new_text: std.ArrayList(u8) = .empty,
+        line: ?u32 = null,
+        alloc: Allocator,
+        fn diff(
+            raw: *anyopaque,
+            path: []const u8,
+            old_text: []const u8,
+            new_text: []const u8,
+            line: ?u32,
+        ) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            try ctx.path.appendSlice(ctx.alloc, path);
+            try ctx.old_text.appendSlice(ctx.alloc, old_text);
+            try ctx.new_text.appendSlice(ctx.alloc, new_text);
+            ctx.line = line;
+        }
+    };
+    var ctx = Ctx{ .alloc = alloc };
+    defer ctx.path.deinit(alloc);
+    defer ctx.old_text.deinit(alloc);
+    defer ctx.new_text.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .open_diff = Ctx.diff,
+    });
+    runtime.loadInit(null, workspace);
+    runtime.invokeCommand("/showdiff", "");
+    try std.testing.expectEqualStrings("demo.lua", ctx.path.items);
+    try std.testing.expectEqualStrings("keep\nold\n", ctx.old_text.items);
+    try std.testing.expectEqualStrings("keep\nnew\n", ctx.new_text.items);
+    try std.testing.expectEqual(@as(?u32, 2), ctx.line);
+}
+
+test "workspace lua plugin can require and register a command" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "lua/diffview");
+    var plugin = try tmp.dir.createFile(io_mod.getIo(), "lua/diffview/init.lua", .{});
+    try plugin.writeStreamingAll(io_mod.getIo(),
+        \\fx.command("diffview", function(payload)
+        \\  fx.view.diff("demo.lua", "old", "new")
+        \\end, { desc = "Lua plugin diff-view demo" })
+        \\return true
+        \\
+    );
+    plugin.close(io_mod.getIo());
+    var init_file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer init_file.close(io_mod.getIo());
+    try init_file.writeStreamingAll(io_mod.getIo(), "require(\"diffview\")\n");
+
+    const Ctx = struct {
+        path: std.ArrayList(u8) = .empty,
+        old_text: std.ArrayList(u8) = .empty,
+        new_text: std.ArrayList(u8) = .empty,
+        alloc: Allocator,
+        fn diff(
+            raw: *anyopaque,
+            path: []const u8,
+            old_text: []const u8,
+            new_text: []const u8,
+            _: ?u32,
+        ) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            try ctx.path.appendSlice(ctx.alloc, path);
+            try ctx.old_text.appendSlice(ctx.alloc, old_text);
+            try ctx.new_text.appendSlice(ctx.alloc, new_text);
+        }
+    };
+    var ctx = Ctx{ .alloc = alloc };
+    defer ctx.path.deinit(alloc);
+    defer ctx.old_text.deinit(alloc);
+    defer ctx.new_text.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .open_diff = Ctx.diff,
+    });
+    runtime.loadInit(null, workspace);
+    try std.testing.expectEqual(@as(usize, 0), runtime.notices.items.len);
+    try std.testing.expect(runtime.hasCommand("/diffview"));
+    runtime.invokeCommand("/diffview", "");
+    try std.testing.expectEqualStrings("demo.lua", ctx.path.items);
+    try std.testing.expectEqualStrings("old", ctx.old_text.items);
+    try std.testing.expectEqualStrings("new", ctx.new_text.items);
 }
 
 test "fx.lsp.start passes name cmd and workspace root to the host" {
