@@ -378,7 +378,7 @@ fn authPickerInteractionHint(view: auth_runtime.PickerView, width: u16) ?[]const
                 grok_browser_variants,
             else => return null,
         },
-        .api_key => return null,
+        .api_key, .openai_url, .openai_key => return null,
     };
     for (variants) |candidate| {
         if (display_width.visibleWidth(candidate) <= width) return candidate;

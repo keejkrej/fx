@@ -7,7 +7,6 @@ const app_lifecycle = @import("../app/app_lifecycle.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
-const providers_config = @import("../providers/config.zig");
 const secret = @import("../auth/secret.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const background_runtime = @import("../background/background_runtime.zig");
@@ -8568,7 +8567,7 @@ test "json run with missing API key prints diagnostic then final object" {
     const exit_code = try runWithDeps(alloc, &.{ "--json", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testMissingKeyStartup));
 
     try std.testing.expectEqual(@as(u8, 1), exit_code);
-    try std.testing.expectEqualStrings("fx ask: " ++ providers_config.missing_openai_credential_message ++ "\n", stderr_capture.bytes.items);
+    try std.testing.expectEqualStrings("fx ask: " ++ credentials.missing_credential_message ++ "\n", stderr_capture.bytes.items);
     try std.testing.expectEqualStrings(
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"MissingCredentials\"}\n",
         stdout_capture.bytes.items,

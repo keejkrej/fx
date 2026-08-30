@@ -7982,7 +7982,7 @@ fn openRoutingAuthPicker(app: *RoutingFakeApp) !void {
     app.auth.source_inventory.insert(.ai_gateway_api_key);
     app.auth.openPicker(app.alloc);
     try std.testing.expect(app.auth.movePicker(1));
-    try std.testing.expectEqual(@as(usize, 5), app.auth.pickerView().choiceCount());
+    try std.testing.expectEqual(@as(usize, 4), app.auth.pickerView().choiceCount());
     try std.testing.expectEqual(@as(usize, 1), app.auth.pickerView().selectedIndex());
 }
 

@@ -1124,6 +1124,7 @@ fn configuredProviderSelection(
         .gateway => default_model,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
+        .openai_compatible => return error.OpenAiCompatibleModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }

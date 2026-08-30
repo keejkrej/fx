@@ -1,6 +1,8 @@
 const std = @import("std");
 const config_runtime = @import("../config/config_runtime.zig");
 const io_mod = @import("../shared/io.zig");
+const model_provider = @import("../config/model_provider.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const scripting = @import("../scripting/runtime.zig");
 const types = @import("../shared/types.zig");
 
@@ -114,8 +116,12 @@ pub fn Runtime(comptime App: type) type {
             return "";
         }
 
-        fn provider(_: *anyopaque) []const u8 {
-            return "openai_compatible";
+        fn provider(raw: *anyopaque) []const u8 {
+            const app: *App = @ptrCast(@alignCast(raw));
+            if (comptime provider_runtime.supported(App)) {
+                return @tagName(provider_runtime.provider(app));
+            }
+            return @tagName(model_provider.ProviderId.gateway);
         }
 
         fn getOpt(raw: *anyopaque, alloc: Allocator, key: []const u8) anyerror!?[]u8 {
@@ -126,10 +132,10 @@ pub fn Runtime(comptime App: type) type {
             if (std.mem.eql(u8, key, "provider")) {
                 const workspace = if (comptime @hasField(App, "workspace_root")) app.workspace_root else "";
                 var settings = config_runtime.loadMergedSettings(alloc, workspace) catch {
-                    return try alloc.dupe(u8, "openai_compatible");
+                    return try alloc.dupe(u8, provider(raw));
                 };
                 defer settings.deinit(alloc);
-                const name = if (settings.provider) |value| value.persistedName() else "openai_compatible";
+                const name = if (settings.provider) |value| @tagName(value) else provider(raw);
                 return try alloc.dupe(u8, name);
             }
             if (std.mem.eql(u8, key, "permission_mode")) {
@@ -154,7 +160,11 @@ pub fn Runtime(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(raw));
             var patch = config_runtime.UserSettingsPatch{};
             if (std.mem.eql(u8, key, "model")) {
-                patch.model = value;
+                const current_provider = if (comptime provider_runtime.supported(App))
+                    provider_runtime.provider(app)
+                else
+                    .gateway;
+                patch.model_preference = .{ .provider = current_provider, .model = value };
             } else if (std.mem.eql(u8, key, "fast_mode")) {
                 patch.fast_mode = parseOnOff(value) orelse return error.InvalidValue;
             } else if (std.mem.eql(u8, key, "permission_mode")) {
@@ -163,9 +173,7 @@ pub fn Runtime(comptime App: type) type {
             } else if (std.mem.eql(u8, key, "effort")) {
                 patch.effort = types.ReasoningEffort.parse(value) orelse return error.InvalidValue;
             } else if (std.mem.eql(u8, key, "provider")) {
-                const backend = @import("../providers/model_backend.zig").parse(value) orelse
-                    return error.InvalidValue;
-                patch.provider = backend;
+                patch.provider = model_provider.parse(value) orelse return error.InvalidValue;
             } else {
                 return error.UnknownSetting;
             }

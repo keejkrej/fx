@@ -707,6 +707,7 @@ fn activateProviderSelection(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .openai_compatible => "OpenAI-compatible is already selected.\n",
         });
         return true;
     }
@@ -754,6 +755,7 @@ fn activateProviderSelection(
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .gateway => "configure a Gateway credential first",
+                .openai_compatible => "configure an OpenAI-compatible URL and API key first",
             },
         );
         return false;
@@ -763,6 +765,7 @@ fn activateProviderSelection(
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
+            .openai_compatible => "OpenAI-compatible model catalog is unavailable",
         });
         return false;
     };
@@ -807,13 +810,14 @@ fn activateProviderSelection(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway => unreachable,
+        .gateway, .openai_compatible => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .openai_compatible => "Provider set to OpenAI-compatible.\n",
         });
     }
     return true;
@@ -990,6 +994,10 @@ fn runNonInteractiveWithDeps(
                     }
                     try writeStdout(deps, "Signed in with Grok.\n");
                 },
+                .openai_compatible => {
+                    try writeStderr(deps, "usage: fx setup openai-compatible\n");
+                    return .handled_failure;
+                },
             }
             return .handled_success;
         },
@@ -1084,11 +1092,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: fx provider <gateway|codex|grok|openai-compatible>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or openai-compatible\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command))
@@ -1184,6 +1192,7 @@ fn runNonInteractiveWithDeps(
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
+                    .openai_compatible => "fx models: OpenAI-compatible model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };

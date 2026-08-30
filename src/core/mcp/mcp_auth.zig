@@ -13,6 +13,7 @@ pub const max_document_bytes: usize = 256 * 1024;
 pub const expiry_skew_ms: i64 = 60 * 1000;
 pub const max_scope_reauthorizations: u8 = 2;
 const request_timeout_seconds: i64 = 30;
+const callback_io_timeout_seconds: i64 = 30;
 const max_scope_tokens: usize = 64;
 const max_scope_token_bytes: usize = 256;
 

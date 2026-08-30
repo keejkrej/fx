@@ -29,6 +29,8 @@ const statusline_identity = @import("../workspace/statusline_identity.zig");
 const activity_runtime = @import("../output/activity_runtime.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const event_loop = @import("../../ui/event_loop.zig");
+const code_viewer_screen = @import("../../ui/code_viewer_screen.zig");
+const app_code_viewer_runtime = @import("app_code_viewer_runtime.zig");
 const surface_frame = @import("../../ui/footer/surface_frame.zig");
 const surface_invalidation = @import("../../ui/footer/surface_invalidation.zig");
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
@@ -151,6 +153,7 @@ const SurfaceFrameShell = struct {
 const RenderReconciliation = union(enum) {
     inline_render: InlineRenderReconciliation,
     file_approval_screen,
+    code_viewer_screen,
     frame_result: FrameAttemptResult,
 };
 
@@ -1840,6 +1843,7 @@ pub fn Runtime(comptime App: type) type {
             else switch (try reconcileBeforeFrameRender(app, render_input.queuedBannerRows(footer_ctx))) {
                 .inline_render => |inline_render| inline_render,
                 .file_approval_screen => return renderApprovalScreen(app),
+                .code_viewer_screen => return renderCodeViewerScreen(app),
                 .frame_result => |result| return result,
             };
             const presentation_commits_transcript =

@@ -3,7 +3,6 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const types = @import("../shared/types.zig");
-const model_backend = @import("../providers/model_backend.zig");
 const providers_config = @import("../providers/config.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const context_limits = @import("context_limits.zig");
@@ -100,7 +99,6 @@ pub const UserSettingsPatch = struct {
     /// Removes the key entirely so resolution returns to plain precedence.
     /// Distinct from a null `credential_source`, which means "leave unchanged".
     clear_credential_source: bool = false,
-    provider: ?model_backend.ModelBackend = null,
     clear_provider: bool = false,
     openai_compatible_base_url: ?[]const u8 = null,
     openai_compatible_api_key_env: ?[]const u8 = null,
@@ -123,7 +121,6 @@ pub const UserSettingsPatch = struct {
             self.permission_mode == null and
             self.credential_source == null and
             !self.clear_credential_source and
-            self.provider == null and
             !self.clear_provider and
             self.openai_compatible_base_url == null and
             self.openai_compatible_api_key_env == null and
@@ -1002,7 +999,6 @@ fn applyUserPatchToRoot(
         _ = root.object.orderedRemove("credential_source");
         application.changed = true;
     }
-    if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", @tagName(value)) or application.changed;
     if (patch.clear_provider and root.object.contains("provider")) {
         _ = root.object.orderedRemove("provider");
         application.changed = true;
@@ -1582,6 +1578,7 @@ fn putModelPreference(
         .gateway => "model",
         .codex => "codex_model",
         .grok => "grok_model",
+        .openai_compatible => "openai_compatible_model",
     };
     if (root.contains(legacy_key)) {
         _ = root.orderedRemove(legacy_key);
@@ -1855,11 +1852,6 @@ fn validateKnownSettingsObject(
     }
     if (object.get("credential_source")) |value| {
         if (value != .string or types.parseCredentialSource(value.string) == null) {
-            return error.InvalidSettingsFormat;
-        }
-    }
-    if (object.get("provider")) |value| {
-        if (value != .string or model_backend.parseStrict(value.string) == null) {
             return error.InvalidSettingsFormat;
         }
     }

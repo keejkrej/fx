@@ -317,7 +317,7 @@ test "parse recognizes logout" {
 
 test "parse recognizes login and logout" {
     switch (parse(testSlashRegistry(), "/login")) {
-        .login => |rest| try std.testing.expectEqualStrings("", rest),
+        .login => {},
         else => return error.TestExpectedEqual,
     }
     switch (parse(testSlashRegistry(), "/logout")) {

@@ -18,6 +18,7 @@ const provider_runtime = @import("provider_runtime.zig");
 const types = @import("../shared/types.zig");
 const providers_config = @import("../providers/config.zig");
 const openai_secret = @import("../providers/openai_secret.zig");
+const secret = @import("../auth/secret.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
     return runtime_profile.allows(App, .native_auth) or
@@ -62,6 +63,7 @@ pub fn Runtime(comptime App: type) type {
                     .codex => .chatgpt_subscription,
                     .grok => .grok_subscription,
                     .gateway => app.auth.credentialSource() orelse .fx_login,
+                    .openai_compatible => .stored_key,
                 };
                 const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
                     error.OutOfMemory => return err,
@@ -102,6 +104,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn runLoginCommand(app: *App, rest: []const u8) !void {
+            _ = rest;
             if (comptime !oauthAuthEnabled(App)) {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -1485,7 +1488,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
-                .gateway => unreachable,
+                .gateway, .openai_compatible => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);
@@ -1621,6 +1624,36 @@ const TestAuth = struct {
     fn apiKeyEntryActive(_: *const TestAuth) bool {
         return false;
     }
+
+    fn openaiUrlEntryActive(_: *const TestAuth) bool {
+        return false;
+    }
+
+    fn openaiKeyEntryActive(_: *const TestAuth) bool {
+        return false;
+    }
+
+    fn deleteOpenaiUrlByte(_: *TestAuth) bool {
+        return false;
+    }
+
+    fn appendOpenaiUrlByte(_: *TestAuth, _: std.mem.Allocator, _: u8) !bool {
+        return false;
+    }
+
+    fn openaiUrlText(_: *const TestAuth) []const u8 {
+        return "";
+    }
+
+    fn advanceOpenaiUrlToKey(_: *TestAuth) bool {
+        return false;
+    }
+
+    fn takeOpenaiKey(_: *TestAuth, _: std.mem.Allocator) ?[]u8 {
+        return null;
+    }
+
+    fn openOpenaiCompatiblePickerFromRoot(_: *TestAuth, _: std.mem.Allocator) void {}
 
     fn deleteApiKeyByte(_: *TestAuth) bool {
         return false;

@@ -2,6 +2,7 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const secret = @import("../auth/secret.zig");
+const credentials = @import("../auth/credentials.zig");
 const model_backend = @import("model_backend.zig");
 const openai_secret = @import("openai_secret.zig");
 
@@ -14,10 +15,8 @@ pub const openai_api_key_env = "FX_OPENAI_API_KEY";
 pub const default_api_key_env = openai_api_key_env;
 pub const max_base_url_bytes: usize = 2048;
 pub const max_api_key_env_bytes: usize = 128;
-pub const missing_openai_credential_message =
-    "Fx needs an OpenAI-compatible API key. Run fx setup openai-compatible, or set FX_OPENAI_BASE_URL and FX_OPENAI_API_KEY.";
-pub const missing_openai_interactive_credential_message =
-    "Fx needs an OpenAI-compatible API key. Run /setup to add a URL and key, or set FX_OPENAI_BASE_URL and FX_OPENAI_API_KEY.";
+pub const missing_openai_credential_message = credentials.missing_openai_compatible_credential_message;
+pub const missing_openai_interactive_credential_message = credentials.missing_openai_compatible_interactive_credential_message;
 pub const unimplemented_backend_message = "that model backend is not implemented yet";
 
 pub const OpenAiCompatibleSettings = struct {

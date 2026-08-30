@@ -102,11 +102,6 @@ const update_target = @import("core/upgrade/update_target.zig");
 
 const compiled_update_channel = update_target.Channel.parse(build_options.update_channel) orelse
     @compileError("invalid compiled update channel");
-const composed_backend_context = providers_compose.Context{
-    .vercel = builtin_gateway.provider,
-    .openai_compatible = openai_compatible_provider.provider,
-};
-const composed_gateway_provider = providers_compose.provider(&composed_backend_context);
 const background_runtime = @import("core/background/background_runtime.zig");
 const background_process_provider = @import(
     "core/execution/background_process_provider.zig",
@@ -1813,6 +1808,7 @@ const App = struct {
             providers.gateway.permission_reviewer = null;
             providers.codex.permission_reviewer = null;
             providers.grok.permission_reviewer = null;
+            providers.openai_compatible.permission_reviewer = null;
         }
         return providers;
     }
@@ -3482,9 +3478,9 @@ test "interactive app keeps notification handlers registered for live preference
 
 test "native interactive model catalog uses the openai-compatible provider" {
     var app = App{ .alloc = std.testing.allocator };
-    const provider = app.modelCatalogProvider();
-    try std.testing.expect(provider.fetch_fn == openai_compatible_provider.provider.model_catalog.fetch_fn);
-    try std.testing.expect(provider.fetch_fn != builtin_gateway.model_catalog_provider.fetch_fn);
+    const catalog = app.providerSet().select(.openai_compatible).model_catalog;
+    try std.testing.expect(catalog != null);
+    try std.testing.expect(catalog.?.fetch_fn != builtin_gateway.model_catalog_provider.fetch_fn);
 }
 
 test "native app preserves the built-in tool set without workspace metadata" {

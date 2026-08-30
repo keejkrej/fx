@@ -10,6 +10,7 @@ const settings_store = @import("settings_store.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
+const providers_config = @import("../providers/config.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
 
@@ -41,7 +42,6 @@ pub const Settings = struct {
     provider: ?model_provider.ProviderId = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
-    provider: ?model_backend.ModelBackend = null,
     openai_compatible_base_url: ?[]u8 = null,
     openai_compatible_api_key_env: ?[]u8 = null,
     yolo_acknowledged: ?bool = null,
@@ -69,6 +69,8 @@ pub const Settings = struct {
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         self.models.deinit(alloc);
+        if (self.openai_compatible_base_url) |value| alloc.free(value);
+        if (self.openai_compatible_api_key_env) |value| alloc.free(value);
         self.permission_rules.deinit(alloc);
         self.* = .{};
     }
@@ -508,7 +510,8 @@ fn loadMergedSettingsDetailedWithOptionalHome(
         }
     }
     if (io_mod.getenv(providers_config.provider_env)) |provider_override| {
-        if (model_backend.parse(provider_override) != null) {
+        if (model_provider.parse(provider_override)) |parsed| {
+            settings.provider = parsed;
             sources.provider = .process_override;
         }
     }
@@ -625,7 +628,6 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "update_channel",
         "permission_mode",
         "credential_source",
-        "provider",
         "openai_compatible",
         "yolo_acknowledged",
         "permission",
@@ -1402,11 +1404,6 @@ fn parseProfileOnlyFields(
             return error.InvalidCredentialSource;
     }
 
-    if (root.object.get("provider")) |provider_value| {
-        if (provider_value != .string) return error.InvalidProviderType;
-        settings.provider = model_backend.parse(provider_value.string);
-    }
-
     if (root.object.get("openai_compatible")) |openai_value| {
         if (openai_value != .object) return error.InvalidOpenAiCompatibleType;
         if (openai_value.object.get("base_url")) |url_value| {
@@ -1568,7 +1565,6 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
     if (incoming.provider) |value| target.provider = value;
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;
-    if (incoming.provider) |value| target.provider = value;
     if (incoming.openai_compatible_base_url) |value| {
         if (target.openai_compatible_base_url) |current| alloc.free(current);
         target.openai_compatible_base_url = value;
@@ -3451,7 +3447,7 @@ test "project provider and openai_compatible keys are ignored as profile-only" {
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(model_backend.ModelBackend.openai_compatible, result.settings.provider.?);
+    try std.testing.expectEqual(model_provider.ProviderId.openai_compatible, result.settings.provider.?);
     try std.testing.expectEqualStrings("http://127.0.0.1:9/v1", result.settings.openai_compatible_base_url.?);
     try expectIgnoredProjectKey(result.diagnostics, "provider");
     try expectIgnoredProjectKey(result.diagnostics, "openai_compatible");

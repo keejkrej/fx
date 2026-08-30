@@ -1,19 +1,24 @@
 const std = @import("std");
 const secret = @import("../core/auth/secret.zig");
-const agent_stream_provider = @import("../core/agent/stream_provider.zig");
+const stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
-const gateway_json = @import("../core/gateway/gateway_json.zig");
+const vercel_protocol = @import("vercel_protocol.zig");
 const gateway_client = @import("client.zig");
 const providers_config = @import("../core/providers/config.zig");
 const providers_catalog = @import("../core/providers/catalog.zig");
+const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
 const Allocator = std.mem.Allocator;
-const StreamCallback = agent_stream_provider.StreamCallback;
-const ToolStartCallback = agent_stream_provider.ToolStartCallback;
+const StreamCallback = stream_provider.StreamCallback;
+const ToolStartCallback = stream_provider.ToolStartCallback;
 pub const StreamResult = gateway_client.StreamResult;
-pub const DeliveryCertainty = agent_stream_provider.DeliveryCertainty;
+pub const DeliveryCertainty = stream_provider.DeliveryCertainty;
+
+pub const agent_stream_provider = stream_provider.Provider{
+    .stream_fn = streamCompletion,
+};
 
 const max_sse_event_line_bytes: usize = 32 * 1024 * 1024;
 const transfer_buffer_bytes: usize = 256 * 1024;
@@ -29,13 +34,13 @@ pub const StreamRequest = struct {
     delivery: ?*DeliveryCertainty = null,
     on_reasoning_chunk: ?StreamCallback = null,
     on_tool_input_chunk: ?StreamCallback = null,
-    provider_attempt_owner: agent_stream_provider.ProviderAttemptOwner = .transport,
+    provider_attempt_owner: stream_provider.ProviderAttemptOwner = .transport,
     extra_headers: []const std.http.Header = &.{},
 };
 
 pub fn buildChatCompletionsBody(
     alloc: Allocator,
-    request: agent_stream_provider.BuildRequest,
+    request: stream_provider.RequestData,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -48,7 +53,7 @@ pub fn buildChatCompletionsBody(
         try writeChatMessage(&out.writer, message);
     }
     try out.writer.writeAll("],\"tools\":");
-    try writeOpenAiToolsJson(alloc, &out.writer, request.serialized_tools);
+    try writeOpenAiToolsJson(alloc, &out.writer, request.tools);
     try out.writer.writeAll(",\"tool_choice\":");
     try std.json.Stringify.value(request.tool_choice.label(), .{}, &out.writer);
     if (request.max_output_tokens) |value| {
@@ -60,7 +65,7 @@ pub fn buildChatCompletionsBody(
 
 fn writeChatMessage(writer: *std.Io.Writer, message: types.ChatMessage) !void {
     try writer.writeAll("{\"role\":");
-    try std.json.Stringify.value(gateway_json.roleName(message.role), .{}, writer);
+    try std.json.Stringify.value(vercel_protocol.roleName(message.role), .{}, writer);
     switch (message.role) {
         .system, .user => {
             try writer.writeAll(",\"content\":");
@@ -106,82 +111,42 @@ fn writeChatMessage(writer: *std.Io.Writer, message: types.ChatMessage) !void {
     try writer.writeByte('}');
 }
 
-fn writeOpenAiToolsJson(alloc: Allocator, writer: *std.Io.Writer, serialized_tools: []const u8) !void {
-    if (serialized_tools.len == 0) {
-        try writer.writeAll("[]");
-        return;
-    }
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, serialized_tools, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            try writer.writeAll("[]");
-            return;
-        },
-    };
-    defer parsed.deinit();
-    if (parsed.value != .array) {
-        try writer.writeAll("[]");
-        return;
-    }
-
+fn writeOpenAiToolsJson(alloc: Allocator, writer: *std.Io.Writer, tools: stream_provider.ToolSelection) !void {
     try writer.writeByte('[');
     var wrote = false;
-    for (parsed.value.array.items) |item| {
-        if (item != .object) continue;
-        const converted = convertToolObject(item.object) orelse continue;
+    for (tools.advertised_names) |name| {
+        const tool = tools.advertisedFunction(name) orelse continue;
         if (wrote) try writer.writeByte(',');
         wrote = true;
-        try writeConvertedTool(writer, converted);
+        try writeOpenAiFunctionTool(alloc, writer, tool);
+    }
+    for (tools.additional_functions) |tool| {
+        if (containsToolName(tools.advertised_names, tool.name)) continue;
+        if (wrote) try writer.writeByte(',');
+        wrote = true;
+        try writeOpenAiFunctionTool(alloc, writer, tool);
     }
     try writer.writeByte(']');
 }
 
-const ConvertedTool = struct {
-    name: []const u8,
-    description: []const u8,
-    parameters: std.json.Value,
-};
-
-fn convertToolObject(object: std.json.ObjectMap) ?ConvertedTool {
-    if (object.get("function")) |function_value| {
-        if (function_value != .object) return null;
-        const name_value = function_value.object.get("name") orelse return null;
-        if (name_value != .string or name_value.string.len == 0) return null;
-        const description = if (function_value.object.get("description")) |value|
-            if (value == .string) value.string else ""
-        else
-            "";
-        const parameters = function_value.object.get("parameters") orelse std.json.Value{ .object = .empty };
-        return .{
-            .name = name_value.string,
-            .description = description,
-            .parameters = parameters,
-        };
+fn containsToolName(names: []const []const u8, name: []const u8) bool {
+    for (names) |candidate| {
+        if (std.mem.eql(u8, candidate, name)) return true;
     }
-
-    const type_value = object.get("type") orelse return null;
-    if (type_value != .string or !std.mem.eql(u8, type_value.string, "function")) return null;
-    const name_value = object.get("name") orelse return null;
-    if (name_value != .string or name_value.string.len == 0) return null;
-    const description = if (object.get("description")) |value|
-        if (value == .string) value.string else ""
-    else
-        "";
-    const parameters = object.get("inputSchema") orelse object.get("parameters") orelse std.json.Value{ .object = .empty };
-    return .{
-        .name = name_value.string,
-        .description = description,
-        .parameters = parameters,
-    };
+    return false;
 }
 
-fn writeConvertedTool(writer: *std.Io.Writer, tool: ConvertedTool) !void {
+fn writeOpenAiFunctionTool(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    schema: model_tool_schema.FunctionSchema,
+) !void {
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
-    try std.json.Stringify.value(tool.name, .{}, writer);
+    try std.json.Stringify.value(schema.name, .{}, writer);
     try writer.writeAll(",\"description\":");
-    try std.json.Stringify.value(tool.description, .{}, writer);
+    try std.json.Stringify.value(schema.description, .{}, writer);
     try writer.writeAll(",\"parameters\":");
-    try std.json.Stringify.value(tool.parameters, .{}, writer);
+    try model_tool_schema.writeObjectSchema(alloc, writer, schema.input_schema);
     try writer.writeAll("}}");
 }
 
@@ -211,7 +176,7 @@ pub fn parseSseBytes(
     sse_bytes: []const u8,
     content_capture_limit: ?usize,
     callbacks: ParseCallbacks,
-) !types.GatewayCompletion {
+) !types.ModelCompletion {
     var content: std.ArrayList(u8) = .empty;
     errdefer content.deinit(alloc);
     var tools: std.ArrayList(ToolAccumulator) = .empty;
@@ -353,7 +318,7 @@ fn finishCompletion(
     tools: *std.ArrayList(ToolAccumulator),
     finish_reason: ?types.ProviderFinishReason,
     usage: types.Usage,
-) !types.GatewayCompletion {
+) !types.ModelCompletion {
     var tool_calls: []types.ToolCall = &.{};
     if (tools.items.len > 0) {
         tool_calls = try alloc.alloc(types.ToolCall, tools.items.len);
@@ -405,6 +370,93 @@ fn jsonIndex(value: ?std.json.Value) ?usize {
     return switch (index) {
         .integer => |n| if (n >= 0) @intCast(n) else null,
         else => null,
+    };
+}
+
+fn streamCompletion(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+) !stream_provider.Result {
+    if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
+    try request.admission.admit();
+    const payload = try buildChatCompletionsBody(alloc, request.data());
+    defer alloc.free(payload);
+
+    var owned_url: ?[]u8 = null;
+    defer if (owned_url) |url| alloc.free(url);
+    const resolved = providers_config.resolveActive();
+    const chat_url = if (try resolved.chatCompletionsUrlAlloc(alloc)) |url| blk: {
+        owned_url = url;
+        break :blk url;
+    } else return stream_provider.failResult(error.OpenAiCompatibleUrlMissing);
+
+    var events = request.events;
+    const result = streamChatCompletions(
+        alloc,
+        .{
+            .api_key = request.credential.secret,
+            .model = request.model,
+            .retry_count = request.retry_count,
+            .chat_url = chat_url,
+            .payload = payload,
+            .trace_ctx = request.trace_ctx,
+            .content_capture_limit = request.content_capture_limit,
+            .delivery = request.delivery,
+            .provider_attempt_owner = request.provider_attempt_owner,
+        },
+        @ptrCast(&events),
+        EventBridge.content,
+        EventBridge.toolStart,
+        request.cancel_flag,
+    ) catch |err| {
+        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
+            err,
+            request.delivery.load(),
+        );
+        return err;
+    };
+    if (result.status != .ok) {
+        return .{ .failed = .{
+            .kind = failureKind(result.status),
+            .detail = result.err_body,
+            .retry_after_seconds = result.retry_after_seconds,
+            .ownership = .owned,
+        } };
+    }
+    return .{ .completed = .{
+        .completion = result.completion,
+        .usage = .{ .exact = .openai_compatible },
+        .ownership = .owned,
+    } };
+}
+
+const EventBridge = struct {
+    fn sink(raw: *anyopaque) *stream_provider.EventSink {
+        return @ptrCast(@alignCast(raw));
+    }
+
+    fn content(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .content_delta = chunk });
+    }
+
+    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8) void {
+        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label } });
+    }
+};
+
+fn failureKind(status: std.http.Status) stream_provider.FailureKind {
+    return switch (status) {
+        .bad_request => .invalid_request,
+        .unauthorized => .unauthorized,
+        .forbidden => .forbidden,
+        .payload_too_large => .request_too_large,
+        .too_many_requests => .rate_limited,
+        .internal_server_error => .server_error,
+        .bad_gateway => .bad_gateway,
+        .service_unavailable => .unavailable,
+        .gateway_timeout => .gateway_timeout,
+        else => .provider_error,
     };
 }
 
@@ -541,10 +593,17 @@ test "chat completions builder emits stream tools and openai-shaped messages" {
         },
         .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "ok" },
     };
+    const tools = [_]model_tool_schema.FunctionSchema{.{
+        .name = "read_file",
+        .description = "Read",
+    }};
     const body = try buildChatCompletionsBody(std.testing.allocator, .{
         .model = "gpt-4.1",
-        .serialized_tools = "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]",
         .messages = &messages,
+        .tools = .{
+            .advertised_names = &.{"read_file"},
+            .advertised_functions = &tools,
+        },
         .tool_choice = .auto,
         .provider_options = .{},
         .max_output_tokens = 128,

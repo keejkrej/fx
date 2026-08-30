@@ -62,8 +62,8 @@ pub fn authPickerRowCount(view: auth_runtime.PickerView) u16 {
             else => 7,
         };
     }
-    if (view.stage == .api_key) return 4;
-    if (view.stage == .root and view.include_skip) return 18;
+    if (view.stage == .api_key or view.stage == .openai_url or view.stage == .openai_key) return 4;
+    if (view.stage == .root and view.include_skip) return 19;
     if (isSetupListStage(view.stage)) return @intCast(2 + @max(view.choiceCount(), 1));
     return @intCast(1 + @max(view.choiceCount(), 1));
 }
@@ -71,7 +71,7 @@ pub fn authPickerRowCount(view: auth_runtime.PickerView) u16 {
 fn isSetupListStage(stage: auth_runtime.PickerStage) bool {
     return switch (stage) {
         .root, .connections, .provider, .change_team, .switch_credential => true,
-        .sign_in, .api_key => false,
+        .sign_in, .api_key, .openai_url, .openai_key => false,
     };
 }
 
@@ -83,7 +83,7 @@ fn setupChoiceLabel(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                 .switch_provider => "Model provider",
                 .change_team => "Vercel team",
                 .switch_credential => "Credential source",
-                .login, .chatgpt_login, .grok_login, .setup, .automatic => "",
+                .login, .chatgpt_login, .grok_login, .setup, .openai_compatible, .automatic => "",
             },
             .provider, .source, .team => "",
         },
@@ -93,12 +93,13 @@ fn setupChoiceLabel(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                 .chatgpt_login => "Codex subscription",
                 .grok_login => "Grok subscription",
                 .setup => "AI Gateway API key",
+                .openai_compatible => "OpenAI-compatible",
                 .connections, .change_team, .switch_credential, .switch_provider, .automatic => "",
             },
             .provider, .source, .team => "",
         },
         .provider, .change_team, .switch_credential => view.choiceLabel(choice),
-        .sign_in, .api_key => "",
+        .sign_in, .api_key, .openai_url, .openai_key => "",
     };
 }
 
@@ -118,7 +119,7 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                     view.activeSourceLabel()
                 else
                     "not connected",
-                .login, .chatgpt_login, .grok_login, .setup, .automatic => "",
+                .login, .chatgpt_login, .grok_login, .setup, .openai_compatible, .automatic => "",
             },
             .provider, .source, .team => "",
         },
@@ -133,12 +134,16 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                     "environment"
                 else
                     "not configured",
+                .openai_compatible => if (view.available_sources.contains(.stored_key))
+                    "stored"
+                else
+                    "not configured",
                 .connections, .change_team, .switch_credential, .switch_provider, .automatic => "",
             },
             .provider, .source, .team => "",
         },
         .provider, .change_team, .switch_credential => view.choiceDescription(choice),
-        .sign_in, .api_key => "",
+        .sign_in, .api_key, .openai_url, .openai_key => "",
     };
 }
 
@@ -207,7 +212,7 @@ fn composeSetupHeaderRow(
             .connections => "Connections",
             .provider => "Model provider",
             .switch_credential => "Credential source",
-            .sign_in, .api_key, .change_team => unreachable,
+            .sign_in, .api_key, .openai_url, .openai_key, .change_team => unreachable,
         };
         try row_text.appendClipped(alloc, &row, heading, width);
     }
@@ -230,7 +235,7 @@ fn composeSetupEmptyRow(
         else
             "  No matching Vercel teams",
         .switch_credential => "  No credentials available",
-        .root, .connections, .sign_in, .api_key => "",
+        .root, .connections, .sign_in, .api_key, .openai_url, .openai_key => "",
     }, width);
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
@@ -357,13 +362,13 @@ const onboarding_note = "   ⚠︎ Note: fx is experimental and defaults to auto
 const onboarding_note_link = onboarding_note ++ " \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\";
 
 fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, row_count: u16) u16 {
-    if (row_count >= 18) return row_index;
+    if (row_count >= 19) return row_index;
 
     const selected_row: u16 = 8 + @as(u16, @intCast(view.selectedIndex()));
-    const priority = [_]u16{ selected_row, 11, 9, 10, 8, 15, 7, 12, 5, 0, 2, 3, 6, 13, 14, 1, 4, 16, 17 };
+    const priority = [_]u16{ selected_row, 12, 11, 9, 10, 8, 16, 7, 13, 5, 0, 2, 3, 6, 14, 15, 1, 4, 17, 18 };
 
     var projected_index: u16 = 0;
-    for (0..18) |source_row| {
+    for (0..19) |source_row| {
         for (priority[0..@min(row_count, priority.len)]) |included_row| {
             if (source_row != included_row) continue;
             if (projected_index == row_index) return @intCast(source_row);
@@ -371,7 +376,7 @@ fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, ro
             break;
         }
     }
-    return 17;
+    return 18;
 }
 
 fn composeOnboardingPickerRow(
@@ -391,6 +396,7 @@ fn composeOnboardingPickerRow(
         9 => 1,
         10 => 2,
         11 => 3,
+        12 => 4,
         else => null,
     };
     if (maybe_choice_index) |choice_index| {
@@ -418,10 +424,10 @@ fn composeOnboardingPickerRow(
         5 => "   You can change this anytime with /setup.",
         6 => "",
         7 => "   Get started",
-        12 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
-        13, 14 => "",
-        15 => "   Esc to set up later · Explore all commands with /help",
-        16, 17 => "",
+        13 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
+        14, 15 => "",
+        16 => "   Esc to set up later · Explore all commands with /help",
+        17, 18 => "",
         else => "",
     };
     try row_text.appendClipped(alloc, &row, label, width);
@@ -592,6 +598,72 @@ fn composeSignInPickerRow(
         else => "",
     };
     try row_text.appendClipped(alloc, &row, label, width);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
+fn composeOpenaiUrlPickerRow(
+    alloc: Allocator,
+    url: []const u8,
+    row_index: u16,
+    width: u16,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    if (width == 0) return row;
+
+    try row.appendSlice(alloc, if (row_index == 1)
+        ui_render.selected_completion_style
+    else
+        ui_render.dim_style);
+    switch (row_index) {
+        0 => try row_text.appendClipped(alloc, &row, "   OpenAI-compatible base URL", width),
+        1 => {
+            try row_text.appendClipped(alloc, &row, "   ┃ ", width);
+            if (url.len == 0) {
+                try row.appendSlice(alloc, ui_render.dim_style);
+                try row_text.appendClipped(alloc, &row, "https://api.openai.com/v1", width -| 5);
+            } else {
+                try row_text.appendClipped(alloc, &row, url, width -| 5);
+            }
+        },
+        2 => try row_text.appendClipped(alloc, &row, "   Enter continues · Esc cancels", width),
+        3 => try row_text.appendClipped(alloc, &row, "   Saved in ~/.fx/settings.json", width),
+        else => {},
+    }
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
+fn composeOpenaiKeyPickerRow(
+    alloc: Allocator,
+    mask_count: usize,
+    row_index: u16,
+    width: u16,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    if (width == 0) return row;
+
+    try row.appendSlice(alloc, if (row_index == 1)
+        ui_render.selected_completion_style
+    else
+        ui_render.dim_style);
+    switch (row_index) {
+        0 => try row_text.appendClipped(alloc, &row, "   Paste your OpenAI-compatible API key", width),
+        1 => {
+            try row_text.appendClipped(alloc, &row, "   ┃ ", width);
+            if (mask_count == 0) {
+                try row.appendSlice(alloc, ui_render.dim_style);
+                try row_text.appendClipped(alloc, &row, "Paste or type a key", width -| 5);
+            } else {
+                for (0..@min(mask_count, width -| 5)) |_| try row.appendSlice(alloc, "•");
+            }
+        },
+        2 => try row_text.appendClipped(alloc, &row, "   Enter saves · Esc cancels", width),
+        3 => try row_text.appendClipped(alloc, &row, "   Stored separately from Vercel Gateway keys", width),
+        else => {},
+    }
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
@@ -1893,7 +1965,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
         .include_skip = true,
     };
 
-    try std.testing.expectEqual(@as(u16, 18), authPickerRowCount(view));
+    try std.testing.expectEqual(@as(u16, 19), authPickerRowCount(view));
     var screen: std.ArrayList(u8) = .empty;
     defer screen.deinit(alloc);
     for (0..authPickerRowCount(view)) |row_index| {
@@ -1937,7 +2009,11 @@ test "auth onboarding composes the welcome copy and setup choices" {
     defer unselected_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, unselected_row.items, "Add an API key") != null);
 
-    var narrow_note = try composeAuthPickerRow(alloc, view, 12, authPickerRowCount(view), 58);
+    var openai_row = try composeAuthPickerRow(alloc, view, 12, authPickerRowCount(view), 100);
+    defer openai_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, openai_row.items, "OpenAI-compatible URL and key") != null);
+
+    var narrow_note = try composeAuthPickerRow(alloc, view, 13, authPickerRowCount(view), 58);
     defer narrow_note.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow_note.items, "https://fx.sh/docs/stability") == null);
 
@@ -2068,7 +2144,7 @@ test "auth picker renders the staged switch and disabled team screens" {
         .stage = .provider,
     };
     const provider_rows = authPickerRowCount(provider_view);
-    try std.testing.expectEqual(@as(u16, 5), provider_rows);
+    try std.testing.expectEqual(@as(u16, 6), provider_rows);
     var provider_header = try composeAuthPickerRow(alloc, provider_view, 0, provider_rows, 80);
     defer provider_header.deinit(alloc);
     try std.testing.expect(std.mem.startsWith(u8, provider_header.items, ui_render.dim_style));

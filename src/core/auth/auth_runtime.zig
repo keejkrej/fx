@@ -411,8 +411,8 @@ pub const PickerView = struct {
             else
                 4,
             .connections => connectionChoiceCount(),
-            .provider => if (comptime host_target.is_wasm) 2 else 3,
-            .sign_in, .api_key => 0,
+            .provider => if (comptime host_target.is_wasm) 3 else 4,
+            .sign_in, .api_key, .openai_url, .openai_key => 0,
             .change_team => blk: {
                 var count: usize = 0;
                 for (self.teams) |team| {
@@ -444,10 +444,11 @@ pub const PickerView = struct {
             .provider => switch (index) {
                 0 => .{ .provider = .gateway },
                 1 => .{ .provider = .codex },
-                2 => if (comptime host_target.is_wasm) null else .{ .provider = .grok },
+                2 => if (comptime host_target.is_wasm) .{ .provider = .openai_compatible } else .{ .provider = .grok },
+                3 => if (comptime host_target.is_wasm) null else .{ .provider = .openai_compatible },
                 else => null,
             },
-            .sign_in, .api_key => null,
+            .sign_in, .api_key, .openai_url, .openai_key => null,
             .change_team => blk: {
                 var visible_index: usize = 0;
                 for (self.teams, 0..) |team, team_index| {
@@ -512,7 +513,7 @@ pub const PickerView = struct {
                 .login => if (self.fx_login_session_available) "connected" else "",
                 .chatgpt_login => if (self.available_sources.contains(.chatgpt_subscription)) "connected" else "",
                 .grok_login => if (self.available_sources.contains(.grok_subscription)) "connected" else "",
-                .setup, .switch_credential, .switch_provider => "",
+                .setup, .openai_compatible, .switch_credential, .switch_provider => "",
                 .automatic => "use the first available source",
                 .change_team => if (self.fx_login_session_available) "choose a team" else "sign in first",
             },
@@ -538,7 +539,7 @@ pub const PickerView = struct {
 };
 
 fn connectionChoiceCount() usize {
-    return if (comptime host_target.is_wasm) 2 else 4;
+    return if (comptime host_target.is_wasm) 3 else 5;
 }
 
 fn connectionChoiceAt(index: usize) ?Choice {
@@ -546,6 +547,7 @@ fn connectionChoiceAt(index: usize) ?Choice {
         return switch (index) {
             0 => .{ .action = .login },
             1 => .{ .action = .setup },
+            2 => .{ .action = .openai_compatible },
             else => null,
         };
     }
@@ -554,6 +556,7 @@ fn connectionChoiceAt(index: usize) ?Choice {
         1 => .{ .action = .chatgpt_login },
         2 => .{ .action = .grok_login },
         3 => .{ .action = .setup },
+        4 => .{ .action = .openai_compatible },
         else => null,
     };
 }
@@ -622,6 +625,12 @@ pub const StatusSnapshot = struct {
             return switch (surface) {
                 .cli => credentials.missing_grok_credential_message,
                 .interactive => credentials.missing_grok_interactive_credential_message,
+            };
+        }
+        if (self.required_source == .stored_key) {
+            return switch (surface) {
+                .cli => credentials.missing_openai_compatible_credential_message,
+                .interactive => credentials.missing_openai_compatible_interactive_credential_message,
             };
         }
         return switch (surface) {
@@ -738,6 +747,8 @@ pub fn loadStatusSnapshotForProvider(
             .chatgpt_subscription
         else if (provider == .grok)
             .grok_subscription
+        else if (provider == .openai_compatible)
+            .stored_key
         else
             null,
         .stored_key_status = resolution.stored_key_status,
@@ -822,7 +833,7 @@ pub const Runtime = struct {
         secret_store: host.SecretStore,
     ) void {
         comptime {
-            if (std.meta.fields(Self).len != 24) {
+            if (std.meta.fields(Self).len != 26) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -851,6 +862,8 @@ pub const Runtime = struct {
         storage.api_key_input = .empty;
         storage.api_key_returns_to_root = false;
         storage.api_key_save = .{};
+        storage.openai_url_input = .empty;
+        storage.openai_returns_to_root = false;
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
@@ -1565,11 +1578,11 @@ pub const Runtime = struct {
         if (!self.pickerView().choiceEnabled(selected)) return null;
 
         switch (self.picker_stage) {
-            .sign_in, .api_key => unreachable,
+            .sign_in, .api_key, .openai_url, .openai_key => unreachable,
             .connections => switch (selected) {
                 .action => |action| switch (action) {
                     .login, .chatgpt_login, .grok_login => self.closePicker(alloc),
-                    .setup => {},
+                    .setup, .openai_compatible => {},
                     .connections,
                     .change_team,
                     .switch_credential,
@@ -1738,6 +1751,15 @@ pub const Runtime = struct {
                     probeCredentialSource,
                     loadRuntimeCredentialSource,
                 )),
+            .openai_compatible => if (self.credentialSource() == .stored_key)
+                false
+            else
+                self.selectSourceWithLoader(
+                    alloc,
+                    .stored_key,
+                    self,
+                    loadRuntimeCredentialSource,
+                ),
         };
     }
 
@@ -2662,8 +2684,6 @@ test "auth picker navigation wraps across the four setup sections" {
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expectEqualStrings("Switch provider", runtime.pickerView().choiceLabel(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
-    try std.testing.expect((Choice{ .action = .openai_compatible }).eql(runtime.pickerView().selected_choice.?));
-    try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .change_team }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .switch_credential }).eql(runtime.pickerView().selected_choice.?));
@@ -2746,7 +2766,7 @@ test "auth picker without credentials exposes acquisition actions" {
     try std.testing.expect(picker.active_source == null);
     try std.testing.expect((Choice{ .action = .connections }).eql(picker.selected_choice.?));
     try std.testing.expectEqual(@as(usize, 0), picker.available_sources.count());
-    try std.testing.expectEqual(@as(usize, 5), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
     try std.testing.expect(!picker.choiceEnabled(.{ .action = .change_team }));
     try std.testing.expectEqualStrings("missing", picker.activeSourceLabel());
 }
@@ -2758,13 +2778,15 @@ test "auth onboarding picker exposes the setup paths" {
 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.include_skip);
-    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 5), picker.choiceCount());
     try std.testing.expect((Choice{ .action = .login }).eql(picker.choiceAt(0).?));
     try std.testing.expect((Choice{ .action = .chatgpt_login }).eql(picker.choiceAt(1).?));
     try std.testing.expect((Choice{ .action = .grok_login }).eql(picker.choiceAt(2).?));
     try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(3).?));
+    try std.testing.expect((Choice{ .action = .openai_compatible }).eql(picker.choiceAt(4).?));
     try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(3).?));
-    try std.testing.expect(picker.choiceAt(4) == null);
+    try std.testing.expectEqualStrings("OpenAI-compatible URL and key", picker.choiceLabel(picker.choiceAt(4).?));
+    try std.testing.expect(picker.choiceAt(5) == null);
 }
 
 test "clearing a remembered choice re-resolves even when no login was active" {

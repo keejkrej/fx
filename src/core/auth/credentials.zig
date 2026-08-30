@@ -11,6 +11,7 @@ const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
+const providers_config = @import("../providers/config.zig");
 
 pub const Source = types.CredentialSource;
 
@@ -202,11 +203,15 @@ pub const missing_chatgpt_credential_message = "fx needs a Codex subscription lo
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login, open Connections, then choose Codex subscription.";
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
+pub const missing_openai_compatible_credential_message = "fx needs an OpenAI-compatible API key. Run fx setup openai-compatible, or set FX_OPENAI_BASE_URL and FX_OPENAI_API_KEY.";
+pub const missing_openai_compatible_interactive_credential_message = "fx needs an OpenAI-compatible API key. Run /setup to add a URL and key, or set FX_OPENAI_BASE_URL and FX_OPENAI_API_KEY.";
 pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 
 test "public credential guidance spells fx lowercase" {
     try std.testing.expect(std.mem.startsWith(u8, missing_credential_message, "fx needs"));
     try std.testing.expect(std.mem.startsWith(u8, missing_interactive_credential_message, "fx needs"));
+    try std.testing.expect(std.mem.startsWith(u8, missing_openai_compatible_credential_message, "fx needs"));
+    try std.testing.expect(std.mem.startsWith(u8, missing_openai_compatible_interactive_credential_message, "fx needs"));
     try std.testing.expect(std.mem.startsWith(u8, unreadable_store_message, "fx could"));
 }
 
@@ -298,6 +303,10 @@ pub fn resolveForProvider(
             return .{ .credential = credential };
         },
         .gateway => {},
+        .openai_compatible => {
+            const credential = try loadOpenaiCompatibleCredential(alloc);
+            return .{ .credential = credential };
+        },
     }
     return resolvePreferring(
         alloc,
@@ -450,6 +459,12 @@ pub fn sourceExists(
             break :blk true;
         },
     };
+}
+
+fn loadOpenaiCompatibleCredential(alloc: std.mem.Allocator) !?Credential {
+    const resolved = providers_config.resolveActive();
+    const value = (try resolved.loadApiKey(alloc)) orelse return null;
+    return .{ .token = value, .source = .stored_key };
 }
 
 fn loadEnvCredential(
