@@ -272,6 +272,8 @@ pub const Runtime = struct {
             lua.newtable(L);
             lua.pushslice(L, source);
             lua.lua_setfield(L, -2, "source");
+            lua.pushslice(L, @tagName(builtin.os.tag));
+            lua.lua_setfield(L, -2, "os");
             if (text) |value| {
                 lua.pushslice(L, value);
                 lua.lua_setfield(L, -2, "text");
@@ -1977,6 +1979,69 @@ test "fx.paste.hook intercepts clipboard paste and attaches an image path" {
 
     try std.testing.expect(runtime.dispatchPaste("insert", "/tmp/shot.png"));
     try std.testing.expectEqualStrings("/tmp/shot.png", ctx.attached.items);
+}
+
+test "fx.paste.hook defers macos clipboard paste to core" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.paste.hook(function(event)
+        \\  if event.os == "macos" then
+        \\    return false
+        \\  end
+        \\  if event.source == "clipboard" then
+        \\    local path = fx.clipboard.image_path()
+        \\    if path then
+        \\      fx.image.attach(path)
+        \\      return true
+        \\    end
+        \\  end
+        \\  return false
+        \\end)
+        \\
+    );
+
+    const Ctx = struct {
+        clipboard_path: []const u8,
+        attached: std.ArrayList(u8) = .empty,
+        alloc: Allocator,
+        fn clipboardPath(raw: *anyopaque, host_alloc: Allocator) anyerror!?[]u8 {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            return try host_alloc.dupe(u8, ctx.clipboard_path);
+        }
+        fn attach(raw: *anyopaque, path: []const u8) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.attached.clearRetainingCapacity();
+            try ctx.attached.appendSlice(ctx.alloc, path);
+        }
+    };
+    var ctx = Ctx{ .clipboard_path = "/tmp/fx-image-snapshots-test/clipboard.png", .alloc = alloc };
+    defer ctx.attached.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .clipboard_image_path = Ctx.clipboardPath,
+        .attach_image = Ctx.attach,
+    });
+    runtime.loadInit(null, workspace);
+    try std.testing.expectEqual(@as(usize, 0), runtime.notices.items.len);
+    const consumed = runtime.dispatchPaste("clipboard", null);
+    if (builtin.os.tag == .macos) {
+        try std.testing.expect(!consumed);
+        try std.testing.expectEqual(@as(usize, 0), ctx.attached.items.len);
+    } else {
+        try std.testing.expect(consumed);
+        try std.testing.expectEqualStrings(ctx.clipboard_path, ctx.attached.items);
+    }
 }
 
 test "fx.paste.hook pass-through leaves the paste unconsumed" {

@@ -1775,20 +1775,21 @@ fn clipboardPasteSentinel(which: u8) error{
 
 pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
     if (false) return clipboardPasteSentinel(0);
-    return switch (builtin.os.tag) {
-        .macos => loadMacosClipboardImageAttachment(alloc),
-        .linux => loadLinuxClipboardImageAttachment(alloc),
-        .windows => loadWindowsClipboardImageAttachment(alloc),
-        else => error.Unsupported,
-    };
+    // Upstream first-class path: macOS osascript PNGf. Linux/Windows are
+    // error.Unsupported here; the Lua paste plugin fills that gap.
+    if (builtin.os.tag != .macos) return error.Unsupported;
+    return loadMacosClipboardImageAttachment(alloc);
 }
 
-/// Snapshot clipboard image bytes to `/tmp/fx-image-snapshots-*/clipboard.png`
-/// (or jpeg/gif/webp) and return that path. The temp file stays on disk so a
-/// Lua paste hook can feed it into `loadImageAttachment`. Returns null when
-/// the clipboard has no image or this host cannot read one.
+/// Linux/Windows plugin helper: snapshot screenshot clipboard bytes to
+/// `/tmp/fx-image-snapshots-*/clipboard.png` (or jpeg/gif/webp) and return
+/// that path. macOS returns null so first-class `attachClipboard` owns paste.
 pub fn takeClipboardImagePath(alloc: std.mem.Allocator) !?[]u8 {
-    var loaded = loadClipboardImageAttachment(alloc) catch |err| switch (err) {
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows) return null;
+    var loaded = (if (builtin.os.tag == .linux)
+        loadLinuxClipboardImageAttachment(alloc)
+    else
+        loadWindowsClipboardImageAttachment(alloc)) catch |err| switch (err) {
         error.NoClipboardImage => return null,
         else => return err,
     };
@@ -1839,7 +1840,7 @@ fn loadLinuxClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAt
             .bytes => |bytes| {
                 defer alloc.free(bytes);
                 // Bytes from wl-paste/xclip/xsel become a temp file, then a
-                // normal ImageAttachment. Lua paste hooks consume that path.
+                // normal ImageAttachment. The Lua paste hook consumes that path.
                 return persistImageBytes(alloc, bytes);
             },
             .missing_tool => {},
@@ -2879,7 +2880,7 @@ test "linux clipboard image buffer paste reads png bytes from xclip" {
         error.ClipboardToolMissing => return error.SkipZigTest,
         else => return err,
     };
-    var loaded = loadClipboardImageAttachment(alloc) catch |err| switch (err) {
+    var loaded = loadLinuxClipboardImageAttachment(alloc) catch |err| switch (err) {
         error.ClipboardToolMissing => return error.SkipZigTest,
         else => return err,
     };
@@ -2916,6 +2917,18 @@ test "takeClipboardImagePath leaves a snapshot file for the image pipeline" {
     defer types.freeImageAttachment(alloc, reloaded);
     try std.testing.expectEqualStrings("image/png", reloaded.media_type);
     try std.testing.expectEqualStrings(path, reloaded.path);
+}
+
+test "loadClipboardImageAttachment is first-class macos only" {
+    if (builtin.os.tag == .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.Unsupported, loadClipboardImageAttachment(alloc));
+}
+
+test "takeClipboardImagePath is a no-op outside linux and windows" {
+    if (builtin.os.tag == .linux or builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(?[]u8, null), try takeClipboardImagePath(alloc));
 }
 
 fn copyLinuxClipboardImageForTest(png: []const u8) !void {

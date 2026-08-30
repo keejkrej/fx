@@ -1931,6 +1931,7 @@ pub fn Handlers(comptime App: type) type {
             if (comptime @hasField(App, "scripting")) {
                 if (app_lua_runtime.Runtime(App).dispatchPaste(app, "clipboard", null)) return;
             }
+            try image_commands.Commands(App).attachClipboard(app);
         }
 
         fn commandToggleFast(ctx: *anyopaque) !void {

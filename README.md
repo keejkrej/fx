@@ -9,7 +9,7 @@ Keep upstream sign-in: `fx login grok`, `fx login codex`. This line does not rei
 **Lua plugins.** Two shipped demos of the plugin API:
 
 - **In-TUI diff.** `/diffview` is Lumen-like: file list, hunks, side-by-side. Comment a hunk (`c`) and the note lands in the agent input box as context, ready to send.
-- **Screenshot buffer paste.** A paste interceptor: if the clipboard holds image bytes (Omarchy, Hyprland, Windows, Linux screenshot copy) or an image file path, write bytes to tmp and attach `[Image N]` like a normal file. Text passes through. Grok Build makes you copy a PNG from disk first.
+- **Screenshot buffer paste (Linux/Windows).** macOS already pastes clipboard images in upstream fx. This plugin fills the gap: screenshot-copy on Omarchy, Hyprland, or Windows puts image bytes on the clipboard; the paste hook writes them to tmp and attaches `[Image N]`. Text passes through. Grok Build makes you copy a PNG from disk first.
 
 Install from [this repo's GitHub Releases](https://github.com/keejkrej/fx/releases), not `curl | bash` from fx.sh.
 
