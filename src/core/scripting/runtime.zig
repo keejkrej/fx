@@ -58,6 +58,8 @@ pub const Host = struct {
     ) anyerror!void = rejectDiff,
     open_review: *const fn (ctx: *anyopaque, review: DiffReview) anyerror!void = rejectReview,
     append_input: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void = rejectInput,
+    clipboard_image_path: *const fn (ctx: *anyopaque, alloc: Allocator) anyerror!?[]u8 = missingClipboardImage,
+    attach_image: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void = rejectImage,
     allow_process: *const fn (ctx: *anyopaque) bool = denyProcess,
     start_lsp: *const fn (ctx: *anyopaque, spec: LspStartSpec) anyerror!void = rejectLsp,
     stop_lsp: *const fn (ctx: *anyopaque, name: []const u8) anyerror!void = rejectLspStop,
@@ -79,6 +81,10 @@ const RegisteredHook = struct {
     lua_ref: c_int,
 };
 
+const RegisteredPasteHook = struct {
+    lua_ref: c_int,
+};
+
 pub const Runtime = struct {
     alloc: Allocator = std.heap.page_allocator,
     host: Host = .{},
@@ -92,6 +98,7 @@ pub const Runtime = struct {
     commands: std.ArrayList(RegisteredCommand) = .empty,
     keymaps: std.ArrayList(RegisteredKeymap) = .empty,
     lua_hooks: std.ArrayList(RegisteredHook) = .empty,
+    paste_hooks: std.ArrayList(RegisteredPasteHook) = .empty,
     notices: std.ArrayList(Notice) = .empty,
     hook_text: std.ArrayList(u8) = .empty,
 
@@ -249,6 +256,39 @@ pub const Runtime = struct {
         return true;
     }
 
+    pub fn dispatchPaste(self: *Runtime, source: []const u8, text: ?[]const u8) bool {
+        if (comptime !enabled) return false;
+        if (self.paste_hooks.items.len == 0) return false;
+        const L = self.state orelse return false;
+        self.lock();
+        defer self.unlock();
+        var consumed = false;
+        for (self.paste_hooks.items) |hook| {
+            if (!lua.checkstack(L, 4)) {
+                self.addNotice(.@"error", "Lua stack overflow while running a paste hook.", .{}) catch {};
+                continue;
+            }
+            _ = lua.lua_rawgeti(L, lua.REGISTRYINDEX, hook.lua_ref);
+            lua.newtable(L);
+            lua.pushslice(L, source);
+            lua.lua_setfield(L, -2, "source");
+            if (text) |value| {
+                lua.pushslice(L, value);
+                lua.lua_setfield(L, -2, "text");
+            }
+            if (lua.pcall(L, 1, 1, 0) != lua.OK) {
+                const err = lua.tostring(L, -1) orelse "Lua paste hook failed";
+                self.addNotice(.@"error", "{s}", .{err}) catch {};
+                lua.pop(L, 1);
+                continue;
+            }
+            if (lua.lua_toboolean(L, -1) != 0) consumed = true;
+            lua.pop(L, 1);
+            if (consumed) break;
+        }
+        return consumed;
+    }
+
     pub fn registerLifecycleHooks(self: *Runtime, lifecycle: *hooks.Runtime) !void {
         if (comptime !enabled) return;
         try lifecycle.registerPreToolUse(.{
@@ -320,6 +360,7 @@ pub const Runtime = struct {
         self.commands.clearRetainingCapacity();
         self.keymaps.clearRetainingCapacity();
         self.lua_hooks.clearRetainingCapacity();
+        self.paste_hooks.clearRetainingCapacity();
         if (self.combined_specs.len > 0) {
             self.alloc.free(self.combined_specs);
             self.combined_specs = &.{};
@@ -332,6 +373,7 @@ pub const Runtime = struct {
         self.commands.deinit(self.alloc);
         self.keymaps.deinit(self.alloc);
         self.lua_hooks.deinit(self.alloc);
+        self.paste_hooks.deinit(self.alloc);
         self.hook_text.deinit(self.alloc);
         self.freeNotices(self.takeNotices());
         self.notices.deinit(self.alloc);
@@ -540,6 +582,21 @@ pub const Runtime = struct {
         lua.lua_setfield(L, -2, "input");
 
         lua.newtable(L);
+        lua.pushcfunction(L, apiPasteHook);
+        lua.lua_setfield(L, -2, "hook");
+        lua.lua_setfield(L, -2, "paste");
+
+        lua.newtable(L);
+        lua.pushcfunction(L, apiClipboardImagePath);
+        lua.lua_setfield(L, -2, "image_path");
+        lua.lua_setfield(L, -2, "clipboard");
+
+        lua.newtable(L);
+        lua.pushcfunction(L, apiImageAttach);
+        lua.lua_setfield(L, -2, "attach");
+        lua.lua_setfield(L, -2, "image");
+
+        lua.newtable(L);
         lua.pushcfunction(L, apiLspStart);
         lua.lua_setfield(L, -2, "start");
         lua.pushcfunction(L, apiLspStop);
@@ -641,6 +698,12 @@ fn rejectReview(_: *anyopaque, _: DiffReview) anyerror!void {
     return error.Unsupported;
 }
 fn rejectInput(_: *anyopaque, _: []const u8) anyerror!void {
+    return error.Unsupported;
+}
+fn missingClipboardImage(_: *anyopaque, _: Allocator) anyerror!?[]u8 {
+    return null;
+}
+fn rejectImage(_: *anyopaque, _: []const u8) anyerror!void {
     return error.Unsupported;
 }
 fn rejectLsp(_: *anyopaque, _: LspStartSpec) anyerror!void {
@@ -1004,6 +1067,44 @@ fn apiInputAppend(L: ?*lua.State) callconv(.c) c_int {
     lua.luaL_checktype(L, 1, lua.TSTRING);
     const text = lua.tostring(L, 1) orelse return lua.raise(L, "text required");
     rt.host.append_input(rt.host.ctx, text) catch |err| {
+        return lua.raise(L, @errorName(err));
+    };
+    return 0;
+}
+
+fn apiPasteHook(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    lua.luaL_checktype(L, 1, lua.TFUNCTION);
+    lua.lua_pushvalue(L, 1);
+    const ref = lua.luaL_ref(L, lua.REGISTRYINDEX);
+    rt.paste_hooks.append(rt.alloc, .{ .lua_ref = ref }) catch {
+        lua.luaL_unref(L, lua.REGISTRYINDEX, ref);
+        return lua.raise(L, "OutOfMemory");
+    };
+    return 0;
+}
+
+fn apiClipboardImagePath(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    const path = rt.host.clipboard_image_path(rt.host.ctx, rt.alloc) catch |err| {
+        return lua.raise(L, @errorName(err));
+    } orelse {
+        lua.lua_pushnil(L);
+        return 1;
+    };
+    defer rt.alloc.free(path);
+    lua.pushslice(L, path);
+    return 1;
+}
+
+fn apiImageAttach(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    lua.luaL_checktype(L, 1, lua.TSTRING);
+    const path = lua.tostring(L, 1) orelse return lua.raise(L, "path required");
+    rt.host.attach_image(rt.host.ctx, path) catch |err| {
         return lua.raise(L, @errorName(err));
     };
     return 0;
@@ -1808,4 +1909,97 @@ test "fx.lsp.start is a notice when the host denies process spawn" {
     runtime.loadInit(null, workspace);
     try std.testing.expect(runtime.notices.items.len >= 1);
     try std.testing.expect(std.mem.find(u8, runtime.notices.items[0].body, "not permitted") != null);
+}
+
+test "fx.paste.hook intercepts clipboard paste and attaches an image path" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.paste.hook(function(event)
+        \\  if event.source == "clipboard" then
+        \\    local path = fx.clipboard.image_path()
+        \\    if path then
+        \\      fx.image.attach(path)
+        \\      return true
+        \\    end
+        \\    return false
+        \\  end
+        \\  if event.text and event.text:match("%.png$") then
+        \\    fx.image.attach(event.text)
+        \\    return true
+        \\  end
+        \\  return false
+        \\end)
+        \\
+    );
+
+    const Ctx = struct {
+        clipboard_path: []const u8,
+        attached: std.ArrayList(u8) = .empty,
+        alloc: Allocator,
+        fn clipboardPath(raw: *anyopaque, host_alloc: Allocator) anyerror!?[]u8 {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            return try host_alloc.dupe(u8, ctx.clipboard_path);
+        }
+        fn attach(raw: *anyopaque, path: []const u8) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.attached.clearRetainingCapacity();
+            try ctx.attached.appendSlice(ctx.alloc, path);
+        }
+    };
+    var ctx = Ctx{ .clipboard_path = "/tmp/fx-image-snapshots-test/clipboard.png", .alloc = alloc };
+    defer ctx.attached.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .clipboard_image_path = Ctx.clipboardPath,
+        .attach_image = Ctx.attach,
+    });
+    runtime.loadInit(null, workspace);
+    try std.testing.expectEqual(@as(usize, 0), runtime.notices.items.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.paste_hooks.items.len);
+
+    try std.testing.expect(runtime.dispatchPaste("clipboard", null));
+    try std.testing.expectEqualStrings(ctx.clipboard_path, ctx.attached.items);
+
+    ctx.attached.clearRetainingCapacity();
+    try std.testing.expect(!runtime.dispatchPaste("insert", "hello from a text paste"));
+    try std.testing.expectEqual(@as(usize, 0), ctx.attached.items.len);
+
+    try std.testing.expect(runtime.dispatchPaste("insert", "/tmp/shot.png"));
+    try std.testing.expectEqualStrings("/tmp/shot.png", ctx.attached.items);
+}
+
+test "fx.paste.hook pass-through leaves the paste unconsumed" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.paste.hook(function(event)
+        \\  return false
+        \\end)
+        \\
+    );
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.loadInit(null, workspace);
+    try std.testing.expectEqual(@as(usize, 1), runtime.paste_hooks.items.len);
+    try std.testing.expect(!runtime.dispatchPaste("clipboard", null));
+    try std.testing.expect(!runtime.dispatchPaste("insert", "plain text"));
 }

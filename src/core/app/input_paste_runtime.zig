@@ -305,6 +305,14 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 .unchanged => app.input_runtime.paste.buffer.items,
             };
 
+            if (comptime @hasField(App, "scripting")) {
+                const app_lua_runtime = @import("app_lua_runtime.zig");
+                if (app_lua_runtime.Runtime(App).dispatchPaste(app, "insert", payload)) {
+                    app.input_runtime.paste.buffer.clearRetainingCapacity();
+                    return;
+                }
+            }
+
             if (paste_decoder.isDropShapedPaste(payload) or
                 image_attachments.hasImagePathToken(payload) or
                 paste_decoder.hasFileUrlToken(payload))

@@ -1783,6 +1783,22 @@ pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAtt
     };
 }
 
+/// Snapshot clipboard image bytes to `/tmp/fx-image-snapshots-*/clipboard.png`
+/// (or jpeg/gif/webp) and return that path. The temp file stays on disk so a
+/// Lua paste hook can feed it into `loadImageAttachment`. Returns null when
+/// the clipboard has no image or this host cannot read one.
+pub fn takeClipboardImagePath(alloc: std.mem.Allocator) !?[]u8 {
+    var loaded = loadClipboardImageAttachment(alloc) catch |err| switch (err) {
+        error.NoClipboardImage => return null,
+        else => return err,
+    };
+    const attachment = loaded.takeAttachment();
+    defer types.freeImageAttachment(alloc, attachment);
+    const path = try alloc.dupe(u8, attachment.path);
+    alloc.free(loaded.source_dir);
+    return path;
+}
+
 pub fn clipboardToolMissingNotice() []const u8 {
     return switch (builtin.os.tag) {
         .linux => "install wl-paste (wl-clipboard) or xclip to paste screenshot images",
@@ -1823,7 +1839,7 @@ fn loadLinuxClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAt
             .bytes => |bytes| {
                 defer alloc.free(bytes);
                 // Bytes from wl-paste/xclip/xsel become a temp file, then a
-                // normal ImageAttachment. attachClipboard consumes that path.
+                // normal ImageAttachment. Lua paste hooks consume that path.
                 return persistImageBytes(alloc, bytes);
             },
             .missing_tool => {},
@@ -2878,6 +2894,28 @@ test "linux clipboard image buffer paste reads png bytes from xclip" {
     var header: [16]u8 = undefined;
     const stored = try readImageHeaderBytes(attachment.path, &header);
     try std.testing.expectEqualStrings("image/png", detectMediaTypeFromBytes(stored).?);
+}
+
+test "takeClipboardImagePath leaves a snapshot file for the image pipeline" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const png = try encodePngRgba(alloc, 1, 1, &.{ 0x33, 0x22, 0x11, 0xff });
+    defer alloc.free(png);
+    copyLinuxClipboardImageForTest(png) catch |err| switch (err) {
+        error.ClipboardToolMissing => return error.SkipZigTest,
+        else => return err,
+    };
+    const path = takeClipboardImagePath(alloc) catch |err| switch (err) {
+        error.ClipboardToolMissing => return error.SkipZigTest,
+        else => return err,
+    } orelse return error.TestExpectedEqual;
+    defer alloc.free(path);
+    try std.testing.expect(std.mem.find(u8, path, "fx-image-snapshots-") != null);
+    try std.testing.expectEqualStrings("clipboard.png", std.fs.path.basename(path));
+    const reloaded = try loadImageAttachment(alloc, path);
+    defer types.freeImageAttachment(alloc, reloaded);
+    try std.testing.expectEqualStrings("image/png", reloaded.media_type);
+    try std.testing.expectEqualStrings(path, reloaded.path);
 }
 
 fn copyLinuxClipboardImageForTest(png: []const u8) !void {

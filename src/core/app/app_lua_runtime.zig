@@ -72,6 +72,25 @@ pub fn Runtime(comptime App: type) type {
             return handled;
         }
 
+        pub fn dispatchPaste(app: *App, source: []const u8, text: ?[]const u8) bool {
+            if (comptime !scripting.enabled) return false;
+            app.scripting.bindHost(host(app));
+            const handled = app.scripting.dispatchPaste(source, text);
+            flushNotices(app) catch {};
+            if (handled) {
+                if (comptime @hasField(App, "shell")) {
+                    if (comptime @hasField(App, "terminal")) {
+                        if (!app.terminal.codeViewerScreenActive()) {
+                            app.shell.render_requests.request(.footer);
+                        }
+                    } else {
+                        app.shell.render_requests.request(.footer);
+                    }
+                }
+            }
+            return handled;
+        }
+
         fn flushNotices(app: *App) !void {
             const notices = app.scripting.takeNotices();
             defer app.scripting.freeNotices(notices);
@@ -96,6 +115,8 @@ pub fn Runtime(comptime App: type) type {
                 .open_diff = openDiff,
                 .open_review = openReview,
                 .append_input = appendInput,
+                .clipboard_image_path = clipboardImagePath,
+                .attach_image = attachImage,
                 .allow_process = allowProcess,
                 .start_lsp = startLsp,
                 .stop_lsp = stopLsp,
@@ -260,6 +281,32 @@ pub fn Runtime(comptime App: type) type {
                     app.shell.render_requests.request(.footer);
                 }
             }
+        }
+
+        fn clipboardImagePath(raw: *anyopaque, alloc: Allocator) anyerror!?[]u8 {
+            const image_attachments = @import("../images/image_attachments.zig");
+            return image_attachments.takeClipboardImagePath(alloc) catch |err| switch (err) {
+                error.ClipboardToolMissing => {
+                    notify(raw, image_attachments.clipboardToolMissingNotice(), .@"error");
+                    return null;
+                },
+                error.ImageTooLarge => {
+                    notify(raw, image_attachments.image_too_large_notice, .@"error");
+                    return null;
+                },
+                error.UnsupportedImageType => {
+                    notify(raw, "clipboard did not contain a PNG, JPEG, GIF, or WebP image", .@"error");
+                    return null;
+                },
+                else => return err,
+            };
+        }
+
+        fn attachImage(raw: *anyopaque, path: []const u8) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(raw));
+            if (comptime !@hasField(App, "pending_images")) return error.Unsupported;
+            const image_commands = @import("../images/image_commands.zig");
+            try image_commands.Commands(App).attachPath(app, path);
         }
 
         fn noticeViewerUnavailable(app: *App, path: []const u8) !void {

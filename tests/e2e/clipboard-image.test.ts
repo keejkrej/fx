@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { REPO_ROOT } from "../evals/eval-helpers";
-import { composerContains, hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { composerContains, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
 const ONE_BY_ONE_PNG = Buffer.from(
@@ -103,14 +103,12 @@ function x11AuthorityPath(): string | undefined {
 async function launchFx(): Promise<{ terminal: TmuxSession; stderrPath: string }> {
   const root = mkdtempSync(join(tmpdir(), "fx-clipboard-image-"));
   const home = join(root, "home");
-  const workspace = join(root, "workspace");
   const stderrPath = join(root, "stderr.log");
   mkdirSync(join(home, ".fx"), { recursive: true });
-  mkdirSync(workspace);
   writeFileSync(stderrPath, "");
   tempDirs.push(root);
   const terminal = await TmuxSession.create({
-    cwd: workspace,
+    cwd: REPO_ROOT,
     stderrPath,
     env: {
       HOME: home,
@@ -130,7 +128,7 @@ async function launchFx(): Promise<{ terminal: TmuxSession; stderrPath: string }
 
 const SKIP = !linuxImageClipboardWorks();
 
-describe.skipIf(SKIP)("tui: clipboard image-buffer paste", () => {
+describe.skipIf(SKIP)("tui: Lua clipboard screenshot paste plugin", () => {
   test(
     "Ctrl+V attaches screenshot PNG bytes as [Image 1]",
     async () => {
@@ -171,20 +169,17 @@ describe.skipIf(SKIP)("tui: clipboard image-buffer paste", () => {
   );
 
   test(
-    "Ctrl+V on a text clipboard does not paste the text as an image",
+    "Ctrl+V on a text clipboard does not attach an image",
     async () => {
       expect(copyClipboardText("hello-from-text-clipboard")).toBe(true);
       const launched = await launchFx();
       session = launched.terminal;
       await session.waitForComposer(10_000);
       await session.sendKeys("C-v");
-      const pane = await session.waitForPane(
-        (text) => text.includes("no image found on clipboard"),
-        8_000,
-      );
+      const pane = await session.waitForStableComposer(3_000, 400);
       expect(composerContains(pane, "hello-from-text-clipboard")).toBe(false);
       expect(composerContains(pane, "[Image 1]")).toBe(false);
-      expect(hasEmptyComposer(pane) || !composerContains(pane, "hello-from-text-clipboard")).toBe(true);
+      expect(pane).not.toContain("no image found on clipboard");
       expect(session.paneStatus()).toEqual({ dead: false, status: null });
       expect(readFileSync(launched.stderrPath, "utf8")).toBe("");
     },

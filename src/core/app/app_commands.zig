@@ -1928,7 +1928,9 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandPasteClipboard(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try image_commands.Commands(App).attachClipboard(app);
+            if (comptime @hasField(App, "scripting")) {
+                if (app_lua_runtime.Runtime(App).dispatchPaste(app, "clipboard", null)) return;
+            }
         }
 
         fn commandToggleFast(ctx: *anyopaque) !void {

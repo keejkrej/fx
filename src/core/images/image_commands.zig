@@ -85,9 +85,8 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn attachClipboard(app: *App) !void {
-            // Screenshot clipboard buffers are written to a temp file by
-            // loadClipboardImageAttachment, then attached as a normal image
-            // path. This is the same [Image N] pipeline as /image <path>.
+            // Host helper for Lua paste hooks. TUI Ctrl+V and /paste dispatch
+            // `fx.paste.hook` first; they do not call this as a first-class path.
             var loaded = image_attachments.loadClipboardImageAttachment(app.alloc) catch |err| {
                 switch (err) {
                     error.NoClipboardImage => {

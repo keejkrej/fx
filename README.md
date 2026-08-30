@@ -6,9 +6,10 @@ Keep upstream sign-in: `fx login grok`, `fx login codex`. This line does not rei
 
 **No Gateway.** Point fx at any OpenAI-compatible `/v1/chat/completions` server, or keep those logins. No Vercel account, no AI Gateway billing.
 
-**Lua, demoed by an in-TUI diff view.** `/diffview` is Lumen-like and embedded: file list, hunks, side-by-side. Comment a hunk (`c`) and the note lands in the agent input box as context, ready to send.
+**Lua plugins.** Two shipped demos of the plugin API:
 
-**Screenshot paste that works.** Copy pixels on Omarchy, Hyprland, Windows, or Linux. Ctrl+V writes PNG bytes to a temp file and attaches `[Image N]` like a normal image. You do not copy a PNG from disk first. That is the gap in Grok Build.
+- **In-TUI diff.** `/diffview` is Lumen-like: file list, hunks, side-by-side. Comment a hunk (`c`) and the note lands in the agent input box as context, ready to send.
+- **Screenshot buffer paste.** A paste interceptor: if the clipboard holds image bytes (Omarchy, Hyprland, Windows, Linux screenshot copy) or an image file path, write bytes to tmp and attach `[Image N]` like a normal file. Text passes through. Grok Build makes you copy a PNG from disk first.
 
 Install from [this repo's GitHub Releases](https://github.com/keejkrej/fx/releases), not `curl | bash` from fx.sh.
 

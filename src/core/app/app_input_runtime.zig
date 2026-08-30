@@ -1606,7 +1606,10 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
                 22 => {
-                    try image_commands.Commands(App).attachClipboard(app);
+                    if (comptime @hasField(App, "scripting")) {
+                        const app_lua_runtime = @import("app_lua_runtime.zig");
+                        if (app_lua_runtime.Runtime(App).dispatchPaste(app, "clipboard", null)) return;
+                    }
                 },
                 24 => {
                     if (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app)) return;
