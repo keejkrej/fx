@@ -15,11 +15,15 @@ const render_engine = @import("../render_engine.zig");
 const transcript_runtime = @import("../transcript/runtime.zig");
 const footer_viewport = @import("viewport.zig");
 const approval_ui = @import("approval_ui.zig");
-const appearance_menu_presentation = @import("appearance_menu_presentation.zig");
 const compact_command_menu_presentation = @import("compact_command_menu_presentation.zig");
 const input_presentation = @import("input_presentation.zig");
 const interaction_state = @import("interaction_state.zig");
 const picker_presentation = @import("picker_presentation.zig");
+const model_menu_presentation = @import("model_menu_presentation.zig");
+const skills_menu_presentation = @import("skills_menu_presentation.zig");
+const help_menu_presentation = @import("help_menu_presentation.zig");
+const settings_menu_presentation = @import("settings_menu_presentation.zig");
+const resume_menu_presentation = @import("resume_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
@@ -163,14 +167,12 @@ fn plannerCursorCol(shell: *const TranscriptRuntime, input: FooterPlannerInput) 
     return if (input.transcript_state) |state| state.cursor_col else shell.cursor_col;
 }
 
-pub noinline fn composerTopChromeRows(input_visible: bool, appearance: render_input.InputAppearance, maxxing_mode: render_input.MaxxingMode) u16 {
-    if (maxxing_mode == .minimal) return 0;
-    return if (input_visible and appearance == .lines) 1 else 0;
+pub noinline fn composerTopChromeRows() u16 {
+    return 0;
 }
 
-test "minimal maxxing suppresses composer chrome regardless of stored appearance" {
-    try std.testing.expectEqual(@as(u16, 0), composerTopChromeRows(true, .lines, .minimal));
-    try std.testing.expectEqual(@as(u16, 0), composerTopChromeRows(true, .tint, .minimal));
+test "current composer suppresses top chrome" {
+    try std.testing.expectEqual(@as(u16, 0), composerTopChromeRows());
 }
 
 fn plannerFooterReservedBaseRows(input: FooterPlannerInput) u16 {
@@ -580,6 +582,7 @@ fn pushQueuedPromptBannerRows(
         var summary = try input_presentation.composeQueuedSummaryRow(
             alloc,
             ctx.queued_count,
+            ctx.steering_count,
             ctx.queued_paused,
             width,
         );
@@ -591,6 +594,7 @@ fn pushQueuedPromptBannerRows(
                 width,
                 false,
                 ctx.queued_cancel_all_available,
+                ctx.steering_count > 0,
             );
             try pushFooterBandRow(alloc, frame, plan, plan.footer.banner +| painted, &hint);
             painted +|= 1;
@@ -652,8 +656,6 @@ fn pushQueuedPromptBannerRows(
                 alloc,
                 source,
                 window,
-                if (ctx.maxxing_mode == .minimal) .lines else ctx.input_appearance,
-                if (ctx.maxxing_mode == .minimal) .rail else .arrow,
             );
             defer input_rows.deinit(alloc);
 
@@ -716,6 +718,7 @@ fn pushQueuedPromptBannerRows(
             width,
             empty_draft,
             ctx.queued_cancel_all_available,
+            ctx.steering_count > 0,
         );
         try pushFooterBandRow(alloc, frame, plan, hint_row, &hint);
     }
@@ -733,8 +736,7 @@ pub fn composeFooterFrame(
     const approval_active = input.approval != null;
     const question_projection = if (!approval_active) ctx.question else null;
     const question_active = question_projection != null;
-    const appearance_active = !approval_active and !question_active and ctx.appearance_menu.active;
-    const compact_command_menu = if (!approval_active and !question_active and !appearance_active)
+    const compact_command_menu = if (!approval_active and !question_active)
         render_input.activeCompactCommandMenu(ctx)
     else
         null;
@@ -787,7 +789,7 @@ pub fn composeFooterFrame(
             .image_tokens = standalone_image_tokens,
             .skill_tokens = standalone_skill_tokens,
             .selection = standalone_selection,
-        }, if (ctx.maxxing_mode == .minimal) .lines else ctx.input_appearance, if (ctx.maxxing_mode == .minimal) .rail else .arrow, ctx.inline_completion_suffix);
+        }, ctx.inline_completion_suffix);
         cursor_row = cursor.row;
         cursor_col = cursor.col;
     }
@@ -796,7 +798,7 @@ pub fn composeFooterFrame(
         cursor_col = cursor.col;
     }
 
-    if (approval_active or question_active or appearance_active or compact_command_active or input.show_picker) {
+    if (approval_active or question_active or compact_command_active or input.show_picker) {
         if (input.input_visible) {
             var picker_divider = try row_text.composeDividerRow(alloc, shell.layout.cols);
             try pushFooterBandRow(alloc, &frame, plan, rows.picker_divider, &picker_divider);
@@ -816,18 +818,6 @@ pub fn composeFooterFrame(
             }
         } else if (question_projection) |projection| {
             try pushQuestionPanelRows(alloc, &frame, plan, rows.picker_start, input.picker_rows, projection, shell.layout.cols);
-        } else if (appearance_active) {
-            var appearance_row_index: u16 = 0;
-            while (appearance_row_index < input.picker_rows) : (appearance_row_index += 1) {
-                var appearance_row = try appearance_menu_presentation.composeAppearanceMenuRow(
-                    alloc,
-                    ctx.appearance_menu,
-                    appearance_row_index,
-                    input.picker_rows,
-                    shell.layout.cols,
-                );
-                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + appearance_row_index, &appearance_row);
-            }
         } else if (compact_command_menu) |menu| {
             var menu_row_index: u16 = 0;
             while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
@@ -839,6 +829,77 @@ pub fn composeFooterFrame(
                     shell.layout.cols,
                 );
                 try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
+        } else if (input.picker_kind == .settings and ctx.settings_menu.active) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try settings_menu_presentation.composeSettingsMenuRow(
+                    alloc,
+                    ctx.settings_menu,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
+        } else if (input.picker_kind == .help and ctx.help_menu.active) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try help_menu_presentation.composeHelpMenuRow(
+                    alloc,
+                    ctx.help_menu,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
+        } else if (input.picker_kind == .sessions and ctx.session_menu.active) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try resume_menu_presentation.composeSessionMenuRow(
+                    alloc,
+                    ctx.session_menu,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
+        } else if (input.picker_kind == .models and ctx.model_menu.active) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try model_menu_presentation.composeModelMenuRow(
+                    alloc,
+                    ctx.model_menu,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
+        } else if (input.picker_kind == .skills and ctx.skills_menu.active) {
+            var prepared = try skills_menu_presentation.prepareInlineSkillsMenu(
+                alloc,
+                ctx.skills_menu,
+                input.picker_rows,
+            );
+            defer prepared.deinit(alloc);
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < prepared.rowCount()) : (menu_row_index += 1) {
+                var menu_row = try skills_menu_presentation.composeSkillsMenuRow(
+                    alloc,
+                    prepared,
+                    menu_row_index,
+                    shell.layout.cols,
+                );
+                try pushFooterBandRow(
+                    alloc,
+                    &frame,
+                    plan,
+                    rows.picker_start + menu_row_index,
+                    &menu_row,
+                );
             }
         } else if (input.picker_kind == .auth and ctx.auth_picker.active) {
             var auth_row_index: u16 = 0;
@@ -938,8 +999,7 @@ pub fn composeFooterFrame(
         }
     }
 
-    const needs_bottom_divider = ctx.maxxing_mode == .legacy or
-        !input.input_visible or approval_active or question_active or appearance_active or compact_command_active or input.show_picker;
+    const needs_bottom_divider = !input.input_visible or approval_active or question_active or compact_command_active or input.show_picker;
     var bottom_row: std.ArrayList(u8) = if (needs_bottom_divider)
         try row_text.composeDividerRow(alloc, shell.layout.cols)
     else
@@ -953,19 +1013,18 @@ pub fn composeFooterFrame(
             input.approval.?,
             shell.layout.cols,
         )
-    else if (appearance_active)
-        try input_presentation.composeAppearanceMenuHintRow(alloc, shell.layout.cols)
     else if (compact_command_menu) |menu|
-        switch (menu) {
-            .statusline => try input_presentation.composeHintRow(
-                alloc,
-                false,
-                input.active_label,
-                ctx,
-                shell.layout.cols,
-            ),
-            else => try input_presentation.composeCompactCommandMenuHintRow(alloc, shell.layout.cols, menu),
-        }
+        try input_presentation.composeCompactCommandMenuHintRow(alloc, shell.layout.cols, menu)
+    else if (input.show_picker and input.picker_kind == .skills)
+        try input_presentation.composeSkillsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .settings)
+        try input_presentation.composeSettingsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .help)
+        try input_presentation.composeHelpMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .sessions)
+        try input_presentation.composeResumeMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .models)
+        try input_presentation.composeModelsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .slash and input.slash_menu_layout != null)
         try input_presentation.composeSlashMenuHintRow(alloc, shell.layout.cols)
     else blk: {
@@ -1000,13 +1059,12 @@ fn composeTranscriptViewerFooterFrame(
     errdefer frame.deinit(alloc);
     const width = shell.layout.cols;
     const navigation = switch (input.ctx.transcript_depth) {
-        .review => "Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
-        .full => "Full detail · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
+        .full => "Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
         .inline_mode => unreachable,
     };
 
     var navigation_row: std.ArrayList(u8) = .empty;
-    try navigation_row.appendSlice(alloc, user_message_card.minimalMarkerStyle());
+    try navigation_row.appendSlice(alloc, user_message_card.promptMarkerStyle());
     try row_text.appendClipped(alloc, &navigation_row, "┃", width);
     try navigation_row.appendSlice(alloc, ui_render.reset_style);
     if (width > 1) {
@@ -1067,8 +1125,6 @@ fn composeAndPushVisibleInputRows(
     summary: visual_layout.Summary,
     window: visual_layout.VisibleWindow,
     source: visual_layout.Source,
-    appearance: render_input.InputAppearance,
-    prefix_style: input_presentation.ComposerPrefixStyle,
     inline_completion_suffix: []const u8,
 ) !InputCursorPlacement {
     const visible_count_u16: u16 = @intCast(@min(window.row_count, std.math.maxInt(u16)));
@@ -1078,7 +1134,7 @@ fn composeAndPushVisibleInputRows(
         placement.row = base_row - (visible_count_u16 - 1 - cursor_index);
     }
 
-    var rows = try input_presentation.composeVisibleInputRows(alloc, source, window, appearance, prefix_style);
+    var rows = try input_presentation.composeVisibleInputRows(alloc, source, window);
     defer rows.deinit(alloc);
     if (inline_completion_suffix.len > 0 and
         summary.cursor.row_index >= window.first_row and
@@ -1090,7 +1146,6 @@ fn composeAndPushVisibleInputRows(
             &rows.rows.items[cursor_index],
             source.terminal_cols,
             inline_completion_suffix,
-            appearance,
         );
     }
 
@@ -1114,7 +1169,7 @@ fn composeInputRowsSnapshot(
     const source = visual_layout.Source{ .input = input, .cursor = cursor, .terminal_cols = width, .images = images };
     const summary = visual_layout.summarize(source, null);
     const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, row_limit);
-    var rows = try input_presentation.composeVisibleInputRows(alloc, source, window, .lines, .arrow);
+    var rows = try input_presentation.composeVisibleInputRows(alloc, source, window);
     defer rows.deinit(alloc);
 
     var out: std.ArrayList(u8) = .empty;
@@ -1212,15 +1267,6 @@ fn testContext(input: *const InputRuntime) render_input.RenderContext {
     };
 }
 
-const test_tint_style = "\x1b[48;5;238m\x1b[38;5;250m";
-const test_tint_bg = vt_emulator.Color{ .indexed = 238 };
-
-fn withTestInputBarStyle() []const u8 {
-    const previous = ui_render.input_bar_style;
-    ui_render.input_bar_style = test_tint_style;
-    return previous;
-}
-
 fn expectRowBackground(row_bytes: []const u8, width: u16, expected_bg: vt_emulator.Color) !void {
     var grid = try vt_emulator.Grid.init(std.testing.allocator, width, 2);
     defer grid.deinit();
@@ -1304,7 +1350,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
     };
     defer shell.deinit(alloc);
     var ctx = testContext(&input);
-    ctx.transcript_depth = .review;
+    ctx.transcript_depth = .full;
     const planner_input: FooterPlannerInput = .{
         .active_label = null,
         .ctx = ctx,
@@ -1323,7 +1369,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
         &frame,
         frame_plan.paint.footer.top_divider,
         shell.layout.cols,
-        "┃ Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
+        "┃ Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
     );
     try expectFrameRowTextTrimmed(
         &frame,
@@ -1357,82 +1403,8 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
         &full_frame,
         full_plan.paint.footer.top_divider,
         shell.layout.cols,
-        "┃ Full detail · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
+        "┃ Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
     );
-}
-
-test "input appearance tint colors only composed input row cells" {
-    const alloc = std.testing.allocator;
-    const previous_style = withTestInputBarStyle();
-    defer ui_render.input_bar_style = previous_style;
-
-    const source = visual_layout.Source{
-        .input = "abc",
-        .cursor = 3,
-        .terminal_cols = 10,
-    };
-    const summary = visual_layout.summarize(source, null);
-    const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 1);
-
-    var line_rows = try input_presentation.composeVisibleInputRows(alloc, source, window, .lines, .arrow);
-    defer line_rows.deinit(alloc);
-    try expectRowDefaultBackground(line_rows.rows.items[0].items, source.terminal_cols);
-
-    var tint_rows = try input_presentation.composeVisibleInputRows(alloc, source, window, .tint, .arrow);
-    defer tint_rows.deinit(alloc);
-    try expectRowBackground(tint_rows.rows.items[0].items, source.terminal_cols, test_tint_bg);
-
-    var reset_grid = try vt_emulator.Grid.init(alloc, 10, 2);
-    defer reset_grid.deinit();
-    try reset_grid.feed(tint_rows.rows.items[0].items);
-    try reset_grid.feed("\x1b[2;1Hz");
-    const reset_cell = reset_grid.cellAt(2, 1) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(reset_cell.style.bg.eql(.default));
-}
-
-test "input appearance tint avoids clear-to-eol on exact-width rows" {
-    const alloc = std.testing.allocator;
-    const previous_style = withTestInputBarStyle();
-    defer ui_render.input_bar_style = previous_style;
-
-    const source = visual_layout.Source{
-        .input = "123456",
-        .cursor = 6,
-        .terminal_cols = 8,
-    };
-    const summary = visual_layout.summarize(source, null);
-    const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 1);
-
-    var rows = try input_presentation.composeVisibleInputRows(alloc, source, window, .tint, .arrow);
-    defer rows.deinit(alloc);
-
-    try std.testing.expect(std.mem.indexOf(u8, rows.rows.items[0].items, "\x1b[K") == null);
-    try expectRowBackground(rows.rows.items[0].items, source.terminal_cols, test_tint_bg);
-}
-
-test "input appearance tint restores row background after skill tokens" {
-    const alloc = std.testing.allocator;
-    const previous_style = withTestInputBarStyle();
-    defer ui_render.input_bar_style = previous_style;
-
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "run review now");
-    const start = "run ".len;
-    try input.skillBindingState().bindSkillToken(alloc, start, start + "review".len, "review", "/tmp/review.md", null);
-
-    const source = visual_layout.Source{
-        .input = input.edit_state.input.items,
-        .cursor = input.edit_state.input.items.len,
-        .terminal_cols = 24,
-        .skill_tokens = input.entities.skill_tokens.items,
-    };
-    const summary = visual_layout.summarize(source, null);
-    const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 1);
-
-    var rows = try input_presentation.composeVisibleInputRows(alloc, source, window, .tint, .arrow);
-    defer rows.deinit(alloc);
-    try expectRowBackground(rows.rows.items[0].items, source.terminal_cols, test_tint_bg);
 }
 
 test "footer paints an inline completion suffix without moving the composer cursor" {
@@ -1478,7 +1450,7 @@ test "footer paints an inline completion suffix without moving the composer curs
         .place_mid_line_active = false,
         .input_extra = geometry.input_extra,
         .input_visible = true,
-        .composer_top_chrome_rows = composerTopChromeRows(true, ctx.input_appearance, ctx.maxxing_mode),
+        .composer_top_chrome_rows = composerTopChromeRows(),
         .picker_rows = 0,
         .banner_active = false,
         .input_summary = geometry.summary,
@@ -1494,7 +1466,7 @@ test "footer paints an inline completion suffix without moving the composer curs
         &frame,
         frame_plan.paint.footer.input_base,
         shell.layout.cols,
-        "❯ explain $managed-menu",
+        "┃ explain $managed-menu",
     );
     try std.testing.expectEqualStrings("explain $man", input.edit_state.input.items);
     try std.testing.expectEqual(
@@ -1508,242 +1480,6 @@ test "footer paints an inline completion suffix without moving the composer curs
         frame.cursor.col,
         .{ .indexed = 245 },
     );
-}
-
-test "input appearance tint leaves picker divider and hint rows untinted" {
-    const alloc = std.testing.allocator;
-    const previous_style = withTestInputBarStyle();
-    defer ui_render.input_bar_style = previous_style;
-
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "/input ");
-    input.edit_state.cursor = input.edit_state.input.items.len;
-
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 18,
-            .cols = 40,
-            .content_bottom = 12,
-            .divider_top_row = 13,
-            .input_row = 14,
-            .divider_bottom_row = 15,
-            .hint_row = 16,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 10,
-        .cursor_col = 1,
-    };
-    defer shell.deinit(alloc);
-
-    var ctx = testContext(&input);
-    ctx.input_appearance = .tint;
-    const geometry = input_presentation.measureRawInputGeometry(ctx, shell.layout.cols, shell.layout.content_bottom, true, false, false, false);
-    try std.testing.expect(geometry.show_slash_query);
-
-    const picker_rows: u16 = @intCast(@min(geometry.slash_completion_count, input_presentation.max_model_picker_rows));
-    const planner_input: FooterPlannerInput = .{
-        .active_label = null,
-        .ctx = ctx,
-        .place_mid_line_active = false,
-        .input_extra = geometry.input_extra,
-        .input_visible = true,
-        .composer_top_chrome_rows = composerTopChromeRows(true, ctx.input_appearance, ctx.maxxing_mode),
-        .picker_rows = picker_rows,
-        .banner_active = false,
-        .show_picker = true,
-        .picker_kind = .slash,
-        .slash_completion_count = geometry.slash_completion_count,
-        .picker_start_col = geometry.picker_start_col,
-        .input_summary = geometry.summary,
-        .input_window = geometry.window,
-        .total_lines = geometry.total_lines,
-    };
-
-    const frame_plan = planFooterPaint(&shell, planner_input);
-    try frame_plan.paint.validate();
-
-    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
-    defer frame.deinit(alloc);
-
-    try std.testing.expectEqual(frame_plan.paint.footer.top_divider, frame_plan.paint.footer.input_base);
-    try expectFrameRowBackground(&frame, frame_plan.paint.footer.input_base, shell.layout.cols, test_tint_bg);
-    try expectFrameRowDefaultBackground(&frame, frame_plan.paint.footer.picker_divider, shell.layout.cols);
-    try expectFrameRowDefaultBackground(&frame, frame_plan.paint.footer.picker_start, shell.layout.cols);
-    try expectFrameRowDefaultBackground(&frame, frame_plan.paint.footer.bottom_divider, shell.layout.cols);
-    try expectFrameRowDefaultBackground(&frame, frame_plan.paint.footer.hint, shell.layout.cols);
-}
-
-test "input appearance tint collapses composer top divider row" {
-    const alloc = std.testing.allocator;
-    const previous_style = withTestInputBarStyle();
-    defer ui_render.input_bar_style = previous_style;
-
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.textReplacementState().replace(alloc, "tinted");
-
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 18,
-            .cols = 16,
-            .content_bottom = 12,
-            .divider_top_row = 13,
-            .input_row = 14,
-            .divider_bottom_row = 15,
-            .hint_row = 16,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 10,
-        .cursor_col = 1,
-    };
-    defer shell.deinit(alloc);
-
-    var ctx = testContext(&input);
-    ctx.input_appearance = .tint;
-    const geometry = input_presentation.measureRawInputGeometry(ctx, shell.layout.cols, shell.layout.content_bottom, true, false, false, false);
-    const planner_input: FooterPlannerInput = .{
-        .active_label = null,
-        .ctx = ctx,
-        .place_mid_line_active = false,
-        .input_extra = geometry.input_extra,
-        .input_visible = true,
-        .composer_top_chrome_rows = composerTopChromeRows(true, ctx.input_appearance, ctx.maxxing_mode),
-        .picker_rows = 0,
-        .banner_active = false,
-        .input_summary = geometry.summary,
-        .input_window = geometry.window,
-        .total_lines = geometry.total_lines,
-    };
-
-    const frame_plan = planFooterPaint(&shell, planner_input);
-    try frame_plan.paint.validate();
-
-    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
-    defer frame.deinit(alloc);
-
-    try std.testing.expectEqual(frame_plan.paint.footer.top_divider, frame_plan.paint.footer.input_base);
-    try std.testing.expectEqual(@as(u16, 3), frame_plan.paint.footer.total_rows);
-    try expectFrameRowBackground(&frame, frame_plan.paint.footer.input_base, shell.layout.cols, test_tint_bg);
-    try expectFrameRowTextTrimmed(&frame, frame_plan.paint.footer.bottom_divider, shell.layout.cols, "────────────────");
-}
-
-test "input appearance tint keeps multiline input rows contiguous" {
-    const alloc = std.testing.allocator;
-    const previous_style = withTestInputBarStyle();
-    defer ui_render.input_bar_style = previous_style;
-
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.textReplacementState().replace(alloc, "first\nsecond");
-
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 18,
-            .cols = 24,
-            .content_bottom = 12,
-            .divider_top_row = 13,
-            .input_row = 14,
-            .divider_bottom_row = 15,
-            .hint_row = 16,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 10,
-        .cursor_col = 1,
-    };
-    defer shell.deinit(alloc);
-
-    var ctx = testContext(&input);
-    ctx.input_appearance = .tint;
-    const geometry = input_presentation.measureRawInputGeometry(ctx, shell.layout.cols, shell.layout.content_bottom, true, false, false, false);
-    const planner_input: FooterPlannerInput = .{
-        .active_label = null,
-        .ctx = ctx,
-        .place_mid_line_active = false,
-        .input_extra = geometry.input_extra,
-        .input_visible = true,
-        .composer_top_chrome_rows = composerTopChromeRows(true, ctx.input_appearance, ctx.maxxing_mode),
-        .picker_rows = 0,
-        .footer_extra_rows = geometry.input_extra,
-        .banner_active = false,
-        .input_summary = geometry.summary,
-        .input_window = geometry.window,
-        .total_lines = geometry.total_lines,
-    };
-
-    const frame_plan = planFooterPaint(&shell, planner_input);
-    try frame_plan.paint.validate();
-
-    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
-    defer frame.deinit(alloc);
-
-    try std.testing.expectEqual(@as(u16, 0), frame_plan.paint.footer.composer_top_chrome_rows);
-    try std.testing.expectEqual(frame_plan.paint.footer.top_divider + 1, frame_plan.paint.footer.input_base);
-    try expectFrameRowBackground(&frame, frame_plan.paint.footer.top_divider, shell.layout.cols, test_tint_bg);
-    try expectFrameRowBackground(&frame, frame_plan.paint.footer.input_base, shell.layout.cols, test_tint_bg);
-    try expectFrameRowTextTrimmed(&frame, frame_plan.paint.footer.bottom_divider, shell.layout.cols, "────────────────────────");
-}
-
-test "input appearance tint places queued banner directly above input" {
-    const alloc = std.testing.allocator;
-    const previous_style = withTestInputBarStyle();
-    defer ui_render.input_bar_style = previous_style;
-
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.textReplacementState().replace(alloc, "queued");
-
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 18,
-            .cols = 24,
-            .content_bottom = 12,
-            .divider_top_row = 13,
-            .input_row = 14,
-            .divider_bottom_row = 15,
-            .hint_row = 16,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 10,
-        .cursor_col = 1,
-    };
-    defer shell.deinit(alloc);
-
-    var ctx = testContext(&input);
-    ctx.input_appearance = .tint;
-    ctx.queued_count = 1;
-    const geometry = input_presentation.measureRawInputGeometry(ctx, shell.layout.cols, shell.layout.content_bottom, true, false, false, false);
-    const planner_input: FooterPlannerInput = .{
-        .active_label = null,
-        .ctx = ctx,
-        .place_mid_line_active = false,
-        .input_extra = geometry.input_extra,
-        .input_visible = true,
-        .composer_top_chrome_rows = composerTopChromeRows(true, ctx.input_appearance, ctx.maxxing_mode),
-        .picker_rows = 0,
-        .footer_extra_rows = geometry.input_extra + 1,
-        .banner_active = true,
-        .banner_rows = 1,
-        .footer_gap_active = true,
-        .input_summary = geometry.summary,
-        .input_window = geometry.window,
-        .total_lines = geometry.total_lines,
-    };
-
-    const frame_plan = planFooterPaint(&shell, planner_input);
-    try frame_plan.paint.validate();
-
-    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
-    defer frame.deinit(alloc);
-
-    try std.testing.expectEqual(frame_plan.paint.footer.banner + 1, frame_plan.paint.footer.input_base);
-    try std.testing.expectEqual(frame_plan.paint.footer.top_divider, frame_plan.paint.footer.input_base);
-    try expectFrameRowDefaultBackground(&frame, frame_plan.paint.footer.banner, shell.layout.cols);
-    try expectFrameRowBackground(&frame, frame_plan.paint.footer.input_base, shell.layout.cols, test_tint_bg);
 }
 
 test "queued prompts collapse to a single summary row until the review opens" {
@@ -1778,7 +1514,7 @@ test "queued prompts collapse to a single summary row until the review opens" {
         .place_mid_line_active = false,
         .input_extra = 0,
         .input_visible = true,
-        .composer_top_chrome_rows = composerTopChromeRows(true, ctx.input_appearance, ctx.maxxing_mode),
+        .composer_top_chrome_rows = composerTopChromeRows(),
         .picker_rows = 0,
         .footer_extra_rows = banner_rows,
         .banner_active = true,
@@ -1831,7 +1567,7 @@ test "a hidden paused review keeps the summary row above its hint" {
         .place_mid_line_active = false,
         .input_extra = 0,
         .input_visible = true,
-        .composer_top_chrome_rows = composerTopChromeRows(true, ctx.input_appearance, ctx.maxxing_mode),
+        .composer_top_chrome_rows = composerTopChromeRows(),
         .picker_rows = 0,
         .footer_extra_rows = banner_rows,
         .banner_active = true,
@@ -1883,8 +1619,8 @@ test "queued prompt cards stack above the composer with a paused hint" {
     const second = try user_message_card.buildUserPromptCard(alloc, "second queued\ncontinued", &.{}, shell.layout.cols);
     defer alloc.free(second);
     const cards = [_]render_input.QueuedPromptCard{
-        .{ .bytes = first, .row_count = 1 },
-        .{ .bytes = second, .row_count = 2 },
+        .{ .bytes = first },
+        .{ .bytes = second },
     };
 
     var ctx = testContext(&input);
@@ -1898,7 +1634,7 @@ test "queued prompt cards stack above the composer with a paused hint" {
         .place_mid_line_active = false,
         .input_extra = 0,
         .input_visible = true,
-        .composer_top_chrome_rows = composerTopChromeRows(true, ctx.input_appearance, ctx.maxxing_mode),
+        .composer_top_chrome_rows = composerTopChromeRows(),
         .picker_rows = 0,
         .footer_extra_rows = 7,
         .banner_active = true,
@@ -1911,10 +1647,10 @@ test "queued prompt cards stack above the composer with a paused hint" {
     defer frame.deinit(alloc);
 
     const banner = frame_plan.paint.footer.banner;
-    try expectFrameRowTextTrimmed(&frame, banner, shell.layout.cols, "❯ first queued");
+    try expectFrameRowTextTrimmed(&frame, banner, shell.layout.cols, "┃ first queued");
     try expectFrameRowTextTrimmed(&frame, banner + 1, shell.layout.cols, "");
-    try expectFrameRowTextTrimmed(&frame, banner + 2, shell.layout.cols, "❯ second queued");
-    try expectFrameRowTextTrimmed(&frame, banner + 3, shell.layout.cols, "  continued");
+    try expectFrameRowTextTrimmed(&frame, banner + 2, shell.layout.cols, "┃ second queued");
+    try expectFrameRowTextTrimmed(&frame, banner + 3, shell.layout.cols, "┃ continued");
     try expectFrameRowTextTrimmed(&frame, banner + 4, shell.layout.cols, "");
     try expectFrameRowTextTrimmed(&frame, banner + 5, shell.layout.cols, "paused · enter to send");
     try expectFrameRowTextTrimmed(&frame, banner + 6, shell.layout.cols, "");
@@ -1949,8 +1685,8 @@ test "queued editor paints and owns the cursor on its original card row" {
     const editing_bytes = try alloc.dupe(u8, "");
     defer alloc.free(editing_bytes);
     const cards = [_]render_input.QueuedPromptCard{
-        .{ .bytes = first, .row_count = 1 },
-        .{ .bytes = editing_bytes, .row_count = 1, .editing = true },
+        .{ .bytes = first },
+        .{ .bytes = editing_bytes, .editing = true },
     };
 
     var ctx = testContext(&input);
@@ -1978,13 +1714,13 @@ test "queued editor paints and owns the cursor on its original card row" {
     defer frame.deinit(alloc);
 
     const banner = frame_plan.paint.footer.banner;
-    try expectFrameRowTextTrimmed(&frame, banner, shell.layout.cols, "❯ first queued");
+    try expectFrameRowTextTrimmed(&frame, banner, shell.layout.cols, "┃ first queued");
     try expectFrameRowTextTrimmed(&frame, banner + 1, shell.layout.cols, "");
-    try expectFrameRowTextTrimmed(&frame, banner + 2, shell.layout.cols, "❯ second queued");
+    try expectFrameRowTextTrimmed(&frame, banner + 2, shell.layout.cols, "┃ second queued");
     try expectFrameRowTextTrimmed(&frame, banner + 3, shell.layout.cols, "");
     try expectFrameRowTextTrimmed(&frame, banner + 4, shell.layout.cols, "paused · enter to send");
     try expectFrameRowTextTrimmed(&frame, banner + 5, shell.layout.cols, "");
-    try expectFrameRowTextTrimmed(&frame, frame_plan.paint.footer.input_base, shell.layout.cols, "❯");
+    try expectFrameRowTextTrimmed(&frame, frame_plan.paint.footer.input_base, shell.layout.cols, "┃");
     try std.testing.expectEqual(banner + 2, frame.cursor.row);
     try std.testing.expectEqual(@as(u16, 16), frame.cursor.col);
     try std.testing.expect(frame.cursor_visible);
@@ -2021,7 +1757,7 @@ test "queued editor follows the cursor when its draft exceeds the card budget" {
     const editing_bytes = try alloc.dupe(u8, "");
     defer alloc.free(editing_bytes);
     const cards = [_]render_input.QueuedPromptCard{
-        .{ .bytes = editing_bytes, .row_count = 1, .editing = true },
+        .{ .bytes = editing_bytes, .editing = true },
     };
 
     var ctx = testContext(&input);
@@ -2050,77 +1786,20 @@ test "queued editor follows the cursor when its draft exceeds the card budget" {
 
     // A clamped band drops the spacers and spends every row on queued content.
     const banner = frame_plan.paint.footer.banner;
-    try expectFrameRowTextTrimmed(&frame, banner, shell.layout.cols, "↑ second line");
-    try expectFrameRowTextTrimmed(&frame, banner + 1, shell.layout.cols, "  third line");
-    try expectFrameRowTextTrimmed(&frame, banner + 2, shell.layout.cols, "  fourth line");
-    try expectFrameRowTextTrimmed(&frame, banner + 3, shell.layout.cols, "  fifth line tail");
+    try expectFrameRowTextTrimmed(&frame, banner, shell.layout.cols, "┃↑second line");
+    try expectFrameRowTextTrimmed(&frame, banner + 1, shell.layout.cols, "┃ third line");
+    try expectFrameRowTextTrimmed(&frame, banner + 2, shell.layout.cols, "┃ fourth line");
+    try expectFrameRowTextTrimmed(&frame, banner + 3, shell.layout.cols, "┃ fifth line tail");
     try expectFrameRowTextTrimmed(&frame, banner + 4, shell.layout.cols, "paused · enter to send");
     try std.testing.expectEqual(banner + 3, frame.cursor.row);
     try std.testing.expectEqual(@as(u16, 18), frame.cursor.col);
     try std.testing.expect(frame.cursor_visible);
 }
 
-test "input appearance lines keeps both composer dividers" {
-    const alloc = std.testing.allocator;
-    const previous_style = withTestInputBarStyle();
-    defer ui_render.input_bar_style = previous_style;
-
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "plain");
-    input.edit_state.cursor = input.edit_state.input.items.len;
-
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 18,
-            .cols = 12,
-            .content_bottom = 12,
-            .divider_top_row = 13,
-            .input_row = 14,
-            .divider_bottom_row = 15,
-            .hint_row = 16,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 10,
-        .cursor_col = 1,
-    };
-    defer shell.deinit(alloc);
-
-    var ctx = testContext(&input);
-    ctx.input_appearance = .lines;
-    const geometry = input_presentation.measureRawInputGeometry(ctx, shell.layout.cols, shell.layout.content_bottom, true, false, false, false);
-    const planner_input: FooterPlannerInput = .{
-        .active_label = null,
-        .ctx = ctx,
-        .place_mid_line_active = false,
-        .input_extra = geometry.input_extra,
-        .input_visible = true,
-        .picker_rows = 0,
-        .banner_active = false,
-        .input_summary = geometry.summary,
-        .input_window = geometry.window,
-        .total_lines = geometry.total_lines,
-    };
-
-    const frame_plan = planFooterPaint(&shell, planner_input);
-    try frame_plan.paint.validate();
-
-    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
-    defer frame.deinit(alloc);
-
-    try expectFrameRowTextTrimmed(&frame, frame_plan.paint.footer.top_divider, shell.layout.cols, "────────────");
-    try expectFrameRowDefaultBackground(&frame, frame_plan.paint.footer.input_base, shell.layout.cols);
-    try expectFrameRowTextTrimmed(&frame, frame_plan.paint.footer.bottom_divider, shell.layout.cols, "────────────");
-}
-
-test "minimal maxxing renders a white connected rail across composer rows" {
+test "current composer renders a white connected rail across its rows" {
     const alloc = std.testing.allocator;
     ui_render.initTheme(false, null);
     defer ui_render.initTheme(false, null);
-    const previous_style = withTestInputBarStyle();
-    defer ui_render.input_bar_style = previous_style;
-
     var input = InputRuntime{};
     defer input.deinit(alloc);
     try input.edit_state.input.appendSlice(alloc, "one\ntwo\nthree");
@@ -2143,9 +1822,7 @@ test "minimal maxxing renders a white connected rail across composer rows" {
     };
     defer shell.deinit(alloc);
 
-    var ctx = testContext(&input);
-    ctx.input_appearance = .tint;
-    ctx.maxxing_mode = .minimal;
+    const ctx = testContext(&input);
     const geometry = input_presentation.measureRawInputGeometry(ctx, shell.layout.cols, shell.layout.content_bottom, true, false, false, false);
     const planner_input: FooterPlannerInput = .{
         .active_label = null,
@@ -2153,7 +1830,7 @@ test "minimal maxxing renders a white connected rail across composer rows" {
         .place_mid_line_active = false,
         .input_extra = geometry.input_extra,
         .input_visible = true,
-        .composer_top_chrome_rows = composerTopChromeRows(true, ctx.input_appearance, ctx.maxxing_mode),
+        .composer_top_chrome_rows = composerTopChromeRows(),
         .picker_rows = 0,
         .banner_active = false,
         .input_summary = geometry.summary,
@@ -2165,7 +1842,6 @@ test "minimal maxxing renders a white connected rail across composer rows" {
     var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
     defer frame.deinit(alloc);
 
-    try std.testing.expectEqual(core_input_runtime.InputAppearance.tint, ctx.input_appearance);
     try std.testing.expectEqual(@as(u16, 0), frame_plan.paint.footer.composer_top_chrome_rows);
     const first_input_row = frame_plan.paint.footer.input_base - 2;
     try expectFrameRowTextTrimmed(&frame, first_input_row, shell.layout.cols, "┃ one");

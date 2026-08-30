@@ -1,6 +1,5 @@
 const std = @import("std");
 const app_lifecycle = @import("app_lifecycle.zig");
-const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const contracts = @import("../terminal/contracts.zig");
@@ -424,7 +423,7 @@ pub const Controller = struct {
         const profile_user = identity.profileUser(&profile_user_buffer) orelse
             return self.restoreManagerAfterOpenFailure(App, app, "unsupported host");
         const durable_session_id = app_session_runtime.Runtime(App).activeSessionId(app) orelse
-            return self.restoreManagerAfterOpenFailure(App, app, "no durable Fx session");
+            return self.restoreManagerAfterOpenFailure(App, app, "no durable fx session");
         const owner = app_session_runtime.Runtime(App).childCapability(app) orelse
             return self.restoreManagerAfterOpenFailure(App, app, "durable session unavailable");
         var authority = store.reloadHumanTakeoverAuthorityClaim(app.alloc, owner, .{
@@ -433,8 +432,6 @@ pub const Controller = struct {
             .durable_session_id = durable_session_id,
             .workspace_root = app.workspace_root,
             .transport_role = .interactive,
-            .sandbox_backend = app_permission_runtime.Runtime(App)
-                .livePermissionSnapshot(app).sandbox_backend,
             .actor = .human,
         }) catch |err| {
             debug_trace.logf(

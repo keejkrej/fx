@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
+const host_mod = @import("../hosts/host.zig");
 const command_contract = @import("../execution/command_contract.zig");
 const command_environment = @import("../execution/command_environment.zig");
 const background_process_provider = @import(
@@ -28,9 +29,7 @@ const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const pathing = @import("../workspace/pathing.zig");
-const devbox_executor = @import("../execution/devbox_executor.zig");
 const execution_router = @import("../execution/router.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_communication_store = @import("../subagent/communication_store.zig");
@@ -62,10 +61,14 @@ const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const tool_mcp_feature_dispatch = @import("tool_mcp_feature_dispatch.zig");
 const tool_presentation = @import("tool_presentation.zig");
+const terminal_impl = @import("../../tools/terminal/terminal.zig");
 const web_fetch_runtime = @import("web_fetch_runtime.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const web_fetch_artifacts = @import("../session/web_fetch_artifacts.zig");
 const types = @import("../shared/types.zig");
+const model_provider = @import("../config/model_provider.zig");
+const provider_set = @import("../gateway/provider_set.zig");
+const credential_authority = @import("../auth/credential_authority.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const test_builtin_tools = if (builtin.is_test)
@@ -135,7 +138,14 @@ pub const Context = struct {
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     gateway_team: ?[]const u8 = null,
     credential_source: ?types.CredentialSource = null,
+    account_id: ?[]const u8 = null,
+    provider: model_provider.ProviderId = .gateway,
+    provider_capabilities: provider_set.Bundle.Capabilities = .{
+        .fx_search = true,
+        .vision_fallback = true,
+    },
     oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
+    secret_store: host_mod.SecretStore = host_mod.unavailable_secret_store,
     model: []const u8,
     permission_review_turn: ?permission_auto_classifier.ReviewTurnContext = null,
     root_user_intent_context: []const u8 = "",
@@ -178,13 +188,12 @@ pub const Context = struct {
     command_artifact_dir: ?[]const u8 = null,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
+    ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
     terminal_client: ?*terminal_client_runtime.Runtime = null,
     command_timeout_ms: ?usize = null,
     command_timeout_started_ms: ?i64 = null,
     command_replay_capture: ?*command_replay_store.Capture = null,
     command_replay_unavailable: bool = false,
-    sandbox_backend: sandbox.BackendKind = .none,
-    devbox_provider: ?devbox_executor.Provider = null,
     tracker: ?*change_tracker.ChangeTracker = null,
     mcp_ctx: ?*anyopaque = null,
     mcp_has_tool: ?tool_mcp_runtime.HasToolFn = null,
@@ -192,6 +201,7 @@ pub const Context = struct {
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
+    expected_mcp_runtime_generation: ?u64 = null,
     mcp_call_feature: ?tool_mcp_runtime.FeatureCallFn = null,
     mcp_access: tool_mcp_runtime.Access = .unrestricted,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
@@ -240,7 +250,6 @@ pub const Context = struct {
             .worker = self.worker,
             .permission_prompter = self.permission_prompter,
             .background = self.background,
-            .sandbox_backend = self.sandbox_backend,
             .advertised_dynamic_tool_names = self.advertised_dynamic_tool_names,
             .mcp_runtime = mcpRuntimeCapabilities(self),
             .context_limits = self.context_limits,
@@ -265,7 +274,6 @@ pub const Context = struct {
             if (live.permission_state != null) {
                 input.session_permission_state_provider = null;
             }
-            input.sandbox_backend = live.sandbox_backend;
             input.advertised_dynamic_tool_names = live.integrations;
         }
         return input;
@@ -277,6 +285,7 @@ pub const Context = struct {
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
             .credential = self.api_key,
+            .account_id = self.account_id,
             .tenant = self.gateway_team,
             .endpoint = self.gateway_chat_url,
             .cancel_flag = self.cancel_flag,
@@ -298,23 +307,31 @@ fn registeredToolSpec(ctx: Context, name: []const u8) ?*const tool_specs.ToolSpe
     return ctx.tool_registry.lookup(name);
 }
 
+fn providerDisablesTool(capabilities: provider_set.Bundle.Capabilities, name: []const u8) bool {
+    return std.mem.eql(u8, name, "vision") and
+        !capabilities.vision_fallback;
+}
+
 pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_contracts.ToolCallValidationResult {
+    if (providerDisablesTool(ctx.provider_capabilities, call.name)) {
+        return .{ .failure = try arena.dupe(u8, "Unsupported tool: vision") };
+    }
     const spec = registeredToolSpec(ctx, call.name) orelse {
         return switch (try tool_mcp_runtime.validateAdvertisedDynamicTool(.{
             .is_registered_tool = false,
             .advertised_dynamic_tool_names = ctx.advertised_dynamic_tool_names,
             .runtime = mcpRuntimeCapabilities(ctx),
         }, arena, call.name, call.arguments_json)) {
-            .valid => .valid,
+            .valid => |generation| .{ .valid = .{ .mcp_runtime_generation = generation } },
             .invalid => |reason| .{ .failure = reason },
             .not_available => .not_registered,
         };
     };
     switch (spec.executor_kind) {
         // Preserve execution-time argument failures for MCP control tool calls.
-        .mcp_search_tools, .mcp_select_tool, .mcp_features => return .valid,
+        .mcp_search_tools, .mcp_select_tool, .mcp_features => return .{ .valid = .{} },
         // File mutation arguments are decoded once by shared permission preflight.
-        .write_file, .edit_file => return .valid,
+        .write_file, .edit_file => return .{ .valid = .{} },
         else => {},
     }
 
@@ -322,12 +339,15 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
     dispatch_ctx.captured_command_host = spec.captured_command_host;
     return switch (try tool_dispatch.validateRegisteredToolCall(dispatch_ctx, ctx.tool_registry, call)) {
         .not_registered => .not_registered,
-        .valid => .valid,
+        .valid => .{ .valid = .{} },
         .failure => |reason| .{ .failure = reason },
     };
 }
 
 pub fn checkToolAvailability(ctx: Context, arena: Allocator, call: ToolCall) !?[]const u8 {
+    if (providerDisablesTool(ctx.provider_capabilities, call.name)) {
+        return try arena.dupe(u8, "Unsupported tool: vision");
+    }
     return tool_dispatch.localToolAvailabilityFailureForCall(
         typedDispatchContext(ctx, arena),
         ctx.tool_registry,
@@ -344,17 +364,21 @@ pub fn executeToolCallAuthorized(
         request.command_replay_capture.?.abort(request.result_allocator);
     };
     var execution_ctx = ctx;
+    if (request.permission_mode) |permission_mode| {
+        execution_ctx.permission_mode = permission_mode;
+    }
     if (request.live_authority) |authority| {
         if (!containsName(authority.tools, request.call.name) and
             !containsName(authority.integrations, request.call.name))
         {
-            return error.LiveToolAuthorityUnavailable;
+            return tool_contracts.failToolExecutionResult(
+                error.LiveToolAuthorityUnavailable,
+            );
         }
         execution_ctx.permission_mode = authority.permission_mode;
         execution_ctx.permission_grants = authority.grants;
         execution_ctx.session_grants = authority.grants;
         execution_ctx.permission_rules = authority.rules;
-        execution_ctx.sandbox_backend = authority.sandbox_backend;
         execution_ctx.advertised_dynamic_tool_names = authority.integrations;
         execution_ctx.mcp_access = rebindMcpAuthorityGeneration(
             execution_ctx.mcp_access,
@@ -366,6 +390,7 @@ pub fn executeToolCallAuthorized(
             request.advertised_dynamic_tool_names;
     }
     execution_ctx.max_tool_result_bytes = request.max_tool_result_bytes;
+    execution_ctx.expected_mcp_runtime_generation = request.expected_mcp_runtime_generation;
     execution_ctx.current_turn_messages = request.current_turn_messages;
     execution_ctx.output_chunk_lifecycle_id = request.lifecycle_id;
     execution_ctx.command_timeout_started_ms = request.command_timeout_started_ms;
@@ -409,7 +434,6 @@ pub fn executeToolCallAuthorized(
             request.classification_complete,
             request.authorized_image_catalog,
         )) catch |err| {
-        if (request.isSandboxWideningRetryCancellationError(err)) return err;
         diagnostics.recordToolCallResult(.{
             .name = request.call.name,
             .arguments_json = request.call.arguments_json,
@@ -419,23 +443,19 @@ pub fn executeToolCallAuthorized(
         });
         return if (err == error.CancelledBeforeExecution) error.Cancelled else err;
     };
-    if (!request.resultAwaitsSandboxWidening(result)) {
-        const ok = switch (result.status) {
-            .success => true,
-            else => false,
-        };
-        diagnostics.recordToolCallResult(.{
-            .name = request.call.name,
-            .arguments_json = request.call.arguments_json,
-            .model_output = result.model_output,
-            .ok = ok,
-            .started_at_ms = started_at_ms,
-        });
-    }
+    const ok = switch (result.status) {
+        .success => true,
+        else => false,
+    };
+    diagnostics.recordToolCallResult(.{
+        .name = request.call.name,
+        .arguments_json = request.call.arguments_json,
+        .model_output = result.model_output,
+        .ok = ok,
+        .started_at_ms = started_at_ms,
+    });
     if (request.command_replay_capture) |continued| {
-        replay_continuation_transferred = result.command_replay_capture == continued or
-            (result.sandbox_scope_required != null and
-                result.sandbox_scope_required.?.command_replay_capture == continued);
+        replay_continuation_transferred = result.command_replay_capture == continued;
     }
     return result;
 }
@@ -545,7 +565,9 @@ fn executeWorkspaceToolCallInner(
     }
 
     var command_backend = RunCommandBackendState{ .runtime = ctx };
+    var dispatch_metadata: DispatchMetadata = .{};
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
+    dispatch_metadata.attach(&dispatch_ctx);
     dispatch_ctx.execution_authority = authority;
     dispatch_ctx.captured_command_host = spec.captured_command_host;
     dispatch_ctx.run_command_backend = .{
@@ -556,15 +578,16 @@ fn executeWorkspaceToolCallInner(
         dispatch_ctx,
         ctx.tool_registry,
         call,
+        &dispatch_metadata.status_detail,
     );
     if (command_backend.execution_error) |err| {
         dispatched.deinit(arena);
         return err;
     }
     var execution = command_backend.completion orelse
-        toolExecutionResultFromDispatch(dispatched);
+        toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (dispatched.status_detail) |detail| execution.status_detail = detail;
+    if (dispatch_metadata.status_detail) |detail| execution.status_detail = detail;
     return execution;
 }
 
@@ -657,9 +680,12 @@ fn executeRegisteredTool(
     var mcp_progress_bridge = McpProgressBridge{ .ctx = ctx };
     var mcp_call_status: ?tool_mcp_runtime.CallStatus = null;
     var mcp_execution_error: ?anyerror = null;
+    var dispatch_metadata: DispatchMetadata = .{};
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
+    dispatch_metadata.attach(&dispatch_ctx);
     dispatch_ctx.execution_authority = authority;
     dispatch_ctx.mcp_call_options = .{
+        .expected_runtime_generation = ctx.expected_mcp_runtime_generation,
         .cancel_flag = dispatch_ctx.cancel_flag,
         .progress = .{
             .context = @ptrCast(&mcp_progress_bridge),
@@ -698,6 +724,7 @@ fn executeRegisteredTool(
         dispatch_ctx,
         registry,
         call,
+        &dispatch_metadata.status_detail,
     );
     if (command_backend.execution_error) |err| {
         dispatched.deinit(arena);
@@ -717,9 +744,9 @@ fn executeRegisteredTool(
     else if (vision_provider.completion) |completion|
         completion
     else
-        toolExecutionResultFromDispatch(dispatched);
+        toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (dispatched.status_detail) |detail| execution.status_detail = detail;
+    if (dispatch_metadata.status_detail) |detail| execution.status_detail = detail;
     if (mcp_call_status == .input_required or
         (execution.status == .failure and
             tool_mcp_feature_dispatch.isInputRequiredFailure(execution.model_output)))
@@ -772,24 +799,42 @@ fn executeRunCommandBackend(
     };
 }
 
-fn toolExecutionResultFromDispatch(result: tool_dispatch.DispatchResult) ToolExecutionResult {
+const DispatchMetadata = struct {
+    status_detail: ?[]u8 = null,
+    inner_usage: ?types.ToolUsage = null,
+    web_search_completion: ?types.WebSearchCompletion = null,
+    web_fetch_completion: ?types.WebFetchCompletion = null,
+    tool_result_memory: ?types.ToolResultMemory = null,
+
+    fn attach(self: *DispatchMetadata, ctx: *tool_dispatch.DispatchContext) void {
+        ctx.inner_usage_sink = &self.inner_usage;
+        ctx.web_search_completion_sink = &self.web_search_completion;
+        ctx.web_fetch_completion_sink = &self.web_fetch_completion;
+        ctx.tool_result_memory_sink = &self.tool_result_memory;
+    }
+};
+
+fn toolExecutionResultFromDispatch(
+    result: tool_dispatch.AuthorizedDispatchResult,
+    metadata: DispatchMetadata,
+) ToolExecutionResult {
     return switch (result.status) {
         .success => .{
             .model_output = result.body,
-            .status_detail = result.status_detail,
-            .inner_usage = result.inner_usage,
-            .web_search_completion = result.web_search_completion,
-            .web_fetch_completion = result.web_fetch_completion,
-            .tool_result_memory = result.tool_result_memory,
+            .status_detail = metadata.status_detail,
+            .inner_usage = metadata.inner_usage,
+            .web_search_completion = metadata.web_search_completion,
+            .web_fetch_completion = metadata.web_fetch_completion,
+            .tool_result_memory = metadata.tool_result_memory,
         },
         .failure => .{
             .status = .failure,
             .model_output = result.body,
-            .status_detail = result.status_detail,
-            .inner_usage = result.inner_usage,
-            .web_search_completion = result.web_search_completion,
-            .web_fetch_completion = result.web_fetch_completion,
-            .tool_result_memory = result.tool_result_memory,
+            .status_detail = metadata.status_detail,
+            .inner_usage = metadata.inner_usage,
+            .web_search_completion = metadata.web_search_completion,
+            .web_fetch_completion = metadata.web_fetch_completion,
+            .tool_result_memory = metadata.tool_result_memory,
         },
     };
 }
@@ -862,6 +907,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .max_tool_result_bytes = ctx.max_tool_result_bytes,
         .tool_result_dir = ctx.tool_result_dir,
         .session_child_capability = ctx.session_child_capability,
+        .ephemeral_command_replay = ctx.ephemeral_command_replay,
         .terminal_client = ctx.terminal_client,
         .terminal_owner_session_id = ctx.lifecycle_scope.session_id,
         .terminal_transport_role = switch (ctx.lifecycle_scope.kind) {
@@ -875,8 +921,6 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .output_chunk_ctx = ctx.output_chunk_ctx,
         .on_output_chunk = ctx.on_output_chunk,
         .command_timeout_ms = ctx.command_timeout_ms,
-        .sandbox_backend = ctx.sandbox_backend,
-        .devbox_provider = ctx.devbox_provider,
         .ask_question_ctx = if (ctx.interactive) ctx.worker else null,
         .ask_question_batch = if (ctx.interactive) requestQuestionBatchWithWorker else null,
         .web_fetch_runtime = ctx.web_fetch_runtime,
@@ -900,6 +944,24 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         else
             ctx.permission_rules,
     };
+}
+
+fn terminal_lease_cleanup_dispatch_context(
+    ctx: Context,
+    arena: Allocator,
+) tool_dispatch.DispatchContext {
+    var dispatch = typedDispatchContext(ctx, arena);
+    dispatch.cancel_flag = null;
+    return dispatch;
+}
+
+pub fn release_agent_terminal_lease(ctx: Context, session_id: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.session_allocator);
+    defer arena_state.deinit();
+    return terminal_impl.release_agent_write_lease(
+        terminal_lease_cleanup_dispatch_context(ctx, arena_state.allocator()),
+        session_id,
+    );
 }
 
 fn requestQuestionBatchWithWorker(
@@ -995,10 +1057,10 @@ fn executeVisionRequest(
     const config: vision_executor.Config = .{
         .stream_provider = state.runtime.agent_stream_provider,
         .api_key = state.runtime.api_key,
+        .credential_source = state.runtime.credential_source,
         .gateway_team = state.runtime.gateway_team,
         .session_id = state.runtime.lifecycle_scope.session_id,
         .retry_count = state.runtime.gateway_retry_count,
-        .chat_url = state.runtime.gateway_chat_url,
         .cancel_flag = state.runtime.cancel_flag,
         .usage = &state.runtime.session.usage,
         .usage_allocator = state.runtime.session_allocator,
@@ -1083,14 +1145,58 @@ fn visionPathFailure(alloc: Allocator, err: anyerror) Allocator.Error!ToolExecut
     };
 }
 
+fn visionPathImagePreparationFailure(alloc: Allocator) Allocator.Error!ToolExecutionResult {
+    const details = [_]tool_result_errors.Detail{
+        .{ .name = "error", .value = .{ .string = "ImagePreparationFailed" } },
+    };
+    return .{
+        .status = .failure,
+        .status_detail = "ImagePreparationFailed",
+        .model_output = try tool_result_errors.toolExecutionFailureJson(alloc, .{
+            .tool_name = "vision",
+            .message = "Vision could not prepare an approved image path.",
+            .details = &details,
+            .suggestion = image_attachments.image_preparation_failed_notice,
+        }),
+    };
+}
+
 fn visionPathPreparationFailure(
     alloc: Allocator,
     err: anyerror,
 ) !ToolExecutionResult {
     return switch (err) {
-        error.OutOfMemory, error.Cancelled => err,
+        error.OutOfMemory, error.Cancelled, error.TimedOut => err,
+        error.ImagePreparationFailed => visionPathImagePreparationFailure(alloc),
         else => visionPathFailure(alloc, err),
     };
+}
+
+test "Vision path preparation reports semantic failure and preserves operational errors" {
+    const alloc = std.testing.allocator;
+    const failed = try visionPathPreparationFailure(alloc, error.ImagePreparationFailed);
+    defer alloc.free(@constCast(failed.model_output));
+    try std.testing.expectEqualStrings("ImagePreparationFailed", failed.status_detail.?);
+    try expectContains(failed.model_output, "Vision could not prepare an approved image path.");
+    try expectContains(failed.model_output, image_attachments.image_preparation_failed_notice);
+
+    const too_large = try visionPathPreparationFailure(alloc, error.ImageTooLarge);
+    defer alloc.free(@constCast(too_large.model_output));
+    try std.testing.expectEqualStrings("ImageTooLarge", too_large.status_detail.?);
+    try expectContains(too_large.model_output, "under 20 MiB");
+
+    try std.testing.expectError(
+        error.Cancelled,
+        visionPathPreparationFailure(alloc, error.Cancelled),
+    );
+    try std.testing.expectError(
+        error.TimedOut,
+        visionPathPreparationFailure(alloc, error.TimedOut),
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        visionPathPreparationFailure(alloc, error.OutOfMemory),
+    );
 }
 
 fn semanticFailure(output: []const u8) ToolExecutionResult {
@@ -1114,6 +1220,56 @@ pub fn withAdvertisedDynamicToolNames(ctx: Context, advertised_dynamic_tool_name
     return copy;
 }
 
+const EffectiveCommandTimeout = struct {
+    timeout_ms: usize,
+    started_ms: i64,
+};
+
+fn effectiveCommandTimeout(
+    request_timeout_ms: u64,
+    ambient_timeout_ms: ?usize,
+    ambient_started_ms: ?i64,
+    now_ms: i64,
+) !EffectiveCommandTimeout {
+    const requested = std.math.cast(usize, request_timeout_ms) orelse
+        return error.InvalidToolArguments;
+    const ambient = ambient_timeout_ms orelse return .{
+        .timeout_ms = requested,
+        .started_ms = now_ms,
+    };
+    const ambient_started = ambient_started_ms orelse now_ms;
+    const elapsed: usize = if (now_ms <= ambient_started)
+        0
+    else
+        std.math.cast(usize, now_ms - ambient_started) orelse std.math.maxInt(usize);
+    return .{
+        .timeout_ms = @min(requested, ambient -| elapsed),
+        .started_ms = now_ms,
+    };
+}
+
+fn commandReplayPolicy(
+    environment: command_environment.Environment,
+    has_replay_capability: bool,
+    interactive: bool,
+    continued: ?command_replay_store.CapturePolicy,
+) ?command_replay_store.CapturePolicy {
+    if (continued) |policy| return policy;
+    return switch (environment) {
+        .workspace_clean => null,
+        .legacy => if (has_replay_capability or interactive)
+            .best_effort
+        else
+            null,
+        .clean, .user => if (has_replay_capability)
+            .required
+        else if (interactive)
+            .best_effort
+        else
+            null,
+    };
+}
+
 fn toolRunCommand(
     ctx: Context,
     arena: Allocator,
@@ -1122,22 +1278,26 @@ fn toolRunCommand(
 ) !ToolExecutionResult {
     const command = request.command;
     const cwd = request.resolved_cwd;
-    const resolved_backend = sandbox.resolveBackend(ctx.sandbox_backend);
-    const authority_scope = commandAuthorityFingerprint(authority).scope;
-    const needs_preflight_widening = authority_scope == .restricted and
-        resolved_backend == .macos and
-        sandbox.needsBroaderFileAccess(command);
     const command_ctx = command_admission.CommandContext{
         .command = command,
         .resolved_cwd = cwd,
         .background = false,
-        .resolved_backend = resolved_backend,
         .target_os = builtin.os.tag,
         .environment = request.environment,
-        .scope = authority_scope,
     };
-    const timeout_started_ms = ctx.command_timeout_started_ms orelse
-        if (ctx.command_timeout_ms != null) io_mod.milliTimestamp() else null;
+    const timeout = try effectiveCommandTimeout(
+        request.timeout_ms,
+        ctx.command_timeout_ms,
+        ctx.command_timeout_started_ms,
+        io_mod.milliTimestamp(),
+    );
+    const replay_policy = commandReplayPolicy(
+        request.environment,
+        ctx.session_child_capability != null or
+            ctx.ephemeral_command_replay != null,
+        ctx.interactive,
+        if (ctx.command_replay_capture) |capture| capture.policy() else null,
+    );
 
     if (comptime builtin.os.tag == .wasi or builtin.is_test) {
         if (ctx.workspace_executor) |executor| {
@@ -1147,16 +1307,13 @@ fn toolRunCommand(
                 command_ctx,
                 authority,
                 executor,
-                ctx.command_timeout_ms,
+                timeout.timeout_ms,
             );
         }
     }
     if (comptime builtin.os.tag == .wasi) return error.WorkspaceUnavailable;
 
     try execution_router.validateConfigContext(.{
-        .backend = ctx.sandbox_backend,
-        .workspace_root = ctx.workspace_root,
-        .access_scope = ctx.access_scope,
         .max_command_output_bytes = ctx.max_command_output_bytes,
     }, command_ctx);
     var route = try execution_router.prepareAuthorizedRoute(arena, command_ctx, authority);
@@ -1169,12 +1326,13 @@ fn toolRunCommand(
     );
     if (compatibility_result) |compatibility| {
         if (route != .approved_shell) return error.CommandAdmissionChanged;
-        const intercepted_replay = initCommandReplayCapture(
+        const intercepted_replay = try initCommandReplayCapture(
             arena,
-            ctx.interactive,
+            replay_policy,
             ctx.max_command_output_bytes,
             ctx.max_command_output_bytes,
             ctx.session_child_capability,
+            ctx.ephemeral_command_replay,
             ctx.command_replay_capture,
             ctx.command_replay_unavailable,
         );
@@ -1191,12 +1349,24 @@ fn toolRunCommand(
             .success => |body| body,
             .failure => |body| body,
         };
-        if (compatibility == .success and ctx.interactive and output.len > 0) {
-            try callback.accept(
+        if (compatibility == .success and capture != null and output.len > 0) {
+            callback.accept(
                 ctx.output_chunk_lifecycle_id,
                 .stdout,
                 output,
-            );
+            ) catch |err| {
+                if (err != error.CommandOutputCaptureFailed) return err;
+                return finishCommandToolResult(
+                    arena,
+                    capture,
+                    false,
+                    &transferred,
+                    null,
+                    try command_result_mapping.Foreground.outputCaptureFailure(arena),
+                );
+            };
+        }
+        if (compatibility == .success and ctx.interactive and output.len > 0) {
             try ctx.on_output_chunk(
                 ctx.output_chunk_ctx,
                 ctx.output_chunk_lifecycle_id,
@@ -1205,6 +1375,7 @@ fn toolRunCommand(
             );
         }
         return finishCommandToolResult(
+            arena,
             capture,
             intercepted_replay.unavailable and
                 (ctx.command_replay_unavailable or callback.had_accepted_output),
@@ -1220,24 +1391,16 @@ fn toolRunCommand(
         );
     }
 
-    if (route == .approved_shell and needs_preflight_widening) {
-        return sandboxScopeRequiredPreflight(
-            arena,
-            authority,
-            timeout_started_ms,
-        );
-    }
-    const use_permissive = authority_scope == .broader;
-
-    const replay_init = initCommandReplayCapture(
+    const replay_init = try initCommandReplayCapture(
         arena,
-        ctx.interactive,
+        replay_policy,
         ctx.max_command_output_bytes,
         execution_router.foregroundResultComparisonLimit(
             route,
             ctx.max_command_output_bytes,
         ),
         ctx.session_child_capability,
+        ctx.ephemeral_command_replay,
         ctx.command_replay_capture,
         ctx.command_replay_unavailable,
     );
@@ -1252,68 +1415,78 @@ fn toolRunCommand(
     };
 
     const routed = execution_router.executePreparedRoute(.{
-        .backend = ctx.sandbox_backend,
-        .workspace_root = ctx.workspace_root,
-        .access_scope = ctx.access_scope,
         .max_command_output_bytes = ctx.max_command_output_bytes,
         .cancel_flag = runtimeCancelFlag(ctx),
         .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,
         .output_chunk_ctx = ctx.output_chunk_ctx,
         .on_output_chunk = ctx.on_output_chunk,
-        .accepted_output_chunk_ctx = if (ctx.interactive) @ptrCast(&replay_callback) else null,
-        .on_accepted_output_chunk = if (ctx.interactive) CommandReplayCaptureCallback.onChunk else null,
+        .accepted_output_chunk_ctx = if (replay_capture != null) @ptrCast(&replay_callback) else null,
+        .on_accepted_output_chunk = if (replay_capture != null) CommandReplayCaptureCallback.onChunk else null,
         .callback_projection = if (ctx.interactive) .raw else .model_safe,
-        .permissive = use_permissive,
-        .timeout_ms = ctx.command_timeout_ms,
-        .timeout_started_ms = timeout_started_ms,
-        .devbox_provider = ctx.devbox_provider,
+        .timeout_ms = timeout.timeout_ms,
+        .timeout_started_ms = timeout.started_ms,
         .command_artifact_capability = ctx.session_child_capability,
         .command_artifact_dir = ctx.command_artifact_dir,
     }, arena, route) catch |err| {
-        if (err == error.TimeoutExpired) return finishCommandToolResult(
+        if (err == error.TimeoutExpired) {
+            return finishCommandToolResult(
+                arena,
+                replay_capture,
+                replay_init.unavailable and
+                    (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
+                &replay_transferred,
+                null,
+                try command_result_mapping.Foreground.timeoutFailure(
+                    arena,
+                    command,
+                    cwd,
+                    timeout.timeout_ms,
+                    timeout.started_ms,
+                ),
+            );
+        }
+        if (err == error.CommandOutputCaptureFailed) return finishCommandToolResult(
+            arena,
             replay_capture,
-            replay_init.unavailable and
-                (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
+            false,
             &replay_transferred,
             null,
-            try command_result_mapping.Foreground.timeoutFailure(
-                arena,
-                command,
-                cwd,
-                ctx.command_timeout_ms,
-                timeout_started_ms,
-            ),
+            try command_result_mapping.Foreground.outputCaptureFailure(arena),
         );
+        if (err == error.Cancelled and runtimeCancelFlag(ctx).load(.seq_cst)) {
+            return finishCommandToolResult(
+                arena,
+                replay_capture,
+                replay_init.unavailable and
+                    (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
+                &replay_transferred,
+                null,
+                .{
+                    .status = .failure,
+                    .cancelled = true,
+                    .model_output = "command cancelled\n",
+                },
+            );
+        }
         return err;
     };
     const result = routed.result;
 
     if (try command_result_mapping.Foreground.cancelledFailure(arena, result)) |cancelled| {
-        return cancelled;
-    }
-
-    if (routed.route == .approved_shell and
-        authority_scope == .restricted and
-        resolved_backend == .macos and
-        sandbox.looksLikeSandboxError(result.output))
-    {
         return finishCommandToolResult(
+            arena,
             replay_capture,
             replay_init.unavailable and
                 (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
             &replay_transferred,
             result,
-            try sandboxScopeRequiredReactive(
-                arena,
-                authority,
-                timeout_started_ms,
-                result,
-            ),
+            cancelled,
         );
     }
 
     if (try command_result_mapping.Foreground.nonZeroFailure(arena, result)) |failure| {
         return finishCommandToolResult(
+            arena,
             replay_capture,
             replay_init.unavailable and
                 (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
@@ -1324,6 +1497,7 @@ fn toolRunCommand(
     }
 
     return finishCommandToolResult(
+        arena,
         replay_capture,
         replay_init.unavailable and
             (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
@@ -1377,6 +1551,7 @@ fn executeWorkspaceRunCommand(
     var replay_transferred = false;
     if (try command_result_mapping.Foreground.cancelledFailure(arena, result)) |cancelled| {
         return finishCommandToolResult(
+            arena,
             null,
             false,
             &replay_transferred,
@@ -1386,6 +1561,7 @@ fn executeWorkspaceRunCommand(
     }
     if (try command_result_mapping.Foreground.nonZeroFailure(arena, result)) |failure| {
         return finishCommandToolResult(
+            arena,
             null,
             false,
             &replay_transferred,
@@ -1394,6 +1570,7 @@ fn executeWorkspaceRunCommand(
         );
     }
     return finishCommandToolResult(
+        arena,
         null,
         false,
         &replay_transferred,
@@ -1406,71 +1583,6 @@ fn executeWorkspaceRunCommand(
                 null,
         },
     );
-}
-
-fn commandAuthorityFingerprint(
-    authority: command_admission.CommandExecutionAuthority,
-) command_admission.AdmissionFingerprint {
-    return switch (authority) {
-        .direct_only => |fingerprint| fingerprint,
-        .shell_allowed => |allowed| allowed.fingerprint,
-    };
-}
-
-fn dupedAdmittedFingerprint(
-    arena: Allocator,
-    authority: command_admission.CommandExecutionAuthority,
-) !command_admission.AdmissionFingerprint {
-    var admitted = commandAuthorityFingerprint(authority);
-    admitted.command = try arena.dupe(u8, admitted.command);
-    admitted.resolved_cwd = try arena.dupe(u8, admitted.resolved_cwd);
-    admitted.environment = switch (admitted.environment) {
-        .legacy => .legacy,
-        .workspace_clean => .workspace_clean,
-        .clean => |path| .{ .clean = try arena.dupe(u8, path) },
-        .user => |path| .{ .user = try arena.dupe(u8, path) },
-    };
-    return admitted;
-}
-
-fn sandboxScopeRequiredPreflight(
-    arena: Allocator,
-    authority: command_admission.CommandExecutionAuthority,
-    timeout_started_ms: ?i64,
-) !ToolExecutionResult {
-    return .{
-        .status = .failure,
-        .model_output = "",
-        .sandbox_scope_required = .{
-            .phase = .preflight,
-            .restricted_fingerprint = try dupedAdmittedFingerprint(arena, authority),
-            .command_timeout_started_ms = timeout_started_ms,
-        },
-    };
-}
-
-fn sandboxScopeRequiredReactive(
-    arena: Allocator,
-    authority: command_admission.CommandExecutionAuthority,
-    timeout_started_ms: ?i64,
-    result: command_contract.RunCommandResult,
-) !ToolExecutionResult {
-    const command_result_json = if (result.command_result) |command_result|
-        try command_result.toJson(arena)
-    else
-        null;
-    return .{
-        .status = .failure,
-        .model_output = result.output,
-        .command_result_json = command_result_json,
-        .sandbox_scope_required = .{
-            .phase = .reactive,
-            .restricted_fingerprint = try dupedAdmittedFingerprint(arena, authority),
-            .command_timeout_started_ms = timeout_started_ms,
-            .restricted_model_output = result.output,
-            .restricted_command_result_json = command_result_json,
-        },
-    };
 }
 
 const CommandReplayCaptureCallback = struct {
@@ -1498,7 +1610,14 @@ const CommandReplayCaptureCallback = struct {
         if (chunk.len == 0) return;
         self.had_accepted_output = true;
         if (self.capture) |capture| {
-            capture.appendAccepted(self.alloc, stream, chunk);
+            switch (capture.policy()) {
+                .required => try capture.appendAcceptedRequired(
+                    self.alloc,
+                    stream,
+                    chunk,
+                ),
+                .best_effort => capture.appendAccepted(self.alloc, stream, chunk),
+            }
         }
     }
 };
@@ -1510,24 +1629,31 @@ const CommandReplayCaptureInit = struct {
 
 fn initCommandReplayCapture(
     arena: Allocator,
-    interactive: bool,
+    replay_policy: ?command_replay_store.CapturePolicy,
     inline_limit: usize,
     comparison_limit: usize,
     capability: ?*session_child_store.SessionChildCapability,
+    ephemeral_store: ?*command_replay_store.EphemeralStore,
     continued_capture: ?*command_replay_store.Capture,
     continued_unavailable: bool,
-) CommandReplayCaptureInit {
-    if (!interactive) return .{};
-    if (continued_unavailable) return .{ .unavailable = true };
+) !CommandReplayCaptureInit {
+    const policy = replay_policy orelse return .{};
+    if (continued_unavailable) {
+        if (policy == .required) return error.CommandOutputCaptureFailed;
+        return .{ .unavailable = true };
+    }
     if (continued_capture) |capture| {
         capture.setComparisonLimit(comparison_limit);
         return .{ .capture = capture };
     }
-    const capture = command_replay_store.Capture.create(
-        arena,
-        inline_limit,
-        capability,
-    ) catch |err| {
+    const capture_inline_limit = if (policy == .required) 0 else inline_limit;
+    const capture = (if (capability) |saved|
+        command_replay_store.Capture.create(arena, capture_inline_limit, saved)
+    else if (ephemeral_store) |ephemeral|
+        command_replay_store.Capture.createEphemeral(arena, capture_inline_limit, ephemeral)
+    else
+        command_replay_store.Capture.create(arena, capture_inline_limit, null)) catch |err| {
+        if (policy == .required) return err;
         debug_trace.logf(
             "session",
             "command replay capture initialization unavailable err={s}",
@@ -1535,11 +1661,13 @@ fn initCommandReplayCapture(
         );
         return .{ .unavailable = true };
     };
+    capture.setPolicyBeforeCapture(policy);
     capture.setComparisonLimit(comparison_limit);
     return .{ .capture = capture };
 }
 
 fn finishCommandToolResult(
+    arena: Allocator,
     capture: ?*command_replay_store.Capture,
     replay_unavailable: bool,
     replay_transferred: *bool,
@@ -1547,6 +1675,12 @@ fn finishCommandToolResult(
     result: ToolExecutionResult,
 ) !ToolExecutionResult {
     var owned = result;
+    if (capture) |candidate| switch (candidate.policy()) {
+        .required => candidate.sealRequired(arena) catch {
+            owned = try command_result_mapping.Foreground.outputCaptureFailure(arena);
+        },
+        .best_effort => {},
+    };
     if (process_result) |command_result| {
         if (commandProcessPresentation(command_result)) |presentation| {
             var memory = owned.tool_result_memory orelse types.ToolResultMemory{};
@@ -1554,17 +1688,12 @@ fn finishCommandToolResult(
             owned.tool_result_memory = memory;
         }
     }
-    if (owned.sandbox_scope_required) |*required| {
-        required.command_replay_capture = capture;
-        required.command_replay_unavailable = replay_unavailable;
-    } else {
-        if (replay_unavailable) {
-            var memory = owned.tool_result_memory orelse types.ToolResultMemory{};
-            memory.command_output_replay = .unavailable;
-            owned.tool_result_memory = memory;
-        }
-        owned.command_replay_capture = capture;
+    if (replay_unavailable) {
+        var memory = owned.tool_result_memory orelse types.ToolResultMemory{};
+        memory.command_output_replay = .unavailable;
+        owned.tool_result_memory = memory;
     }
+    owned.command_replay_capture = capture;
     if (capture != null) replay_transferred.* = true;
     return owned;
 }
@@ -1577,6 +1706,7 @@ fn commandProcessPresentation(
         .foreground => |value| value,
         .background => return null,
     };
+    if (foreground.timed_out) return .timed_out;
     if (foreground.signal) |signal| return .{ .signal = signal };
     if (foreground.exit_code) |exit_code| {
         if (exit_code != 0) return .{ .exit_code = exit_code };
@@ -1733,6 +1863,7 @@ fn executeSubagentProvider(
         .root_user_messages = ctx.root_user_messages,
         .root_user_evidence_complete = ctx.root_user_evidence_complete,
         .defaults = .{
+            .provider = ctx.provider,
             .model = ctx.model,
             .effort = ctx.effort,
             .fast_mode = ctx.fast_mode,
@@ -1988,20 +2119,12 @@ fn noopOutput(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.Comm
 fn noopBackgroundReady(_: *anyopaque, _: u64, _: []const u8) void {}
 
 const test_tool_registry = tool_dispatch.Registry{ .tools = &.{
-    test_builtin_tools.list_files,
     test_builtin_tools.glob_files,
     test_builtin_tools.grep_files,
     test_builtin_tools.read_file,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
-    test_builtin_tools.delete_file,
-    test_builtin_tools.rename_file,
-    test_builtin_tools.copy_file,
-    test_builtin_tools.create_folder,
-    test_builtin_tools.file_info,
     test_builtin_tools.memory,
-    test_builtin_tools.semantic_search,
-    test_builtin_tools.open_file,
     test_builtin_tools.web_fetch,
     test_builtin_tools.web_search,
     test_builtin_tools.terminal,
@@ -2081,7 +2204,7 @@ const test_context_registry = context_contract.Registry{ .default_provider = .{
 } };
 
 const test_review_calls = [_]ToolCall{
-    .{ .id = "test-review", .name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"printf test\"}" },
+    .{ .id = "test-review", .name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"printf test\",\"timeout_ms\":600000}" },
 };
 const test_review_root_messages = [_][]const u8{"test root request"};
 
@@ -2108,7 +2231,6 @@ const TestRuntime = struct {
     workspace_root: []const u8 = "/tmp",
     ignored_list_entries: []const []const u8 = &.{},
     skills_dir: []const u8 = "",
-    sandbox_backend: sandbox.BackendKind = .none,
     tracker: ?*change_tracker.ChangeTracker = null,
     permission_rules: types.PermissionRuleSet = .{},
     permission_grants: []const PermissionGrant = &.{},
@@ -2118,12 +2240,18 @@ const TestRuntime = struct {
     max_command_output_bytes: usize = 64 * 1024,
     max_tool_result_bytes: usize = 64 * 1024,
     api_key: []const u8 = "",
+    provider: model_provider.ProviderId = .gateway,
+    provider_capabilities: provider_set.Bundle.Capabilities = .{
+        .fx_search = true,
+        .vision_fallback = true,
+    },
     gateway_team: ?[]const u8 = null,
     gateway_retry_count: usize = 0,
     gateway_chat_url: []const u8 = "",
     context_limits: context_limits.Values = .{},
     command_artifact_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
+    ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
     command_timeout_ms: ?usize = null,
     interactive: bool = true,
     mcp_ctx: ?*anyopaque = null,
@@ -2167,6 +2295,8 @@ const TestRuntime = struct {
             .api_key = self.api_key,
             .agent_stream_provider = self.agent_stream_provider,
             .gateway_team = self.gateway_team,
+            .provider = self.provider,
+            .provider_capabilities = self.provider_capabilities,
             .model = self.model,
             .gateway_retry_count = self.gateway_retry_count,
             .gateway_chat_url = self.gateway_chat_url,
@@ -2196,8 +2326,8 @@ const TestRuntime = struct {
             .on_background_url_ready = noopBackgroundReady,
             .command_artifact_dir = self.command_artifact_dir,
             .session_child_capability = self.session_child_capability,
+            .ephemeral_command_replay = self.ephemeral_command_replay,
             .command_timeout_ms = self.command_timeout_ms,
-            .sandbox_backend = self.sandbox_backend,
             .tracker = self.tracker,
             .mcp_ctx = self.mcp_ctx,
             .mcp_has_tool = self.mcp_has_tool,
@@ -2321,7 +2451,6 @@ const SubagentTestAuthority = struct {
                 },
                 .mode = .full,
             },
-            .none,
             &.{},
             .{},
             &.{},
@@ -3228,37 +3357,12 @@ const TestCommandOutputCapture = struct {
     }
 };
 
-const TestDevboxProvider = struct {
-    calls: usize = 0,
-};
-
-fn executeTestDevboxProvider(
-    raw_ctx: ?*anyopaque,
-    alloc: Allocator,
-    _: []const u8,
-    _: []const u8,
-    control: devbox_executor.Control,
-) devbox_executor.ProviderError!devbox_executor.VercelOutcome {
-    try control.check();
-    const state: *TestDevboxProvider = @ptrCast(@alignCast(raw_ctx.?));
-    state.calls += 1;
-    const stdout = try alloc.dupe(u8, "DEVBOX_COMPACT_ONE\nDEVBOX_COMPACT_TWO\n");
-    errdefer alloc.free(stdout);
-    const stderr = try alloc.dupe(u8, "");
-    return .{ .success = .{
-        .exit_code = 0,
-        .stdout = stdout,
-        .stderr = stderr,
-        .duration_ms = 9,
-    } };
-}
-
 fn runCommandArgsForTest(alloc: Allocator, command: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"action\":\"exec\",\"command\":");
     try std.json.Stringify.value(command, .{}, &out.writer);
-    try out.writer.writeByte('}');
+    try out.writer.writeAll(",\"timeout_ms\":600000}");
     return out.toOwnedSlice();
 }
 
@@ -3267,7 +3371,7 @@ fn runCommandArgsWithCleanProfileForTest(alloc: Allocator, command: []const u8) 
     defer out.deinit();
     try out.writer.writeAll("{\"action\":\"exec\",\"command\":");
     try std.json.Stringify.value(command, .{}, &out.writer);
-    try out.writer.writeAll(",\"profile\":\"clean\"}");
+    try out.writer.writeAll(",\"profile\":\"clean\",\"timeout_ms\":600000}");
     return out.toOwnedSlice();
 }
 
@@ -3303,6 +3407,7 @@ fn terminalExecCallForTest(arena: Allocator, call: ToolCall) !ToolCall {
     );
     if (args != .object) return error.InvalidToolArguments;
     try args.object.put(arena, "action", .{ .string = "exec" });
+    try args.object.put(arena, "timeout_ms", .{ .integer = 600_000 });
     var out: std.Io.Writer.Allocating = .init(arena);
     defer out.deinit();
     try std.json.Stringify.value(args, .{}, &out.writer);
@@ -3322,7 +3427,7 @@ test "registered terminal exec preserves invalid execution authority error" {
     const call = ToolCall{
         .id = "invalid-authority",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf should-not-run\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf should-not-run\",\"timeout_ms\":600000}",
     };
 
     try std.testing.expectError(
@@ -3351,6 +3456,7 @@ test "captured command compatibility bypasses compound commands" {
         .command = "fx-compatibility-probe; printf shell-fallback",
         .resolved_cwd = "/tmp",
         .environment = .legacy,
+        .timeout_ms = 600_000,
     })) == null);
 
     for ([_]command_environment.Environment{
@@ -3364,6 +3470,7 @@ test "captured command compatibility bypasses compound commands" {
                 .command = "fx-compatibility-probe",
                 .resolved_cwd = "/tmp",
                 .environment = environment,
+                .timeout_ms = 600_000,
             },
         )) == null);
     }
@@ -3385,6 +3492,7 @@ test "run command compatibility returns installer failure without shell fallback
             .command = "fx-compatibility-probe",
             .resolved_cwd = "/tmp",
             .environment = .legacy,
+            .timeout_ms = 600_000,
         },
     )) orelse return error.TestExpectedEqual;
 
@@ -3407,9 +3515,8 @@ fn unexpectedTestPrompt(
 
 const TestAutoReview = struct {
     calls: usize = 0,
-    decision: permission_auto_classifier.Decision = .allow,
+    decision: permission_auto_classifier.Decision = .clear,
     risk: permission_auto_classifier.Risk = .low,
-    authorization: permission_auto_classifier.Authorization = .medium,
     rationale: []const u8 = "test automatic review",
     action_tag: ?std.meta.Tag(permission_auto_classifier.Action) = null,
     exact_command: ?[]const u8 = null,
@@ -3418,7 +3525,6 @@ const TestAutoReview = struct {
     file_additions: usize = 0,
     file_deletions: usize = 0,
     file_review_rows: usize = 0,
-    escalation_reason: ?[]const u8 = null,
     target_path: ?[]const u8 = null,
 
     fn review(
@@ -3427,11 +3533,7 @@ const TestAutoReview = struct {
         request: permission_auto_classifier.ReviewRequest,
     ) anyerror!permission_auto_classifier.ParseOutcome {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-        if (request.workspace_root.len == 0 or request.escalation_reason.len == 0) {
-            return error.TestExpectedReviewContext;
-        }
         self.calls += 1;
-        self.escalation_reason = request.escalation_reason;
         self.target_path = if (request.targets.len > 0)
             request.targets[0].path
         else
@@ -3448,11 +3550,9 @@ const TestAutoReview = struct {
             .tool => |tool| {
                 self.exact_arguments_json = tool.arguments_json;
             },
-            .sandbox_widening => {},
         }
         return .{ .valid = .{
             .risk = self.risk,
-            .authorization = self.authorization,
             .decision = self.decision,
             .rationale = try alloc.dupe(u8, self.rationale),
         } };
@@ -3693,17 +3793,29 @@ test "tool runtime explicit cancellation source overrides worker fallback" {
     try std.testing.expect(typedDispatchContext(rt.context(), arena_state.allocator()).cancel_flag.? == &cancel_flag);
 }
 
+test "agent terminal lease cleanup ignores preexisting turn cancellation" {
+    var cancel_flag = std.atomic.Value(bool).init(true);
+    var rt = TestRuntime{ .cancel_flag = &cancel_flag };
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const cleanup = terminal_lease_cleanup_dispatch_context(
+        rt.context(),
+        arena_state.allocator(),
+    );
+    try std.testing.expect(cleanup.cancel_flag == null);
+}
+
 test "read-only local runtime tools are registered in built-in registry" {
     const cases = [_]struct {
         name: []const u8,
         kind: tool_specs.ExecutorKind,
     }{
-        .{ .name = "list_files", .kind = .list_files },
         .{ .name = "glob_files", .kind = .glob_files },
         .{ .name = "grep_files", .kind = .grep_files },
         .{ .name = "read_file", .kind = .read_file },
         .{ .name = "read_tool_result", .kind = .read_tool_result },
-        .{ .name = "file_info", .kind = .file_info },
     };
 
     var rt = TestRuntime{};
@@ -3727,9 +3839,9 @@ test "tool runtime validates and executes only tools from supplied registry" {
     const arena = arena_state.allocator();
 
     const call = ToolCall{
-        .id = "list",
-        .name = "list_files",
-        .arguments_json = "{}",
+        .id = "read",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"README.md\"}",
     };
     try std.testing.expectEqual(
         tool_contracts.ToolCallValidationResult.not_registered,
@@ -3738,15 +3850,12 @@ test "tool runtime validates and executes only tools from supplied registry" {
 
     const missing = try executeToolCall(empty_rt.context(), arena, call);
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, missing.status);
-    try std.testing.expectEqualStrings("Unsupported tool: list_files", missing.model_output);
+    try std.testing.expectEqualStrings("Unsupported tool: read_file", missing.model_output);
 
-    const list_only_registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.list_files} };
-    var list_rt = TestRuntime{ .tool_registry = list_only_registry };
-    defer list_rt.deinit(alloc);
-    try std.testing.expectEqual(
-        tool_contracts.ToolCallValidationResult.valid,
-        try validateToolCall(list_rt.context(), arena, call),
-    );
+    const read_only_registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.read_file} };
+    var read_rt = TestRuntime{ .tool_registry = read_only_registry };
+    defer read_rt.deinit(alloc);
+    try std.testing.expect((try validateToolCall(read_rt.context(), arena, call)) == .valid);
 }
 
 fn registryOwnedWebFetchCall(
@@ -3773,23 +3882,6 @@ fn registryOwnedTerminalExecCall(
     return .{ .success = try ctx.allocator.dupe(u8, "registry-owned terminal exec") };
 }
 
-fn registryOwnedFileInfoCall(
-    ctx: tool_dispatch.DispatchContext,
-    input: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    _ = input;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned file_info") };
-}
-
-fn registryOwnedCreateFolderCall(
-    ctx: tool_dispatch.DispatchContext,
-    input: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    _ = input;
-    if (ctx.subagent_provider != null) return error.InvalidToolArguments;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned create_folder") };
-}
-
 fn registryOwnedAskQuestionCall(
     ctx: tool_dispatch.DispatchContext,
     input: tool_dispatch.ToolInput,
@@ -3799,41 +3891,6 @@ fn registryOwnedAskQuestionCall(
         return error.InvalidToolArguments;
     }
     return .{ .success = try ctx.allocator.dupe(u8, "registry-owned ask_user_question") };
-}
-
-fn registryOwnedSemanticSearchCall(
-    ctx: tool_dispatch.DispatchContext,
-    input: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    _ = input;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned semantic_search") };
-}
-
-const RegistryOwnedLauncherInput = struct {};
-
-fn decodeRegistryOwnedLauncher(
-    ctx: tool_dispatch.DispatchContext,
-    _: []const u8,
-) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    const input = try ctx.allocator.create(RegistryOwnedLauncherInput);
-    input.* = .{};
-    return .{ .input = .{
-        .ptr = input,
-        .deinit_fn = deinitRegistryOwnedLauncherInput,
-    } };
-}
-
-fn deinitRegistryOwnedLauncherInput(ptr: *anyopaque, alloc: Allocator) void {
-    const input: *RegistryOwnedLauncherInput = @ptrCast(@alignCast(ptr));
-    alloc.destroy(input);
-}
-
-fn registryOwnedLauncherCall(
-    ctx: tool_dispatch.DispatchContext,
-    input: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    _ = input;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned launcher") };
 }
 
 fn registryOwnedMemoryCall(
@@ -3983,209 +4040,6 @@ test "ask_user_question execution uses supplied registry entry and interactive h
     }));
 }
 
-test "file_info execution uses supplied registry entry" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var registered_file_info = test_builtin_tools.file_info;
-    registered_file_info.call = registryOwnedFileInfoCall;
-    const tools = [_]tool_dispatch.Tool{registered_file_info};
-    const registry = tool_dispatch.Registry{ .tools = tools[0..] };
-    const call = ToolCall{
-        .id = "info",
-        .name = "file_info",
-        .arguments_json = "{\"path\":\".\"}",
-    };
-
-    var rt = TestRuntime{ .tool_registry = registry };
-    defer rt.deinit(alloc);
-    const direct = try executeToolCall(rt.context(), arena, call);
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, direct.status);
-    try std.testing.expectEqualStrings("registry-owned file_info", direct.model_output);
-}
-
-test "create_folder supplied registry entry has no subagent capability" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var registered_create_folder = test_builtin_tools.create_folder;
-    registered_create_folder.call = registryOwnedCreateFolderCall;
-    const tools = [_]tool_dispatch.Tool{registered_create_folder};
-    const registry = tool_dispatch.Registry{ .tools = tools[0..] };
-    const call = ToolCall{
-        .id = "create-folder-registry",
-        .name = "create_folder",
-        .arguments_json = "{\"path\":\"created\"}",
-    };
-
-    var rt = TestRuntime{
-        .tool_registry = registry,
-        .workspace_root = workspace,
-    };
-    defer rt.deinit(alloc);
-    const result = try executeToolCallAuthorized(rt.context(), .{
-        .call_allocator = arena,
-        .result_allocator = arena,
-        .call = call,
-        .authority = .ordinary,
-        .session_grants = &.{},
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = rt.max_tool_result_bytes,
-    });
-
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-    try std.testing.expectEqualStrings("registry-owned create_folder", result.model_output);
-    try std.testing.expectError(
-        error.FileNotFound,
-        tmp.dir.statFile(io_mod.getIo(), "created", .{}),
-    );
-}
-
-test "real tool runtime enforces refreshed live authority before filesystem effect" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    var rt = TestRuntime{ .workspace_root = workspace };
-    defer rt.deinit(alloc);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const call = ToolCall{
-        .id = "live-create",
-        .name = "create_folder",
-        .arguments_json = "{\"path\":\"created\"}",
-    };
-    const denied_tools = [_][]const u8{"read_file"};
-    try std.testing.expectError(
-        error.LiveToolAuthorityUnavailable,
-        executeToolCallAuthorized(rt.context(), .{
-            .call_allocator = arena,
-            .result_allocator = arena,
-            .call = call,
-            .authority = .ordinary,
-            .session_grants = &.{},
-            .live_authority = .{
-                .generation = 2,
-                .root_id = "root",
-                .tools = &denied_tools,
-                .sandbox_backend = .none,
-                .integrations = &.{},
-                .rules = .{},
-                .grants = &.{},
-                .permission_mode = .auto,
-            },
-            .advertised_dynamic_tool_names = &.{},
-            .max_tool_result_bytes = rt.max_tool_result_bytes,
-        }),
-    );
-    try std.testing.expectError(
-        error.FileNotFound,
-        tmp.dir.statFile(io_mod.getIo(), "created", .{}),
-    );
-
-    const allowed_tools = [_][]const u8{"create_folder"};
-    const result = try executeToolCallAuthorized(rt.context(), .{
-        .call_allocator = arena,
-        .result_allocator = arena,
-        .call = call,
-        .authority = .ordinary,
-        .session_grants = &.{},
-        .live_authority = .{
-            .generation = 3,
-            .root_id = "root",
-            .tools = &allowed_tools,
-            .sandbox_backend = .none,
-            .integrations = &.{},
-            .rules = .{},
-            .grants = &.{},
-            .permission_mode = .auto,
-        },
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = rt.max_tool_result_bytes,
-    });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-    _ = try tmp.dir.statFile(io_mod.getIo(), "created", .{});
-}
-
-test "semantic_search execution uses supplied registry entry" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var registered_semantic_search = test_builtin_tools.semantic_search;
-    registered_semantic_search.call = registryOwnedSemanticSearchCall;
-    const tools = [_]tool_dispatch.Tool{registered_semantic_search};
-    const registry = tool_dispatch.Registry{ .tools = tools[0..] };
-    const call = ToolCall{
-        .id = "semantic-search",
-        .name = "semantic_search",
-        .arguments_json = "{\"query\":\"registry\"}",
-    };
-
-    var rt = TestRuntime{
-        .tool_registry = registry,
-        .workspace_root = workspace,
-    };
-    defer rt.deinit(alloc);
-    const result = try executeToolCall(rt.context(), arena, call);
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-    try std.testing.expectEqualStrings("registry-owned semantic_search", result.model_output);
-}
-
-test "launcher execution uses supplied registry entries after ordinary authorization" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var registered_open_file = test_builtin_tools.open_file;
-    registered_open_file.decode = decodeRegistryOwnedLauncher;
-    registered_open_file.validate = null;
-    registered_open_file.call = registryOwnedLauncherCall;
-    const tools = [_]tool_dispatch.Tool{
-        registered_open_file,
-    };
-    const registry = tool_dispatch.Registry{ .tools = tools[0..] };
-
-    var rt = TestRuntime{ .tool_registry = registry };
-    defer rt.deinit(alloc);
-    for ([_][]const u8{"open_file"}) |name| {
-        const result = try executeToolCallAuthorized(rt.context(), .{
-            .call_allocator = arena,
-            .result_allocator = arena,
-            .call = .{
-                .id = "launcher-registry",
-                .name = name,
-                .arguments_json = "{}",
-            },
-            .authority = .ordinary,
-            .session_grants = &.{},
-            .advertised_dynamic_tool_names = &.{},
-            .max_tool_result_bytes = rt.max_tool_result_bytes,
-        });
-
-        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-        try std.testing.expectEqualStrings("registry-owned launcher", result.model_output);
-    }
-}
-
 test "web_fetch execution uses supplied registry entry" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -4251,7 +4105,7 @@ test "terminal exec execution uses supplied registry entry" {
     const call = ToolCall{
         .id = "run-command-registry",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf bypassed\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf bypassed\",\"timeout_ms\":600000}",
     };
 
     var rt = TestRuntime{ .tool_registry = registry };
@@ -4411,14 +4265,11 @@ test "validateToolCall preserves the registered captured command host" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
 
-    try std.testing.expectEqual(
-        tool_contracts.ToolCallValidationResult.valid,
-        try validateToolCall(rt.context(), arena_state.allocator(), .{
-            .id = "workspace-terminal",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ok\"}",
-        }),
-    );
+    try std.testing.expect((try validateToolCall(rt.context(), arena_state.allocator(), .{
+        .id = "workspace-terminal",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ok\"}",
+    })) == .valid);
 }
 
 test "validateToolCall rejects selected MCP arguments through runtime capability" {
@@ -4441,6 +4292,19 @@ test "validateToolCall rejects selected MCP arguments through runtime capability
     });
     try std.testing.expect(invalid == .failure);
     try std.testing.expectEqualStrings("path must be a string", invalid.failure);
+
+    const valid = try validateToolCall(rt.context(), arena_state.allocator(), .{
+        .id = "mcp-valid",
+        .name = "mcp_fs_read",
+        .arguments_json = "{\"path\":\"README.md\"}",
+    });
+    switch (valid) {
+        .valid => |witness| try std.testing.expectEqual(
+            @as(?u64, 41),
+            witness.mcp_runtime_generation,
+        ),
+        .not_registered, .failure => return error.TestUnexpectedResult,
+    }
 }
 
 test "checkToolAvailability rejects missing web_search runtime without catalog or network work" {
@@ -4715,8 +4579,8 @@ test "request tool permission keeps safe defaults while local writes bypass revi
 
     try std.testing.expectEqual(ToolPermissionDecision.once, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
         .id = "1",
-        .name = "list_files",
-        .arguments_json = "{}",
+        .name = "glob_files",
+        .arguments_json = "{\"pattern\":\"*\"}",
     }, .ask, &.{})).decision);
 
     try std.testing.expectEqual(ToolPermissionDecision.once, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
@@ -4724,82 +4588,6 @@ test "request tool permission keeps safe defaults while local writes bypass revi
         .name = "ask_user_question",
         .arguments_json = "{}",
     }, .ask, &.{})).decision);
-}
-
-test "CLI headless ordinary admission preserves multi-target deny precedence" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    {
-        var source = try tmp.dir.createFile(io_mod.getIo(), "workspace/source.txt", .{ .truncate = true });
-        defer source.close(io_mod.getIo());
-        try source.writeStreamingAll(io_mod.getIo(), "source\n");
-    }
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-
-    var rt = TestRuntime{ .workspace_root = root, .interactive = false };
-    defer rt.deinit(alloc);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const cases = [_]struct {
-        tool_name: []const u8,
-        arguments_json: []const u8,
-        source_action: types.PermissionAction,
-        destination_action: types.PermissionAction,
-    }{
-        .{
-            .tool_name = "copy_file",
-            .arguments_json = "{\"source\":\"source.txt\",\"destination\":\"destination.txt\"}",
-            .source_action = .ask,
-            .destination_action = .deny,
-        },
-        .{
-            .tool_name = "copy_file",
-            .arguments_json = "{\"source\":\"source.txt\",\"destination\":\"destination.txt\"}",
-            .source_action = .deny,
-            .destination_action = .ask,
-        },
-        .{
-            .tool_name = "rename_file",
-            .arguments_json = "{\"old_path\":\"source.txt\",\"new_path\":\"destination.txt\"}",
-            .source_action = .ask,
-            .destination_action = .deny,
-        },
-        .{
-            .tool_name = "rename_file",
-            .arguments_json = "{\"old_path\":\"source.txt\",\"new_path\":\"destination.txt\"}",
-            .source_action = .deny,
-            .destination_action = .ask,
-        },
-    };
-
-    for (cases, 0..) |case, index| {
-        var rules = [_]types.PermissionRule{
-            .{
-                .permission = @constCast(case.tool_name),
-                .pattern = @constCast("source.txt"),
-                .action = case.source_action,
-            },
-            .{
-                .permission = @constCast(case.tool_name),
-                .pattern = @constCast("destination.txt"),
-                .action = case.destination_action,
-            },
-        };
-        rt.permission_rules = .{ .rules = &rules };
-
-        const outcome = try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
-            .id = try std.fmt.allocPrint(arena, "multi-target-{d}", .{index}),
-            .name = case.tool_name,
-            .arguments_json = case.arguments_json,
-        }, .ask, &.{});
-        try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
-        try std.testing.expect(outcome.execution_authority == null);
-    }
 }
 
 test "run_command default user profile requires configured or reviewed shell authority" {
@@ -5444,7 +5232,8 @@ test "file mutation lifecycle decodes each call at most once" {
         applied.status,
     );
     try std.testing.expect(applied.committed_file_handoff != null);
-    try std.testing.expect(applied.prepared_result_memory != null);
+    try std.testing.expect(applied.tool_result_memory_prepared);
+    try std.testing.expect(applied.tool_result_memory != null);
     call_arena_state.deinit();
     call_arena_live = false;
     try std.testing.expectEqualStrings(
@@ -5604,54 +5393,6 @@ test "file mutation preflight separates edit approval from equality disclosure" 
     }
 }
 
-test "request tool permission combines configured external copy target with workspace automatic review" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "external");
-    {
-        var source = try tmp.dir.createFile(io_mod.getIo(), "workspace/source.txt", .{ .truncate = true });
-        defer source.close(io_mod.getIo());
-        try source.writeStreamingAll(io_mod.getIo(), "source\n");
-    }
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
-    defer alloc.free(external);
-    const pattern = try std.fmt.allocPrint(alloc, "{s}/**", .{external});
-    defer alloc.free(pattern);
-    var rules = [_]types.PermissionRule{
-        .{
-            .permission = @constCast("copy_file"),
-            .pattern = pattern,
-            .action = .allow,
-        },
-    };
-
-    var reviewer = TestAutoReview{};
-    var rt = TestRuntime{
-        .workspace_root = root,
-        .permission_mode = .auto,
-        .permission_rules = .{ .rules = &rules },
-        .interactive = false,
-        .auto_classifier = reviewer.classifier(),
-    };
-    defer rt.deinit(alloc);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try std.testing.expectEqual(ToolPermissionDecision.once, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
-        .id = "copy-external",
-        .name = "copy_file",
-        .arguments_json = "{\"source\":\"source.txt\",\"destination\":\"../external/copied.txt\"}",
-    }, .auto, &.{})).decision);
-    try std.testing.expectEqual(@as(usize, 1), reviewer.calls);
-    try std.testing.expectEqualStrings("tool_requires_approval", reviewer.escalation_reason.?);
-    try std.testing.expect(rt.worker.pending_permission_request_shared == null);
-}
-
 test "disabled automatic reviewer returns a recoverable denial without a human prompt" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5687,7 +5428,7 @@ test "disabled automatic reviewer returns a recoverable denial without a human p
         .arguments_json = args,
     }, .auto, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, outcome.denial_reason.?);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, outcome.denial_reason.?);
     try std.testing.expect(outcome.requirement == null);
     try std.testing.expect(outcome.execution_authority == null);
     try std.testing.expect(outcome.auto_review_result == null);
@@ -5780,41 +5521,6 @@ test "request tool permission honors configured deny and allow rules" {
         .name = "read_file",
         .arguments_json = "{\"path\":\"src/app.zig\"}",
     }, .ask, &.{})).decision);
-}
-
-test "request tool permission denies semantic_search outside workspace target" {
-    const alloc = std.testing.allocator;
-    var workspace_tmp = std.testing.tmpDir(.{});
-    defer workspace_tmp.cleanup();
-    try workspace_tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    var external_tmp = std.testing.tmpDir(.{});
-    defer external_tmp.cleanup();
-    {
-        var file = try external_tmp.dir.createFile(io_mod.getIo(), "outside.txt", .{ .truncate = true });
-        defer file.close(io_mod.getIo());
-        try file.writeStreamingAll(io_mod.getIo(), "needle external\n");
-    }
-    const root = try io_mod.dirRealpathAlloc(alloc, workspace_tmp.dir, "workspace");
-    defer alloc.free(root);
-    const external = try io_mod.dirRealpathAlloc(alloc, external_tmp.dir, ".");
-    defer alloc.free(external);
-
-    var rt = TestRuntime{
-        .workspace_root = root,
-        .permission_mode = .auto,
-    };
-    defer rt.deinit(alloc);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const args = try std.fmt.allocPrint(arena, "{{\"query\":\"needle\",\"path\":\"{s}\"}}", .{external});
-
-    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
-        .id = "semantic",
-        .name = "semantic_search",
-        .arguments_json = args,
-    }, .auto, &.{})).decision);
 }
 
 test "executeToolCall rejects overlong glob pattern with failure status" {
@@ -6057,45 +5763,341 @@ test "executeToolCall preserves explicit ignored directory grep roots" {
     try expectContains(result.model_output, "node_modules/pkg/index.js:1: needle module");
 }
 
-test "request tool permission checks copy and rename destinations" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/src");
-    {
-        var file = try tmp.dir.createFile(io_mod.getIo(), "workspace/src/source.txt", .{ .truncate = true });
-        defer file.close(io_mod.getIo());
-        try file.writeStreamingAll(io_mod.getIo(), "source\n");
-    }
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
+test "effective command timeout uses the earlier remaining budget" {
+    try std.testing.expectEqual(
+        EffectiveCommandTimeout{ .timeout_ms = 5000, .started_ms = 700 },
+        try effectiveCommandTimeout(5000, null, null, 700),
+    );
+    try std.testing.expectEqual(
+        EffectiveCommandTimeout{ .timeout_ms = 700, .started_ms = 400 },
+        try effectiveCommandTimeout(5000, 1000, 100, 400),
+    );
+    try std.testing.expectEqual(
+        EffectiveCommandTimeout{ .timeout_ms = 100, .started_ms = 400 },
+        try effectiveCommandTimeout(100, 5000, 100, 400),
+    );
+    try std.testing.expectEqual(
+        EffectiveCommandTimeout{ .timeout_ms = 0, .started_ms = 1200 },
+        try effectiveCommandTimeout(5000, 1000, 100, 1200),
+    );
+}
 
-    var rt = TestRuntime{ .workspace_root = root };
-    defer rt.deinit(std.testing.allocator);
-    var rules = [_]types.PermissionRule{
-        .{ .permission = @constCast("copy_file"), .pattern = @constCast("blocked/*"), .action = .deny },
-        .{ .permission = @constCast("rename_file"), .pattern = @constCast("blocked/*"), .action = .deny },
+test "command replay policy is decided once from typed execution context" {
+    const Case = struct {
+        environment: command_environment.Environment,
+        has_replay_capability: bool,
+        interactive: bool,
+        continued: ?command_replay_store.CapturePolicy = null,
+        expected: ?command_replay_store.CapturePolicy,
     };
-    rt.permission_rules = .{ .rules = &rules };
+    const cases = [_]Case{
+        .{
+            .environment = .{ .clean = "/bin/zsh" },
+            .has_replay_capability = true,
+            .interactive = false,
+            .expected = .required,
+        },
+        .{
+            .environment = .{ .user = "/bin/zsh" },
+            .has_replay_capability = false,
+            .interactive = true,
+            .expected = .best_effort,
+        },
+        .{
+            .environment = .{ .clean = "/bin/zsh" },
+            .has_replay_capability = false,
+            .interactive = false,
+            .expected = null,
+        },
+        .{
+            .environment = .legacy,
+            .has_replay_capability = true,
+            .interactive = false,
+            .expected = .best_effort,
+        },
+        .{
+            .environment = .workspace_clean,
+            .has_replay_capability = true,
+            .interactive = true,
+            .expected = null,
+        },
+        .{
+            .environment = .{ .clean = "/bin/zsh" },
+            .has_replay_capability = true,
+            .interactive = false,
+            .continued = .best_effort,
+            .expected = .best_effort,
+        },
+    };
 
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            commandReplayPolicy(
+                case.environment,
+                case.has_replay_capability,
+                case.interactive,
+                case.continued,
+            ),
+        );
+    }
+}
+
+test "terminal exec request timeout reaches execution without an ambient timeout" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var rt = TestRuntime{};
+    defer rt.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
-        .id = "copy",
-        .name = "copy_file",
-        .arguments_json = "{\"source\":\"src/source.txt\",\"destination\":\"blocked/copied.txt\"}",
-    }, .auto, &.{})).decision);
-    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
-        .id = "rename",
-        .name = "rename_file",
-        .arguments_json = "{\"old_path\":\"src/source.txt\",\"new_path\":\"blocked/renamed.txt\"}",
-    }, .auto, &.{})).decision);
+    const result = try executeTestRunCommand(rt.context(), arena, .{
+        .id = "request-timeout",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"sleep 1\",\"profile\":\"clean\",\"timeout_ms\":25}",
+    });
 
-    try std.testing.expect(!absolutePathExists(try std.fs.path.join(arena, &.{ root, "blocked/copied.txt" })));
-    try std.testing.expect(!absolutePathExists(try std.fs.path.join(arena, &.{ root, "blocked/renamed.txt" })));
-    try std.testing.expect(absolutePathExists(try std.fs.path.join(arena, &.{ root, "src/source.txt" })));
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try expectContains(result.model_output, "timeout=true\n");
+    try expectContains(result.model_output, "timeout_ms=25\n");
+    const structured = result.command_result_json orelse return error.TestExpectedEqual;
+    try expectCommandResultBool(structured, "timed_out", true);
+}
+
+test "saved noninteractive terminal exec captures replay by capability" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(session_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        session_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+
+    var rt = TestRuntime{
+        .interactive = false,
+        .session_child_capability = &capability,
+    };
+    defer rt.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+
+    const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
+        .id = "saved-noninteractive",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf replay\",\"profile\":\"clean\",\"timeout_ms\":600000}",
+    });
+    defer if (result.command_replay_capture) |capture| {
+        capture.abort(arena_state.allocator());
+    };
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
+    try std.testing.expectEqual(
+        command_replay_store.CapturePolicy.required,
+        result.command_replay_capture.?.policy(),
+    );
+}
+
+test "registered read_tool_result restores an omitted stored-result suffix" {
+    const result_store = @import("../session/result_store.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(session_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        session_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+
+    const handle = try result_store.storeLargeResultManaged(
+        alloc,
+        &capability,
+        "integration-call",
+        "web_fetch",
+        "integration suffix needle",
+    );
+    defer alloc.free(handle);
+    try std.testing.expect(std.mem.endsWith(u8, handle, ".txt"));
+    const suffixless_handle = handle[0 .. handle.len - ".txt".len];
+
+    var rt = TestRuntime{ .session_child_capability = &capability };
+    defer rt.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const arguments_json = try std.fmt.allocPrint(
+        arena,
+        "{{\"handle\":\"{s}\",\"query\":\"suffix needle\"}}",
+        .{suffixless_handle},
+    );
+
+    const result = try executeToolCall(rt.context(), arena, .{
+        .id = "suffixless-result-read",
+        .name = "read_tool_result",
+        .arguments_json = arguments_json,
+    });
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
+    try expectContains(result.model_output, "integration suffix needle");
+    try expectContains(result.model_output, handle);
+}
+
+test "no-save terminal exec publishes one readable ephemeral replay" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const runtime_execution_memory = @import("../agent/runtime/execution_memory.zig");
+    const read_tool_result = @import("../../tools/session/read_tool_result.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const temp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(temp_path);
+    var store = command_replay_store.EphemeralStore.initForTesting(alloc, temp_path);
+    defer store.deinit();
+    var rt = TestRuntime{
+        .interactive = false,
+        .ephemeral_command_replay = &store,
+    };
+    defer rt.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tool_call = ToolCall{
+        .id = "no-save-replay",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ephemeral-needle\",\"profile\":\"clean\",\"timeout_ms\":600000}",
+    };
+
+    const result = try executeTestRunCommand(rt.context(), arena, tool_call);
+    const capture = result.command_replay_capture orelse return error.TestExpectedReplay;
+    var handed_off = false;
+    defer if (!handed_off) capture.discard(arena);
+    var cancel = std.atomic.Value(bool).init(false);
+    var prepared = try runtime_execution_memory.prepareCapturedToolModelOutput(
+        arena,
+        .{
+            .system_prompt = "",
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .agent_step_limit = 1,
+            .cancel_flag = &cancel,
+            .ephemeral_command_replay = &store,
+        },
+        tool_call,
+        result.model_output,
+        capture,
+    );
+    try std.testing.expect(prepared.memory.output_handle == null);
+    try runtime_execution_memory.finalizeCommandReplay(
+        arena,
+        tool_call,
+        &prepared,
+        null,
+        capture,
+    );
+    const replay = prepared.memory.command_output_replay orelse
+        return error.TestExpectedReplay;
+    const descriptor = switch (replay) {
+        .available => |value| value,
+        .unavailable => return error.TestExpectedReplay,
+    };
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, descriptor.handle) != null);
+    const read_arguments = try std.fmt.allocPrint(
+        arena,
+        "{{\"handle\":\"{s}\",\"start_byte\":1,\"byte_count\":4096}}",
+        .{descriptor.handle},
+    );
+    const read_ctx = tool_dispatch.DispatchContext{
+        .allocator = arena,
+        .ephemeral_command_replay = &store,
+    };
+    const decoded = try read_tool_result.decode(read_ctx, read_arguments);
+    const read_input = switch (decoded) {
+        .input => |value| value,
+        .failure => return error.TestUnexpectedDecodeFailure,
+    };
+    defer read_input.deinit(arena);
+    const read_result = try read_tool_result.call(read_ctx, read_input);
+    defer read_result.deinit(arena);
+    switch (read_result) {
+        .success => |page| try expectContains(page, "ephemeral-needle"),
+        .failure => return error.TestExpectedReplay,
+    }
+    capture.releaseRetained(arena);
+    handed_off = true;
+
+    var inspect_dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), temp_path, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer inspect_dir.close(io_mod.getIo());
+    var entries = inspect_dir.iterate();
+    try std.testing.expect(try entries.next(io_mod.getIo()) == null);
+}
+
+test "required replay spill failure returns recoverable capture failure" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var store = command_replay_store.EphemeralStore.initForTesting(
+        alloc,
+        "/definitely/missing/fx-replay-dir",
+    );
+    defer store.deinit();
+    var rt = TestRuntime{
+        .interactive = false,
+        .ephemeral_command_replay = &store,
+        .max_command_output_bytes = 1,
+    };
+    defer rt.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+
+    const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
+        .id = "capture-failure",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf xx\",\"profile\":\"clean\",\"timeout_ms\":600000}",
+    });
+    defer if (result.command_replay_capture) |capture| {
+        capture.abort(arena_state.allocator());
+    };
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try expectContains(result.model_output, "\"output_capture_failed\":true");
 }
 
 test "run_command timeout returns model-visible failure" {
@@ -6137,7 +6139,7 @@ test "run_command timeout returns model-visible failure" {
     const tool_call: ToolCall = .{
         .id = "cmd",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'PRE-TIMEOUT-OUT\\n'; printf 'PRE-TIMEOUT-ERR\\n' >&2; sleep 5\",\"profile\":\"clean\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'PRE-TIMEOUT-OUT\\n'; printf 'PRE-TIMEOUT-ERR\\n' >&2; sleep 5\",\"profile\":\"clean\",\"timeout_ms\":5000}",
     };
 
     const result = try executeTestRunCommand(rt.context(), arena, tool_call);
@@ -6145,7 +6147,13 @@ test "run_command timeout returns model-visible failure" {
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
     try expectContains(result.model_output, "timeout=true\n");
     try expectContains(result.model_output, "timeout_ms=1000\n");
-    try expectContains(result.model_output, "command timed out and was terminated\n");
+    try expectContains(
+        result.model_output,
+        "cleanup_scope=process_group_and_tracked_descendants\n",
+    );
+    try expectContains(result.model_output, "cleanup_guarantee=best_effort\n");
+    try expectContains(result.model_output, "fully detached descendants may remain\n");
+    try expectNotContains(result.model_output, "command timed out and was terminated");
     try expectNotContains(result.model_output, "PRE-TIMEOUT-OUT");
     try expectNotContains(result.model_output, "PRE-TIMEOUT-ERR");
     const structured = result.command_result_json orelse return error.TestExpectedEqual;
@@ -6186,16 +6194,16 @@ test "run_command timeout returns model-visible failure" {
         .system_prompt = "",
         .gateway_retry_count = 0,
         .gateway_chat_url = "",
-        .gateway_tools_json = "[]",
         .agent_step_limit = 1,
         .cancel_flag = &cancel,
         .session_child_capability = &capability,
     };
-    var prepared = try runtime_execution_memory.prepareToolModelOutput(
+    var prepared = try runtime_execution_memory.prepareCapturedToolModelOutput(
         arena,
         config,
         tool_call,
         result.model_output,
+        capture,
     );
     runtime_execution_memory.applyToolResultMemory(
         &prepared.memory,
@@ -6203,7 +6211,7 @@ test "run_command timeout returns model-visible failure" {
     );
     var replay_finalized = false;
     defer if (!replay_finalized) capture.abort(arena);
-    runtime_execution_memory.finalizeCommandReplay(
+    try runtime_execution_memory.finalizeCommandReplay(
         arena,
         tool_call,
         &prepared,
@@ -6305,11 +6313,12 @@ test "interactive command replay capture allocation fails open" {
         std.testing.allocator,
         .{ .fail_index = 0 },
     );
-    const init = initCommandReplayCapture(
+    const init = try initCommandReplayCapture(
         failing.allocator(),
-        true,
+        .best_effort,
         64 * 1024,
         64 * 1024,
+        null,
         null,
         null,
         false,
@@ -6331,6 +6340,7 @@ test "interactive command replay capture allocation fails open" {
 
     var transferred = false;
     const result = try finishCommandToolResult(
+        std.testing.allocator,
         null,
         init.unavailable and callback.had_accepted_output,
         &transferred,
@@ -6344,163 +6354,40 @@ test "interactive command replay capture allocation fails open" {
     }
 }
 
-test "interactive devbox success emits raw provider output once" {
+test "required replay finalizer overrides every recoverable command result" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-
-    var rt = TestRuntime{
-        .workspace_root = "/tmp",
-        .permission_mode = .auto,
-        .sandbox_backend = .vercel,
+    const initial_results = [_]ToolExecutionResult{
+        .{ .status = .success, .model_output = "compatibility success\n" },
+        .{ .status = .failure, .model_output = "timeout\n" },
+        .{ .status = .failure, .cancelled = true, .model_output = "cancelled\n" },
+        .{ .status = .failure, .model_output = "nonzero\n" },
+        .{ .status = .success, .model_output = "success\n" },
     };
-    defer rt.deinit(alloc);
-    var provider = TestDevboxProvider{};
-    var captured = TestCommandOutputCapture{ .alloc = alloc };
-    defer captured.deinit();
-    var ctx = rt.context();
-    ctx.devbox_provider = .{
-        .ctx = @ptrCast(&provider),
-        .execute_fn = executeTestDevboxProvider,
-    };
-    ctx.output_chunk_ctx = @ptrCast(&captured);
-    ctx.on_output_chunk = TestCommandOutputCapture.onChunk;
 
-    const result = try executeTestRunCommand(ctx, arena, .{
-        .id = "devbox-compact",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf remote > provider-output.txt\"}",
-    });
-
-    try std.testing.expectEqual(@as(usize, 1), provider.calls);
-    try std.testing.expectEqualStrings(
-        "DEVBOX_COMPACT_ONE\nDEVBOX_COMPACT_TWO\n",
-        captured.bytes.items,
-    );
-    try std.testing.expectEqual(@as(usize, 1), captured.stdout_chunks);
-    try std.testing.expectEqual(@as(usize, 0), captured.stderr_chunks);
-    try expectContains(result.model_output, "<stdout>\nDEVBOX_COMPACT_ONE\nDEVBOX_COMPACT_TWO\n</stdout>\n");
-    const replay = result.command_replay_capture orelse
-        return error.TestExpectedReplay;
-    try std.testing.expect(replay.hasOutput());
-}
-
-test "run_command reactive sandbox retry timeout retains both attempts" {
-    if (builtin.os.tag != .macos) return;
-
-    const alloc = std.testing.allocator;
-    const zio = io_mod.getIo();
-    const fixture_root = try std.fmt.allocPrint(
-        alloc,
-        "/var/tmp/fx-sandbox-retry-{d}-{d}",
-        .{ std.c.getpid(), io_mod.nanoTimestamp() },
-    );
-    defer alloc.free(fixture_root);
-    try std.Io.Dir.cwd().createDirPath(zio, fixture_root);
-    defer std.Io.Dir.cwd().deleteTree(zio, fixture_root) catch {};
-
-    const home_path = try std.fs.path.join(alloc, &.{ fixture_root, "home" });
-    defer alloc.free(home_path);
-    const cache_path = try std.fs.path.join(alloc, &.{ home_path, ".cache" });
-    defer alloc.free(cache_path);
-    const workspace_path = try std.fs.path.join(alloc, &.{ fixture_root, "workspace" });
-    defer alloc.free(workspace_path);
-
-    // The restricted profile permits /tmp and /private/tmp, so a fixture there
-    // cannot prove that the retry widens access to the user's cache directory.
-    try std.Io.Dir.cwd().createDirPath(zio, cache_path);
-    try std.Io.Dir.cwd().createDirPath(zio, workspace_path);
-    const home = try io_mod.realpathAlloc(alloc, home_path);
-    defer alloc.free(home);
-    const workspace = try io_mod.realpathAlloc(alloc, workspace_path);
-    defer alloc.free(workspace);
-    try setTestHome(home);
-    defer setTestHome(null) catch {};
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const marker = try std.fmt.allocPrint(
-        arena,
-        "{s}/.cache/fx-replay-retry-{d}",
-        .{ home, io_mod.nanoTimestamp() },
-    );
-    defer std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), marker) catch {};
-    const command = try std.fmt.allocPrint(
-        arena,
-        "printf 'FIRST-ATTEMPT\\n'; printf x > '{s}' || exit 1; printf 'RETRY-ATTEMPT\\n'; sleep 5",
-        .{marker},
-    );
-    const args = try runCommandArgsWithCleanProfileForTest(arena, command);
-
-    var rt = TestRuntime{
-        .workspace_root = workspace,
-        .permission_mode = .auto,
-        .sandbox_backend = .macos,
-        .command_timeout_ms = 750,
-    };
-    defer rt.deinit(alloc);
-    const call = ToolCall{
-        .id = "retry-timeout",
-        .name = "terminal",
-        .arguments_json = args,
-    };
-    const restricted = try executeTestRunCommand(rt.context(), arena, call);
-    const required = restricted.sandbox_scope_required orelse
-        return error.TestExpectedSandboxScopeRequired;
-    try std.testing.expectEqual(
-        tool_contracts.SandboxWideningPhase.reactive,
-        required.phase,
-    );
-
-    var broader_context = try tool_admission.runCommandContext(
-        rt.context().admissionInput(),
-        arena,
-        call,
-    );
-    broader_context.scope = .broader;
-    var restricted_capture_owned = required.command_replay_capture != null;
-    defer if (restricted_capture_owned) {
-        required.command_replay_capture.?.abort(arena);
-    };
-    restricted_capture_owned = false;
-    const result = try executeToolCallAuthorized(rt.context(), .{
-        .call_allocator = arena,
-        .result_allocator = arena,
-        .call = call,
-        .authority = .{ .run_command = .{ .shell_allowed = .{
-            .fingerprint = .init(broader_context),
-            .source = .auto_classifier,
-        } } },
-        .session_grants = &.{},
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = rt.max_tool_result_bytes,
-        .command_timeout_started_ms = required.command_timeout_started_ms,
-        .command_replay_capture = required.command_replay_capture,
-        .command_replay_unavailable = required.command_replay_unavailable,
-    });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "timeout=true\n");
-    try expectNotContains(result.model_output, "FIRST-ATTEMPT");
-    try expectNotContains(result.model_output, "RETRY-ATTEMPT");
-
-    const capture = result.command_replay_capture orelse
-        return error.TestExpectedReplay;
-    defer capture.abort(arena);
-    var canonical = (try capture.canonicalizeForComparison(
-        arena,
-    )) orelse return error.TestExpectedReplay;
-    defer canonical.deinit(arena);
-    var first_attempts: usize = 0;
-    var retry_attempts: usize = 0;
-    for (canonical.records.items) |record| {
-        if (record.stream == .stdout and
-            std.mem.eql(u8, record.text.items, "FIRST-ATTEMPT")) first_attempts += 1;
-        if (record.stream == .stdout and
-            std.mem.eql(u8, record.text.items, "RETRY-ATTEMPT")) retry_attempts += 1;
+    for (initial_results) |initial| {
+        const capture = try command_replay_store.Capture.create(arena, 0, null);
+        defer capture.abort(arena);
+        capture.setPolicyBeforeCapture(.required);
+        try std.testing.expectError(
+            error.CommandOutputCaptureFailed,
+            capture.appendAcceptedRequired(arena, .stdout, "accepted\n"),
+        );
+        var transferred = false;
+        const result = try finishCommandToolResult(
+            arena,
+            capture,
+            false,
+            &transferred,
+            null,
+            initial,
+        );
+        try std.testing.expect(transferred);
+        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+        try expectContains(result.model_output, "\"output_capture_failed\":true");
     }
-    try std.testing.expectEqual(@as(usize, 2), first_attempts);
-    try std.testing.expectEqual(@as(usize, 1), retry_attempts);
 }
 
 test "run_command post-spawn cancellation returns structured evidence in every mode" {
@@ -6521,7 +6408,6 @@ test "run_command post-spawn cancellation returns structured evidence in every m
         .workspace_root = workspace,
         .cancel_flag = &cancel,
         .permission_mode = .auto,
-        .sandbox_backend = .none,
         .command_artifact_dir = artifact_dir,
     };
     defer rt.deinit(alloc);
@@ -6598,7 +6484,7 @@ test "run_command post-spawn cancellation returns structured evidence in every m
     var retry_ctx = rt.context();
     retry_ctx.output_chunk_ctx = @ptrCast(&headless_trigger);
     retry_ctx.on_output_chunk = CancelTestCommandOnOutput.onChunk;
-    var command_ctx = try tool_admission.runCommandContext(
+    const command_ctx = try tool_admission.runCommandContext(
         retry_ctx.admissionInput(),
         arena,
         .{
@@ -6607,7 +6493,6 @@ test "run_command post-spawn cancellation returns structured evidence in every m
             .arguments_json = headless_args,
         },
     );
-    command_ctx.scope = .broader;
     const retry = try executeToolCallAuthorized(retry_ctx, .{
         .call_allocator = arena,
         .result_allocator = arena,
@@ -6627,108 +6512,6 @@ test "run_command post-spawn cancellation returns structured evidence in every m
     try std.testing.expect(headless_trigger.seen);
     try std.testing.expect(retry.cancelled);
     var metrics: [1]diagnostics.ToolCallMetric = undefined;
-    try std.testing.expectEqual(@as(usize, 0), diagnostics.snapshotToolCalls(&metrics));
-}
-
-test "broader sandbox retry consumes the original command timeout budget" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
-    var rt = TestRuntime{
-        .command_timeout_ms = 1,
-        .sandbox_backend = .none,
-    };
-    defer rt.deinit(std.testing.allocator);
-
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const call = ToolCall{
-        .id = "broader-timeout",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"sleep 5\"}",
-    };
-    var command_ctx = try tool_admission.runCommandContext(
-        rt.context().admissionInput(),
-        arena,
-        call,
-    );
-    command_ctx.scope = .broader;
-    const original_start_ms = io_mod.milliTimestamp() - 50;
-
-    const result = try executeToolCallAuthorized(rt.context(), .{
-        .call_allocator = arena,
-        .result_allocator = arena,
-        .call = call,
-        .authority = .{ .run_command = .{ .shell_allowed = .{
-            .fingerprint = .init(command_ctx),
-            .source = .auto_classifier,
-        } } },
-        .session_grants = &.{},
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = rt.max_tool_result_bytes,
-        .command_timeout_started_ms = original_start_ms,
-    });
-
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "timeout=true\n");
-    try expectContains(result.model_output, "timeout_ms=1\n");
-}
-
-test "pre-spawn broader retry cancellation defers tool diagnostics" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
-    diagnostics.resetForTest();
-    defer diagnostics.resetForTest();
-    var cancel = std.atomic.Value(bool).init(true);
-    var rt = TestRuntime{
-        .cancel_flag = &cancel,
-        .permission_mode = .auto,
-        .sandbox_backend = .none,
-    };
-    defer rt.deinit(std.testing.allocator);
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const call = ToolCall{
-        .id = "cancel-before-broader-retry",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf never > cancelled-before-retry\"}",
-    };
-    var command_ctx = try tool_admission.runCommandContext(
-        rt.context().admissionInput(),
-        arena,
-        call,
-    );
-    command_ctx.scope = .broader;
-    var request: tool_contracts.ToolExecutionRequest = .{
-        .call_allocator = arena,
-        .result_allocator = arena,
-        .call = call,
-        .authority = .{ .run_command = .{ .shell_allowed = .{
-            .fingerprint = .init(command_ctx),
-            .source = .auto_classifier,
-        } } },
-        .session_grants = &.{},
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = rt.max_tool_result_bytes,
-    };
-
-    try std.testing.expectError(
-        error.CancelledBeforeExecution,
-        executeToolCallAuthorized(rt.context(), request),
-    );
-    var metrics: [1]diagnostics.ToolCallMetric = undefined;
-    try std.testing.expectEqual(@as(usize, 0), diagnostics.snapshotToolCalls(&metrics));
-
-    command_ctx.scope = .restricted;
-    request.authority = .{ .run_command = .{ .shell_allowed = .{
-        .fingerprint = .init(command_ctx),
-        .source = .auto_classifier,
-    } } };
-    try std.testing.expectError(
-        error.Cancelled,
-        executeToolCallAuthorized(rt.context(), request),
-    );
     try std.testing.expectEqual(@as(usize, 1), diagnostics.snapshotToolCalls(&metrics));
 }
 
@@ -6737,7 +6520,6 @@ test "run_command success exposes structured foreground metadata" {
 
     var rt = TestRuntime{
         .permission_mode = .auto,
-        .sandbox_backend = .none,
     };
     defer rt.deinit(std.testing.allocator);
 
@@ -6747,7 +6529,7 @@ test "run_command success exposes structured foreground metadata" {
     const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
         .id = "cmd",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf '\\\\150\\\\145\\\\154\\\\154\\\\157'\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf '\\\\150\\\\145\\\\154\\\\154\\\\157'\",\"timeout_ms\":600000}",
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
@@ -6915,7 +6697,6 @@ test "run_command propagates output callback failure" {
 
     var rt = TestRuntime{
         .permission_mode = .auto,
-        .sandbox_backend = .none,
     };
     defer rt.deinit(std.testing.allocator);
 
@@ -6930,7 +6711,7 @@ test "run_command propagates output callback failure" {
         executeTestRunCommand(ctx, arena_state.allocator(), .{
             .id = "cmd",
             .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'handoff\\\\n'\"}",
+            .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'handoff\\\\n'\",\"timeout_ms\":600000}",
         }),
     );
 }
@@ -6940,7 +6721,6 @@ test "run_command returns model output and structured metadata" {
 
     var rt = TestRuntime{
         .permission_mode = .auto,
-        .sandbox_backend = .none,
     };
     defer rt.deinit(std.testing.allocator);
 
@@ -6950,7 +6730,7 @@ test "run_command returns model output and structured metadata" {
     const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
         .id = "cmd",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'quiet-stdout\\\\n'; printf 'quiet-stderr\\\\n' >&2\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'quiet-stdout\\\\n'; printf 'quiet-stderr\\\\n' >&2\",\"timeout_ms\":600000}",
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
@@ -6972,7 +6752,6 @@ test "run_command nonzero exit returns structured masked failure" {
 
     var rt = TestRuntime{
         .permission_mode = .auto,
-        .sandbox_backend = .none,
     };
     defer rt.deinit(std.testing.allocator);
 
@@ -6982,7 +6761,7 @@ test "run_command nonzero exit returns structured masked failure" {
     const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
         .id = "cmd",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'bad AKIA0123456789ABCDEF\\\\n' >&2; exit 7\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'bad AKIA0123456789ABCDEF\\\\n' >&2; exit 7\",\"timeout_ms\":600000}",
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
@@ -7023,7 +6802,6 @@ test "run_command huge output exposes truncation and artifact paths without stdo
     var rt = TestRuntime{
         .workspace_root = workspace,
         .permission_mode = .auto,
-        .sandbox_backend = .none,
     };
     rt.max_command_output_bytes = 16;
     rt.command_artifact_dir = artifact_dir;
@@ -7035,7 +6813,7 @@ test "run_command huge output exposes truncation and artifact paths without stdo
     const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
         .id = "cmd",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf %026d 0\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf %026d 0\",\"timeout_ms\":600000}",
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
@@ -7047,90 +6825,6 @@ test "run_command huge output exposes truncation and artifact paths without stdo
     try expectCommandResultStringPrefix(structured, "stdout_file", artifact_dir);
     try expectCommandResultStringPrefix(structured, "stderr_file", artifact_dir);
     try std.testing.expect(std.mem.find(u8, structured, "00000000000000000000000000") == null);
-}
-
-test "run_command reactive sandbox widening preserves the restricted attempt" {
-    if (builtin.os.tag != .macos) return;
-
-    var rt = TestRuntime{
-        .permission_mode = .auto,
-        .sandbox_backend = .macos,
-        .interactive = false,
-    };
-    defer rt.deinit(std.testing.allocator);
-
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-
-    const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
-        .id = "cmd",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'Operation not permitted\\\\n' >&2; exit 1\",\"profile\":\"clean\"}",
-    });
-
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "Operation not permitted");
-    const widening = result.sandbox_scope_required orelse
-        return error.TestExpectedSandboxScopeRequired;
-    try std.testing.expectEqual(tool_contracts.SandboxWideningPhase.reactive, widening.phase);
-    try std.testing.expectEqualStrings(
-        "printf 'Operation not permitted\\n' >&2; exit 1",
-        widening.restricted_fingerprint.command,
-    );
-    try std.testing.expectEqualStrings("/tmp", widening.restricted_fingerprint.resolved_cwd);
-    try std.testing.expectEqualStrings(
-        result.model_output,
-        widening.restricted_model_output orelse return error.TestExpectedRestrictedResult,
-    );
-    const structured = result.command_result_json orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings(
-        structured,
-        widening.restricted_command_result_json orelse
-            return error.TestExpectedRestrictedResult,
-    );
-    try expectCommandResultField(structured, "kind", "foreground");
-    try expectCommandResultField(structured, "command", "printf 'Operation not permitted\\n' >&2; exit 1");
-    try expectCommandResultInt(structured, "exit_code", 1);
-    try expectCommandResultInt(structured, "stdout_bytes", 0);
-    try expectCommandResultInt(structured, "stderr_bytes", 24);
-    try std.testing.expect(rt.worker.pending_permission_request_shared == null);
-}
-
-test "run_command preflight sandbox widening reports that no attempt ran" {
-    if (builtin.os.tag != .macos) return;
-
-    diagnostics.resetForTest();
-    defer diagnostics.resetForTest();
-
-    var rt = TestRuntime{
-        .permission_mode = .auto,
-        .sandbox_backend = .macos,
-        .interactive = false,
-    };
-    defer rt.deinit(std.testing.allocator);
-
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-
-    const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
-        .id = "cmd",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
-    });
-
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try std.testing.expectEqualStrings("", result.model_output);
-    try std.testing.expect(result.command_result_json == null);
-    const widening = result.sandbox_scope_required orelse
-        return error.TestExpectedSandboxScopeRequired;
-    try std.testing.expectEqual(tool_contracts.SandboxWideningPhase.preflight, widening.phase);
-    try std.testing.expectEqualStrings("npm test", widening.restricted_fingerprint.command);
-    try std.testing.expectEqualStrings("/tmp", widening.restricted_fingerprint.resolved_cwd);
-    try std.testing.expect(widening.restricted_model_output == null);
-    try std.testing.expect(widening.restricted_command_result_json == null);
-    try std.testing.expect(rt.worker.pending_permission_request_shared == null);
-    var metrics: [1]diagnostics.ToolCallMetric = undefined;
-    try std.testing.expectEqual(@as(usize, 0), diagnostics.snapshotToolCalls(&metrics));
 }
 
 test "terminal exec rejects legacy background input without creating state" {
@@ -7217,17 +6911,7 @@ fn fileGrantOfferMatchesExpectation(
     expected_target: []const u8,
     expected_workspace: bool,
 ) bool {
-    const workspace_permissions = [_][]const u8{
-        "edit",
-        "create_folder",
-        "open_file",
-        "rename_file",
-        "copy_file",
-        "read",
-        "list",
-        "glob",
-        "grep",
-    };
+    const workspace_permissions = [_][]const u8{ "edit", "read", "glob", "grep" };
     for (offer.grants) |grant| {
         if (!std.mem.eql(u8, grant.target_path, expected_target)) return false;
     }
@@ -7331,7 +7015,7 @@ fn waitForPermissionPrompt(worker: *WorkerRuntime, expected: []const u8) !u64 {
 
 test "configured ask rule prompts the worker" {
     var rules = [_]types.PermissionRule{
-        .{ .permission = @constCast("list"), .pattern = @constCast("."), .action = .ask },
+        .{ .permission = @constCast("glob"), .pattern = @constCast("."), .action = .ask },
     };
     var rt = TestRuntime{
         .workspace_root = "/tmp/workspace",
@@ -7341,7 +7025,7 @@ test "configured ask rule prompts the worker" {
     defer rt.deinit(std.testing.allocator);
 
     var state = PermissionThreadState{};
-    const thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &state, rt.context(), ToolCall{ .id = "1", .name = "list_files", .arguments_json = "{}" }, PermissionMode.auto });
+    const thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &state, rt.context(), ToolCall{ .id = "1", .name = "glob_files", .arguments_json = "{\"pattern\":\"*\"}" }, PermissionMode.auto });
     var thread_joined = false;
     defer if (!thread_joined) {
         rt.worker.requestShutdown();
@@ -7349,7 +7033,7 @@ test "configured ask rule prompts the worker" {
     };
 
     rt.worker.worker_processing = true;
-    const request_id = try waitForPermissionPrompt(&rt.worker, "list_files");
+    const request_id = try waitForPermissionPrompt(&rt.worker, "glob_files");
     try std.testing.expectEqual(
         worker_runtime.PermissionSubmissionResult.accepted,
         rt.worker.submitPermissionResponse(
@@ -7366,6 +7050,7 @@ test "configured ask rule prompts the worker" {
 const McpFixture = struct {
     const CountingContext = struct {
         calls: usize = 0,
+        runtime_generation: u64 = 41,
     };
 
     const PermissionContext = struct {
@@ -7377,6 +7062,7 @@ const McpFixture = struct {
         calls: usize = 0,
         admission_generation: u64 = 0,
         action_generation: u64 = 0,
+        expected_runtime_generation: ?u64 = null,
     };
 
     fn hasTrue(_: *anyopaque, _: []const u8, _: tool_mcp_runtime.Access) bool {
@@ -7387,11 +7073,12 @@ const McpFixture = struct {
         return false;
     }
 
-    fn validateArguments(_: *anyopaque, arena: Allocator, _: []const u8, arguments_json: []const u8, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
+    fn validateArguments(raw_ctx: *anyopaque, arena: Allocator, _: []const u8, arguments_json: []const u8, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
         if (std.mem.eql(u8, arguments_json, "{\"path\":7}")) {
             return .{ .invalid = try arena.dupe(u8, "path must be a string") };
         }
-        return .valid;
+        const ctx: *CountingContext = @ptrCast(@alignCast(raw_ctx));
+        return .{ .valid = ctx.runtime_generation };
     }
 
     fn callOk(_: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, _: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
@@ -7413,6 +7100,7 @@ const McpFixture = struct {
         ctx.calls += 1;
         ctx.admission_generation = scope.admission_authority_generation;
         ctx.action_generation = scope.action_authority_generation;
+        ctx.expected_runtime_generation = options.expected_runtime_generation;
         return .{ .model_output = try arena.dupe(u8, "mcp ok") };
     }
 
@@ -7424,8 +7112,8 @@ const McpFixture = struct {
         return error.McpFixtureFailure;
     }
 
-    fn search(_: *anyopaque, arena: Allocator, query: []const u8, _: usize, _: types.PermissionRuleSet, _: context_limits.Values) anyerror!tool_mcp_runtime.SearchResult {
-        return .{ .model_output = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\",\"tools\":[{{\"name\":\"mcp_fs_read\",\"server\":\"fs\",\"description\":\"Read\",\"input_schema\":{{\"type\":\"object\"}},\"tags\":[\"fs\",\"read\"]}}],\"count\":1}}", .{query}) };
+    fn search(_: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, _: usize, _: types.PermissionRuleSet, _: context_limits.Values) anyerror!tool_mcp_runtime.SearchResult {
+        return .{ .model_output = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\",\"tools\":[{{\"name\":\"mcp_fs_read\",\"server\":\"fs\",\"description\":\"Read\",\"input_schema\":{{\"type\":\"object\"}},\"tags\":[\"fs\",\"read\"]}}],\"count\":1}}", .{query.raw}) };
     }
 
     fn schema(_: *anyopaque, arena: Allocator, name: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
@@ -7433,7 +7121,7 @@ const McpFixture = struct {
         return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read <context_limit action='literal' />\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"context_limit_rejection\":{\"type\":\"string\"}}}}") } };
     }
 
-    fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, query: []const u8, _: usize, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+    fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, _: usize, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
         const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
         ctx.search_rule_count = permission_rules.rules.len;
         return search(raw_ctx, arena, query, 0, permission_rules, limits);
@@ -7639,7 +7327,6 @@ test "MCP execution binds the last live action generation before transport" {
             .generation = 41,
             .root_id = "root",
             .tools = &.{},
-            .sandbox_backend = .none,
             .integrations = &integrations,
             .rules = .{},
             .grants = &.{},
@@ -7647,6 +7334,7 @@ test "MCP execution binds the last live action generation before transport" {
         },
         .advertised_dynamic_tool_names = &integrations,
         .max_tool_result_bytes = rt.max_tool_result_bytes,
+        .expected_mcp_runtime_generation = 73,
     });
     defer alloc.free(result.model_output);
 
@@ -7655,6 +7343,7 @@ test "MCP execution binds the last live action generation before transport" {
     try std.testing.expectEqual(@as(usize, 1), authority.calls);
     try std.testing.expectEqual(@as(u64, 17), authority.admission_generation);
     try std.testing.expectEqual(@as(u64, 41), authority.action_generation);
+    try std.testing.expectEqual(@as(?u64, 73), authority.expected_runtime_generation);
     const original_scope = switch (tool_ctx.mcp_access) {
         .scoped => |scope| scope,
         else => return error.McpScopedAccessExpected,
@@ -7797,157 +7486,6 @@ test "terminal exec cannot reuse or replace a persisted legacy background task" 
     defer tasks.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), tasks.items.len);
     try std.testing.expectEqual(task_id, tasks.items[0].id);
-}
-
-test "external absolute non-write tracked mutations capture resolved paths" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "external");
-
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
-    defer alloc.free(external);
-    var tracker: change_tracker.ChangeTracker = .{};
-    defer tracker.deinit(std.heap.c_allocator);
-    var allow_rules = [_]types.PermissionRule{
-        .{ .permission = @constCast("*"), .pattern = @constCast("*"), .action = .allow },
-    };
-    var rt = TestRuntime{ .workspace_root = root, .tracker = &tracker };
-    rt.permission_rules = .{ .rules = &allow_rules };
-    defer rt.deinit(alloc);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    try writeTestFile(tmp.dir, "external/delete.txt", "delete\n");
-    const delete_path = try std.fs.path.join(arena, &.{ external, "delete.txt" });
-    const delete_args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{delete_path});
-    _ = try executeToolCall(rt.context(), arena, .{
-        .id = "external-delete",
-        .name = "delete_file",
-        .arguments_json = delete_args,
-    });
-    try std.testing.expectEqual(@as(usize, 1), tracker.stack.items.len);
-    try std.testing.expectEqual(change_tracker.OperationKind.delete, tracker.stack.items[0].kind);
-    try std.testing.expectEqualStrings(delete_path, tracker.stack.items[0].path);
-    try std.testing.expectEqualStrings("delete\n", tracker.stack.items[0].previous_content.?);
-
-    try writeTestFile(tmp.dir, "external/rename.txt", "rename\n");
-    const rename_source = try std.fs.path.join(arena, &.{ external, "rename.txt" });
-    const rename_dest = try std.fs.path.join(arena, &.{ external, "renamed.txt" });
-    const rename_args = try std.fmt.allocPrint(arena, "{{\"old_path\":\"{s}\",\"new_path\":\"{s}\"}}", .{ rename_source, rename_dest });
-    _ = try executeToolCall(rt.context(), arena, .{
-        .id = "external-rename",
-        .name = "rename_file",
-        .arguments_json = rename_args,
-    });
-    try std.testing.expectEqual(@as(usize, 2), tracker.stack.items.len);
-    try std.testing.expectEqual(change_tracker.OperationKind.rename, tracker.stack.items[1].kind);
-    try std.testing.expectEqualStrings(rename_source, tracker.stack.items[1].path);
-    try std.testing.expectEqualStrings(rename_dest, tracker.stack.items[1].new_path.?);
-
-    try writeTestFile(tmp.dir, "external/copy-source.txt", "copy\n");
-    const copy_source = try std.fs.path.join(arena, &.{ external, "copy-source.txt" });
-    const copy_dest = try std.fs.path.join(arena, &.{ external, "copy-dest.txt" });
-    const copy_args = try std.fmt.allocPrint(arena, "{{\"source\":\"{s}\",\"destination\":\"{s}\"}}", .{ copy_source, copy_dest });
-    _ = try executeToolCall(rt.context(), arena, .{
-        .id = "external-copy",
-        .name = "copy_file",
-        .arguments_json = copy_args,
-    });
-    try std.testing.expectEqual(@as(usize, 3), tracker.stack.items.len);
-    try std.testing.expectEqual(change_tracker.OperationKind.write, tracker.stack.items[2].kind);
-    try std.testing.expectEqualStrings(copy_dest, tracker.stack.items[2].path);
-}
-
-test "invalid tracked mutations do not push tracker operations" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-
-    var tracker: change_tracker.ChangeTracker = .{};
-    defer tracker.deinit(std.heap.c_allocator);
-    var rt = TestRuntime{ .workspace_root = root, .tracker = &tracker };
-    defer rt.deinit(alloc);
-
-    const calls = [_]struct { name: []const u8, args: []const u8 }{
-        .{ .name = "delete_file", .args = "{}" },
-        .{ .name = "rename_file", .args = "{}" },
-        .{ .name = "copy_file", .args = "{}" },
-    };
-
-    for (calls) |call| {
-        var arena_state = std.heap.ArenaAllocator.init(alloc);
-        defer arena_state.deinit();
-        try std.testing.expectError(error.InvalidToolArguments, executeToolCall(rt.context(), arena_state.allocator(), .{
-            .id = "1",
-            .name = call.name,
-            .arguments_json = call.args,
-        }));
-        try std.testing.expectEqual(@as(usize, 0), tracker.stack.items.len);
-    }
-}
-
-test "failed tracked delete rename and copy skip tracker publication" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/non-empty");
-    try writeTestFile(tmp.dir, "workspace/non-empty/child.txt", "keep\n");
-    try writeTestFile(tmp.dir, "workspace/rename-source.txt", "rename\n");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/rename-destination");
-    try writeTestFile(tmp.dir, "workspace/rename-destination/child.txt", "keep\n");
-    try writeTestFile(tmp.dir, "workspace/copy-source.txt", "copy\n");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/copy-destination");
-
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-    var tracker: change_tracker.ChangeTracker = .{};
-    defer tracker.deinit(std.heap.c_allocator);
-    var rt = TestRuntime{ .workspace_root = root, .tracker = &tracker };
-    defer rt.deinit(alloc);
-
-    const calls = [_]struct {
-        name: []const u8,
-        args: []const u8,
-        failure_prefix: []const u8,
-    }{
-        .{
-            .name = "delete_file",
-            .args = "{\"path\":\"non-empty\"}",
-            .failure_prefix = "delete_file failed:",
-        },
-        .{
-            .name = "rename_file",
-            .args = "{\"old_path\":\"rename-source.txt\",\"new_path\":\"rename-destination\"}",
-            .failure_prefix = "rename_file failed:",
-        },
-        .{
-            .name = "copy_file",
-            .args = "{\"source\":\"copy-source.txt\",\"destination\":\"copy-destination\"}",
-            .failure_prefix = "copy_file failed:",
-        },
-    };
-
-    for (calls) |call| {
-        var arena_state = std.heap.ArenaAllocator.init(alloc);
-        defer arena_state.deinit();
-        const result = try executeToolCall(rt.context(), arena_state.allocator(), .{
-            .id = "tracked-failure",
-            .name = call.name,
-            .arguments_json = call.args,
-        });
-        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-        try std.testing.expect(std.mem.startsWith(u8, result.model_output, call.failure_prefix));
-        try std.testing.expectEqual(@as(usize, 0), tracker.stack.items.len);
-    }
 }
 
 test "memory tool uses isolated HOME and preserves outputs" {
@@ -8324,7 +7862,6 @@ const VisionGatewayFixture = struct {
     last_team: ?[]const u8 = null,
     last_model: []const u8 = "",
     last_retry_count: usize = 0,
-    last_chat_url: []const u8 = "",
 
     fn deinit(self: *VisionGatewayFixture) void {
         for (self.payloads.items) |payload| self.alloc.free(payload);
@@ -8341,7 +7878,7 @@ const VisionGatewayFixture = struct {
     fn stream(
         context: ?*anyopaque,
         _: Allocator,
-        request: agent_stream_provider.Request,
+        request: agent_stream_provider.ModelRequest,
     ) anyerror!agent_stream_provider.Result {
         const self: *VisionGatewayFixture = @ptrCast(@alignCast(context.?));
         if (self.allocation_probe) |probe| {
@@ -8349,26 +7886,38 @@ const VisionGatewayFixture = struct {
         }
         const response_index = self.call_count;
         self.call_count += 1;
-        try self.payloads.append(self.alloc, try self.alloc.dupe(u8, request.payload));
-        self.last_api_key = request.api_key;
-        self.last_team = request.team;
+        const payload = try test_builtin_gateway.buildAgentRequest(self.alloc, request.data());
+        defer self.alloc.free(payload);
+        try self.payloads.append(self.alloc, try self.alloc.dupe(u8, payload));
+        self.last_api_key = request.credential.secret;
+        self.last_team = request.credential.tenant;
         self.last_model = request.model;
         self.last_retry_count = request.retry_count;
-        self.last_chat_url = request.chat_url;
         if (self.cancel_after_call == self.call_count) request.cancel_flag.store(true, .seq_cst);
         if (response_index >= self.responses.len) return error.UnexpectedVisionGatewayCall;
         const response = self.responses[response_index];
+        try request.admission.admit();
         request.delivery.markPossiblySent();
-        return .{
-            .status = response.status,
+        if (response.status != .ok) return .{ .failed = .{ .kind = .provider_error } };
+        return .{ .completed = .{
             .completion = .{
                 .content = response.content,
                 .generation_id = response.generation_id,
                 .finish_reason = .stop,
                 .usage = response.usage,
             },
-            .generation_origin = "https://ai-gateway.vercel.sh",
-        };
+            .usage = .{ .deferred = .{
+                .provider = .gateway,
+                .generation_id = response.generation_id orelse "gen_test",
+                .scope = "https://ai-gateway.vercel.sh",
+                .tenant = request.credential.tenant,
+                .credential_source = request.credential.source orelse .ai_gateway_api_key,
+                .credential_identity = credential_authority.derive(
+                    request.credential.source orelse .ai_gateway_api_key,
+                    request.credential.account_id,
+                ),
+            } },
+        } };
     }
 };
 
@@ -8521,6 +8070,36 @@ fn executeVisionPathTargetsForTest(
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = rt.max_tool_result_bytes,
     });
+}
+
+test "Codex vision calls fail before provider access" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog = try makeVisionCatalog(alloc, tmp.dir, 1);
+    defer types.freeImageAttachmentSlice(alloc, catalog);
+    const provider_json = try visionProviderSuccess(alloc, &.{1});
+    defer alloc.free(provider_json);
+    const responses = [_]VisionGatewayResponse{.{ .content = provider_json }};
+    var fixture = VisionGatewayFixture{ .alloc = alloc, .responses = &responses };
+    defer fixture.deinit();
+    var rt = TestRuntime{
+        .provider = .codex,
+        .provider_capabilities = .{},
+        .agent_stream_provider = fixture.provider(),
+        .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
+        .session_allocator = alloc,
+    };
+    defer rt.deinit(alloc);
+    const args = try visionArgs(alloc, &.{1}, "Read the image");
+    defer alloc.free(args);
+
+    const result = try executeVisionForTest(&rt, alloc, args, catalog);
+    defer alloc.free(@constCast(result.model_output));
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try std.testing.expectEqualStrings("Unsupported tool: vision", result.model_output);
+    try std.testing.expectEqual(@as(usize, 0), fixture.call_count);
 }
 
 fn visionRequestAllocationCount(args_json: []const u8) !usize {
@@ -8893,7 +8472,6 @@ test "vision runtime resolves historical authorized images and batches twenty as
     try std.testing.expectEqualStrings("gateway-key", fixture.last_api_key);
     try std.testing.expectEqualStrings("team_vision", fixture.last_team.?);
     try std.testing.expectEqual(@as(usize, 2), fixture.last_retry_count);
-    try std.testing.expectEqualStrings("https://gateway.invalid/chat", fixture.last_chat_url);
     try expectContains(fixture.payloads.items[0], "Read the build state");
     try expectContains(fixture.payloads.items[0], "\"mediaType\":\"image/png\"");
     for (fixture.payloads.items) |payload| {

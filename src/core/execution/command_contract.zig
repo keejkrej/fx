@@ -23,6 +23,7 @@ pub const ForegroundCommandResult = struct {
     exit_code: ?i64 = null,
     signal: ?u32 = null,
     timed_out: bool = false,
+    termination_indeterminate: bool = false,
     duration_ms: ?u64 = null,
     stdout_bytes: usize = 0,
     stderr_bytes: usize = 0,
@@ -30,7 +31,6 @@ pub const ForegroundCommandResult = struct {
     output_file: ?[]const u8 = null,
     stdout_file: ?[]const u8 = null,
     stderr_file: ?[]const u8 = null,
-    sandbox_denied: bool = false,
 };
 
 pub const BackgroundCommandResult = struct {
@@ -73,6 +73,7 @@ pub const ForegroundCommandStatus = union(enum) {
     exit_code: i64,
     signal: u32,
     finished,
+    indeterminate,
 };
 
 pub const ForegroundCommandResultSnapshot = struct {
@@ -84,6 +85,12 @@ pub const ForegroundCommandResultSnapshot = struct {
     stdout_bytes: usize,
     stderr_bytes: usize,
     duration_ms: ?u64 = null,
+};
+
+pub const ForegroundStatusProjection = struct {
+    exit_code: ?i64,
+    signal: ?u32,
+    termination_indeterminate: bool,
 };
 
 pub fn formatForegroundCommandResult(
@@ -98,14 +105,16 @@ pub fn formatForegroundCommandResult(
 
     try writeForegroundStatusLine(&out.writer, snapshot.status);
     try writeForegroundOutputEnvelopes(&out.writer, stdout_text, stderr_text);
+    const status = projectForegroundStatus(snapshot.status);
 
     return .{
         .output = try out.toOwnedSlice(),
         .command_result = .{ .foreground = .{
             .command = snapshot.command,
             .cwd = snapshot.cwd,
-            .exit_code = foregroundExitCode(snapshot.status),
-            .signal = foregroundSignal(snapshot.status),
+            .exit_code = status.exit_code,
+            .signal = status.signal,
+            .termination_indeterminate = status.termination_indeterminate,
             .duration_ms = snapshot.duration_ms,
             .stdout_bytes = snapshot.stdout_bytes,
             .stderr_bytes = snapshot.stderr_bytes,
@@ -113,11 +122,15 @@ pub fn formatForegroundCommandResult(
     };
 }
 
-fn writeForegroundStatusLine(writer: *std.Io.Writer, status: ForegroundCommandStatus) !void {
+pub fn writeForegroundStatusLine(writer: *std.Io.Writer, status: ForegroundCommandStatus) !void {
     switch (status) {
         .exit_code => |code| try writer.print("exit_code={d}\n", .{code}),
         .signal => |signal| try writer.print("signal={d}\n", .{signal}),
         .finished => try writer.writeAll("process finished\n"),
+        .indeterminate => try writer.writeAll(
+            "termination_indeterminate=true\n" ++
+                "message=the command was started, but fx could not confirm its final process status; do not retry unchanged because side effects may already exist\n",
+        ),
     }
 }
 
@@ -137,17 +150,30 @@ fn writeForegroundOutputEnvelopes(writer: *std.Io.Writer, stdout_text: []const u
     }
 }
 
-fn foregroundExitCode(status: ForegroundCommandStatus) ?i64 {
+pub fn projectForegroundStatus(
+    status: ForegroundCommandStatus,
+) ForegroundStatusProjection {
     return switch (status) {
-        .exit_code => |code| code,
-        else => null,
-    };
-}
-
-fn foregroundSignal(status: ForegroundCommandStatus) ?u32 {
-    return switch (status) {
-        .signal => |signal| signal,
-        else => null,
+        .exit_code => |code| .{
+            .exit_code = code,
+            .signal = null,
+            .termination_indeterminate = false,
+        },
+        .signal => |signal| .{
+            .exit_code = null,
+            .signal = signal,
+            .termination_indeterminate = false,
+        },
+        .finished => .{
+            .exit_code = null,
+            .signal = null,
+            .termination_indeterminate = false,
+        },
+        .indeterminate => .{
+            .exit_code = null,
+            .signal = null,
+            .termination_indeterminate = true,
+        },
     };
 }
 
@@ -158,6 +184,9 @@ fn writeForegroundJson(result: ForegroundCommandResult, writer: *std.Io.Writer) 
     try writeOptionalIntField(writer, "exit_code", result.exit_code);
     try writeOptionalIntField(writer, "signal", result.signal);
     try writeBoolField(writer, "timed_out", result.timed_out);
+    if (result.termination_indeterminate) {
+        try writeBoolField(writer, "termination_indeterminate", true);
+    }
     try writeOptionalIntField(writer, "duration_ms", result.duration_ms);
     try writeIntField(writer, "stdout_bytes", result.stdout_bytes);
     try writeIntField(writer, "stderr_bytes", result.stderr_bytes);
@@ -165,7 +194,6 @@ fn writeForegroundJson(result: ForegroundCommandResult, writer: *std.Io.Writer) 
     try writeOptionalStringField(writer, "output_file", result.output_file);
     try writeOptionalStringField(writer, "stdout_file", result.stdout_file);
     try writeOptionalStringField(writer, "stderr_file", result.stderr_file);
-    try writeBoolField(writer, "sandbox_denied", result.sandbox_denied);
     try writer.writeByte('}');
 }
 
@@ -243,7 +271,7 @@ test "foreground result preserves envelopes metadata and json" {
     const json = try result.command_result.?.toJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"foreground\",\"command\":\"printf hello\",\"cwd\":\"/tmp\",\"exit_code\":7,\"signal\":null,\"timed_out\":false,\"duration_ms\":12,\"stdout_bytes\":7,\"stderr_bytes\":6,\"truncated\":false,\"output_file\":null,\"stdout_file\":null,\"stderr_file\":null,\"sandbox_denied\":false}",
+        "{\"kind\":\"foreground\",\"command\":\"printf hello\",\"cwd\":\"/tmp\",\"exit_code\":7,\"signal\":null,\"timed_out\":false,\"duration_ms\":12,\"stdout_bytes\":7,\"stderr_bytes\":6,\"truncated\":false,\"output_file\":null,\"stdout_file\":null,\"stderr_file\":null}",
         json,
     );
 }
@@ -260,4 +288,35 @@ test "foreground result preserves empty finished output" {
     });
     defer std.testing.allocator.free(result.output);
     try std.testing.expectEqualStrings("process finished\n(no output)\n", result.output);
+}
+
+test "foreground result represents indeterminate termination without implying no execution" {
+    const result = try formatForegroundCommandResult(std.testing.allocator, .{
+        .command = "printf effect > marker",
+        .cwd = "/tmp",
+        .status = .indeterminate,
+        .stdout_display = "observed output",
+        .stderr_display = "",
+        .stdout_bytes = 15,
+        .stderr_bytes = 0,
+    });
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(std.mem.find(
+        u8,
+        result.output,
+        "termination_indeterminate=true",
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "do not retry unchanged") != null);
+    const foreground = result.command_result.?.foreground;
+    try std.testing.expect(foreground.termination_indeterminate);
+    try std.testing.expectEqual(@as(?i64, null), foreground.exit_code);
+    try std.testing.expectEqual(@as(?u32, null), foreground.signal);
+    const json = try result.command_result.?.toJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(
+        u8,
+        json,
+        "\"termination_indeterminate\":true",
+    ) != null);
 }

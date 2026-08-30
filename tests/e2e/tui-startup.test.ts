@@ -40,10 +40,11 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 41", 5_000);
-      expect(pane).toContain("General");
+      const pane = await session.waitForText("Commands 36", 5_000);
+      expect(pane).toContain("[All]");
+      expect(pane).toContain("Tab Category");
       expect(pane).toContain("Enter Open");
-      expect(pane).not.toContain("Run /help for commands");
+      expect(pane).toContain("Run /help for commands");
     },
     TIMEOUT,
   );
@@ -62,6 +63,49 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
 });
 
 describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
+  test(
+    "statusline hides the workspace identity by default",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-statusline-default-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace-default-hidden");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(join(workspace, ".git"), { recursive: true });
+      writeFileSync(join(workspace, ".git", "HEAD"), "ref: refs/heads/default-hidden-branch\n");
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cwd: workspace,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_SKIP_ONBOARDING: "1",
+          },
+          stderrPath,
+          width: 100,
+          height: 30,
+        });
+
+        const pane = await session.waitForComposer(10_000);
+        expect(pane).not.toContain("workspace-default-hidden");
+        expect(pane).not.toContain("default-hidden-branch");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "/help keeps command descriptions close after a wide-to-narrow resize",
     async () => {
@@ -93,7 +137,8 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           (line) => line.includes("/help") && line.includes("show available slash commands"),
         );
         expect(wideHelp).toBeDefined();
-        expect(wideHelp!.indexOf("show available slash commands")).toBe(48);
+        const wideDescriptionColumn = wideHelp!.indexOf("show available slash commands");
+        expect(wideDescriptionColumn).toBe(18);
 
         await session.resizeWindow(60, 40);
         const narrow = await session.waitForPane(
@@ -106,7 +151,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           (line) => line.includes("/help") && line.includes("show available"),
         );
         expect(narrowHelp).toBeDefined();
-        expect(narrowHelp!.indexOf("show available")).toBe(40);
+        expect(narrowHelp!.indexOf("show available")).toBe(wideDescriptionColumn);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         if (session) {
@@ -128,10 +173,14 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       const workspace = join(repository, "packages", "status-root");
       const headPath = join(repository, ".git", "HEAD");
       const stderrPath = join(root, "stderr.log");
-      mkdirSync(home, { recursive: true });
+      mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(join(repository, ".git"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(headPath, "ref: refs/heads/initial-branch\n");
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        `${JSON.stringify({ statusLine: { workspace: true }, fast_mode: false })}\n`,
+      );
       writeFileSync(stderrPath, "");
 
       try {
@@ -320,7 +369,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
 
 describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
   test(
-    "/setup opens the four-action setup hub without source rows",
+    "/setup opens an inline status-first hub",
     async () => {
       const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-direct-setup-")));
       session = await TmuxSession.create({
@@ -339,14 +388,31 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
       const setup = await session.waitForPane(
         (pane) =>
           pane.includes("Setup") &&
-          pane.includes("Sign in with Vercel") &&
-          pane.includes("API key") &&
-          pane.includes("Change team") &&
-          pane.includes("Switch credential"),
+          pane.includes("Connections") &&
+          pane.includes("Model provider") &&
+          pane.includes("Vercel team") &&
+          pane.includes("Credential source") &&
+          pane.includes("Enter Open") &&
+          pane.includes("Esc Close"),
         TIMEOUT,
       );
       expect(setup).not.toContain("AI_GATEWAY_API_KEY");
       expect(setup).not.toContain("fx login");
+      expect(setup).not.toContain("Vercel account");
+      expect(setup).not.toContain("run /login");
+
+      for (let index = 0; index < 2; index += 1) {
+        await session.sendKeys("Down");
+      }
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (pane) => pane.includes("Credential source") && pane.includes("Automatic"),
+        TIMEOUT,
+      );
+      await session.sendKeys("Escape");
+      await session.waitForText("Setup", TIMEOUT);
+      await session.sendKeys("Escape");
+      await session.waitForComposer(TIMEOUT);
     },
     TIMEOUT,
   );

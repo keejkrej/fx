@@ -15,10 +15,21 @@ const runtime_config = @import("config.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 
 const Allocator = std.mem.Allocator;
+
+comptime {
+    std.debug.assert(command_replay_store.model_handle_notice_reserve_bytes < tool_result_limits.min_configured_tool_result_bytes);
+}
 const ChatMessage = types.ChatMessage;
 const ToolCall = types.ToolCall;
 const Config = runtime_config.Config;
 const ToolExecutionStatus = runtime_tool_contracts.ToolExecutionStatus;
+
+const steering_open = "<user_steering>\n";
+const steering_close = "\n</user_steering>";
+
+pub fn steeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, steering_open ++ "{s}" ++ steering_close, .{text});
+}
 
 pub fn persistedStatusForCurrentFxLocalResult(
     status: ToolExecutionStatus,
@@ -33,10 +44,34 @@ pub fn classifyProviderExecutedResultStatus(output: []const u8) types.PersistedT
 }
 
 pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMessage) !types.ExecutionMemory {
-    return execution_memory_helpers.buildNormalChatExecutionMemory(
+    var execution = try execution_memory_helpers.buildNormalChatExecutionMemory(
         alloc,
         within_turn_suffix,
     );
+    errdefer types.freeExecutionMemory(alloc, execution);
+
+    var steering: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (steering.items) |text| alloc.free(text);
+        steering.deinit(alloc);
+    }
+    for (within_turn_suffix) |message| {
+        if (message.role != .user) continue;
+        const content = message.content orelse continue;
+        const text = steeringText(content) orelse continue;
+        const copy = try alloc.dupe(u8, text);
+        steering.append(alloc, copy) catch |err| {
+            alloc.free(copy);
+            return err;
+        };
+    }
+    execution.steering = try steering.toOwnedSlice(alloc);
+    return execution;
+}
+
+fn steeringText(content: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, content, steering_open) or !std.mem.endsWith(u8, content, steering_close)) return null;
+    return content[steering_open.len .. content.len - steering_close.len];
 }
 
 pub fn buildInterruptedExecutionMemory(
@@ -125,6 +160,35 @@ pub fn buildInterruptedExecutionMemory(
     return buildExecutionMemory(alloc, filtered.items);
 }
 
+pub fn retainCancelledCommandReplay(
+    arena: Allocator,
+    result_memory: ?types.ToolResultMemory,
+    capture: ?*command_replay_store.Capture,
+) ?types.CancelledCommandPresentation {
+    if (capture) |candidate| {
+        const replay: ?types.CommandOutputReplay = switch (candidate.policy()) {
+            .required => blk: {
+                const descriptor = candidate.retainRequired(arena) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "cancelled command replay retention unavailable err={s}",
+                        .{@errorName(err)},
+                    );
+                    break :blk .unavailable;
+                } orelse break :blk null;
+                break :blk .{ .available = descriptor };
+            },
+            .best_effort => candidate.retain(arena),
+        };
+        if (replay) |retained| return .{ .output_replay = retained };
+    }
+    const replay = if (result_memory) |memory|
+        memory.command_output_replay
+    else
+        null;
+    return if (replay) |value| .{ .output_replay = value } else null;
+}
+
 test "interrupted execution memory retains marked feedback through mixed user tail" {
     const alloc = std.testing.allocator;
     var calls = [_]ToolCall{
@@ -137,7 +201,7 @@ test "interrupted execution memory retains marked feedback through mixed user ta
         .{ .role = .tool, .content = "first command completed", .tool_call_id = calls[0].id, .tool_name = calls[0].name, .tool_result_status = .success },
         .{ .role = .tool, .content = "second command completed", .tool_call_id = calls[1].id, .tool_name = calls[1].name, .tool_result_status = .success },
         .{ .role = .user, .content = "first command feedback marker", .tool_call_id = calls[0].id, .permission_feedback = true },
-        .{ .role = .user, .content = "sandbox hint", .permission_feedback = false },
+        .{ .role = .user, .content = "custom hint", .permission_feedback = false },
         .{ .role = .user, .content = "second command feedback marker", .tool_call_id = calls[1].id, .permission_feedback = true },
     };
 
@@ -163,8 +227,34 @@ fn hasToolResultForCall(
     return false;
 }
 
-pub fn prepareToolModelOutput(arena: Allocator, config: Config, tool_call: ToolCall, raw_output: []const u8) !result_store.PreparedResult {
-    if ((config.session_child_capability != null or config.tool_result_dir != null) and
+pub fn prepareToolModelOutput(
+    arena: Allocator,
+    config: Config,
+    tool_call: ToolCall,
+    raw_output: []const u8,
+) !result_store.PreparedResult {
+    return prepareCapturedToolModelOutput(
+        arena,
+        config,
+        tool_call,
+        raw_output,
+        null,
+    );
+}
+
+pub fn prepareCapturedToolModelOutput(
+    arena: Allocator,
+    config: Config,
+    tool_call: ToolCall,
+    raw_output: []const u8,
+    capture: ?*command_replay_store.Capture,
+) !result_store.PreparedResult {
+    const required_command_replay = if (capture) |candidate|
+        candidate.policy() == .required
+    else
+        false;
+    if (!required_command_replay and
+        (config.session_child_capability != null or config.tool_result_dir != null) and
         raw_output.len > result_store.large_result_threshold_bytes)
     {
         const redacted_output = try execution_memory_helpers.redactText(
@@ -192,11 +282,15 @@ pub fn prepareToolModelOutput(arena: Allocator, config: Config, tool_call: ToolC
             config.max_tool_result_bytes,
         );
     }
+    const model_output_budget = if (required_command_replay)
+        config.max_tool_result_bytes -| command_replay_store.model_handle_notice_reserve_bytes
+    else
+        config.max_tool_result_bytes;
     const safe_output = try tool_result_limits.prepareModelOutput(
         arena,
         tool_call.name,
         raw_output,
-        config.max_tool_result_bytes,
+        model_output_budget,
     );
     return .{
         .model_output = safe_output,
@@ -215,6 +309,7 @@ pub fn applyToolResultMemory(
     const source_memory = source orelse return;
     prepared.command_output_replay = source_memory.command_output_replay;
     prepared.command_process_presentation = source_memory.command_process_presentation;
+    prepared.terminal_action_presentation = source_memory.terminal_action_presentation;
     const source_covers_full_file =
         source_memory.model_view_covers_full_file orelse return;
     prepared.model_view_covers_full_file =
@@ -225,27 +320,32 @@ pub fn applyToolResultMemory(
         prepared.output_handle == null;
 }
 
-/// Consumes a tentative interactive command capture after ordinary result
-/// storage has selected the exact source that completed Ctrl-O and resume will
-/// read. Exact round trips delete the candidate; every unprovable case keeps a
-/// private tagged replay descriptor.
+/// Finalizes tentative command capture after bounded model output is prepared.
+/// Required native exec always retains one authoritative replay and publishes
+/// its handle; legacy exact round trips keep the existing discard optimization.
 pub fn finalizeCommandReplay(
     arena: Allocator,
     tool_call: ToolCall,
     prepared: *result_store.PreparedResult,
     session_child_capability: ?*session_child_store.SessionChildCapability,
     capture: ?*command_replay_store.Capture,
-) void {
+) !void {
     const candidate = capture orelse return;
-    if (!isCapturedCommandCall(arena, tool_call)) {
-        candidate.abort(arena);
-        return;
-    }
     if (!candidate.hasOutput()) {
         candidate.discard(arena);
         return;
     }
-
+    if (candidate.policy() == .required) {
+        const descriptor = (try candidate.retainRequired(arena)) orelse return;
+        prepared.memory.command_output_replay = .{ .available = descriptor };
+        prepared.model_output = try command_replay_store.appendModelHandleNotice(
+            arena,
+            prepared.model_output,
+            descriptor.handle,
+        );
+        prepared.memory.stored_output_bytes = prepared.model_output.len;
+        return;
+    }
     var captured = candidate.canonicalizeForComparison(arena) catch |err| {
         debug_trace.logf(
             "session",
@@ -300,16 +400,6 @@ pub fn finalizeCommandReplay(
         return;
     }
     retainCommandReplay(arena, candidate, &prepared.memory);
-}
-
-fn isCapturedCommandCall(arena: Allocator, call: ToolCall) bool {
-    if (std.mem.eql(u8, call.name, "run_command")) return true;
-    if (!std.mem.eql(u8, call.name, "terminal")) return false;
-    var parsed = std.json.parseFromSlice(std.json.Value, arena, call.arguments_json, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const action = parsed.value.object.get("action") orelse return false;
-    return action == .string and std.mem.eql(u8, action.string, "exec");
 }
 
 fn selectedCommandSource(
@@ -428,6 +518,7 @@ test "command sidebands merge without file-view metadata" {
     applyToolResultMemory(&prepared, .{
         .command_output_replay = .unavailable,
         .command_process_presentation = .{ .signal = 9 },
+        .terminal_action_presentation = .{ .returned = .safety_ceiling },
     });
     switch (prepared.command_output_replay.?) {
         .unavailable => {},
@@ -436,6 +527,10 @@ test "command sidebands merge without file-view metadata" {
     try std.testing.expectEqual(
         types.CommandProcessPresentation{ .signal = 9 },
         prepared.command_process_presentation.?,
+    );
+    try std.testing.expectEqual(
+        types.TerminalActionPresentation{ .returned = .safety_ceiling },
+        prepared.terminal_action_presentation.?,
     );
     try std.testing.expect(prepared.model_view_covers_full_file == null);
 }
@@ -486,7 +581,7 @@ test "exact command sources delete replay and missing handles retain it" {
             .stored_output_bytes = 42,
         },
     };
-    finalizeCommandReplay(
+    try finalizeCommandReplay(
         arena,
         toolCall("command_exact", "run_command", "{}"),
         &prepared,
@@ -515,22 +610,22 @@ test "exact command sources delete replay and missing handles retain it" {
     stored_capture.setComparisonLimit(body.items.len);
     stored_capture.appendAccepted(arena, .stdout, body.items);
     stored_capture.seal(arena);
-    var stored_prepared = try prepareToolModelOutput(
+    var stored_prepared = try prepareCapturedToolModelOutput(
         arena,
         .{
             .system_prompt = "",
             .gateway_retry_count = 0,
             .gateway_chat_url = "",
-            .gateway_tools_json = "[]",
             .agent_step_limit = 1,
             .cancel_flag = &cancel_flag,
             .session_child_capability = &capability,
         },
         toolCall("command_stored_exact", "run_command", "{}"),
         stored_source,
+        stored_capture,
     );
     try std.testing.expect(stored_prepared.memory.output_handle != null);
-    finalizeCommandReplay(
+    try finalizeCommandReplay(
         arena,
         toolCall("command_stored_exact", "run_command", "{}"),
         &stored_prepared,
@@ -573,7 +668,7 @@ test "exact command sources delete replay and missing handles retain it" {
                 .stored_output_bytes = projected_source.len,
             },
         };
-        finalizeCommandReplay(
+        try finalizeCommandReplay(
             arena,
             toolCall("command_transformed", "run_command", "{}"),
             &transformed_prepared,
@@ -605,7 +700,7 @@ test "exact command sources delete replay and missing handles retain it" {
             .stored_output_bytes = 40,
         },
     };
-    finalizeCommandReplay(
+    try finalizeCommandReplay(
         arena,
         toolCall("command_literal", "run_command", "{}"),
         &literal_prepared,
@@ -633,7 +728,7 @@ test "exact command sources delete replay and missing handles retain it" {
             .truncated = true,
         },
     };
-    finalizeCommandReplay(
+    try finalizeCommandReplay(
         arena,
         toolCall("command_missing", "run_command", "{}"),
         &missing_prepared,
@@ -649,6 +744,142 @@ test "exact command sources delete replay and missing handles retain it" {
     var after_missing = try capability.iterate(alloc, .command_artifacts);
     defer after_missing.deinit();
     try std.testing.expectEqual(transform_cases.len + 1, after_missing.names.len);
+}
+
+test "required terminal exec retains exact replay and publishes its handle" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const display_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(display_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        display_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const capture = try command_replay_store.Capture.create(arena, 64 * 1024, &capability);
+    capture.setPolicyBeforeCapture(.required);
+    capture.appendAccepted(arena, .stdout, "one\n");
+    capture.seal(arena);
+    var prepared = result_store.PreparedResult{
+        .model_output = "exit_code=0\n<stdout>\none\n</stdout>\n",
+        .memory = .{
+            .output_bytes = 42,
+            .stored_output_bytes = 42,
+        },
+    };
+
+    try finalizeCommandReplay(
+        arena,
+        toolCall(
+            "terminal_exact",
+            "terminal",
+            "{\"action\":\"exec\",\"command\":\"printf one\",\"timeout_ms\":600000}",
+        ),
+        &prepared,
+        &capability,
+        capture,
+    );
+
+    const replay = prepared.memory.command_output_replay orelse
+        return error.TestExpectedReplay;
+    const descriptor = switch (replay) {
+        .available => |value| value,
+        .unavailable => return error.TestExpectedReplay,
+    };
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, descriptor.handle) != null);
+    capture.releaseRetained(arena);
+}
+
+test "required terminal exec stores large output only as replay" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const display_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(display_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        display_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    const body = try arena.alloc(u8, result_store.large_result_threshold_bytes + 1024);
+    @memset(body, 'x');
+    const raw_output = try std.fmt.allocPrint(
+        arena,
+        "exit_code=0\n<stdout>\n{s}\n</stdout>\n",
+        .{body},
+    );
+    const tool_call = toolCall(
+        "terminal_large",
+        "terminal",
+        "{}",
+    );
+    const capture = try command_replay_store.Capture.create(arena, 1024, &capability);
+    capture.setPolicyBeforeCapture(.required);
+    try capture.appendAcceptedRequired(arena, .stdout, body);
+    var prepared = try prepareCapturedToolModelOutput(arena, .{
+        .system_prompt = "",
+        .gateway_retry_count = 0,
+        .gateway_chat_url = "",
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
+        .cancel_flag = &cancel,
+        .session_child_capability = &capability,
+    }, tool_call, raw_output, capture);
+    try std.testing.expect(prepared.memory.output_handle == null);
+    try finalizeCommandReplay(
+        arena,
+        tool_call,
+        &prepared,
+        &capability,
+        capture,
+    );
+    defer capture.releaseRetained(arena);
+    try std.testing.expect(
+        prepared.model_output.len <= tool_result_limits.min_configured_tool_result_bytes,
+    );
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, "<command_output_handle>") != null);
+
+    var command_artifacts = try capability.iterate(alloc, .command_artifacts);
+    defer command_artifacts.deinit();
+    try std.testing.expectEqual(@as(usize, 1), command_artifacts.names.len);
+    var tool_results = try capability.iterate(alloc, .tool_results);
+    defer tool_results.deinit();
+    try std.testing.expectEqual(@as(usize, 0), tool_results.names.len);
 }
 
 test "common execution memory does not mark stored read previews as full" {
@@ -675,7 +906,6 @@ test "common execution memory does not mark stored read previews as full" {
             .system_prompt = "",
             .gateway_retry_count = 0,
             .gateway_chat_url = "",
-            .gateway_tools_json = "[]",
             .agent_step_limit = 1,
             .cancel_flag = &cancel_flag,
             .tool_result_dir = result_dir,
@@ -786,7 +1016,6 @@ test "large result storage redacts secret-bearing output before preview and disk
         .system_prompt = "",
         .gateway_retry_count = 0,
         .gateway_chat_url = "",
-        .gateway_tools_json = "[]",
         .agent_step_limit = 1,
         .cancel_flag = &cancel_flag,
         .tool_result_dir = dir,
@@ -800,6 +1029,23 @@ test "large result storage redacts secret-bearing output before preview and disk
     defer alloc.free(stored);
     try std.testing.expect(std.mem.find(u8, stored, "super-secret-value") == null);
     try std.testing.expect(std.mem.find(u8, stored, "api_key=[redacted]") != null);
+}
+
+test "execution memory persists consumed steering without protocol wrappers" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "ordinary user context" },
+        .{ .role = .user, .content = "<user_steering>\nfocus on rendering\n</user_steering>" },
+        .{ .role = .assistant, .content = "continuing" },
+        .{ .role = .user, .content = "<user_steering>\nrun the focused test\n</user_steering>" },
+    };
+
+    const execution = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, execution);
+
+    try std.testing.expectEqual(@as(usize, 2), execution.steering.len);
+    try std.testing.expectEqualStrings("focus on rendering", execution.steering[0]);
+    try std.testing.expectEqualStrings("run the focused test", execution.steering[1]);
 }
 
 test "transcript does not mark native web_search as provider resource placeholder" {

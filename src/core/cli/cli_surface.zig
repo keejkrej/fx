@@ -4,16 +4,21 @@ const io_mod = @import("../shared/io.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const background_record_liveness = @import("../background/background_record_liveness.zig");
 const background_store = @import("../background/background_store.zig");
+const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
+const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
-const devbox_executor = @import("../execution/devbox_executor.zig");
+const credentials = @import("../auth/credentials.zig");
+const model_provider = @import("../config/model_provider.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const provider_set = @import("../gateway/provider_set.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -22,13 +27,12 @@ const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
+const provider_catalog = @import("../auth/provider_catalog.zig");
 const secret = @import("../auth/secret.zig");
 const providers_config = @import("../providers/config.zig");
 const openai_secret = @import("../providers/openai_secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
-const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const session_store = @import("../session/session_store.zig");
 const usage_report = @import("../session/usage_report.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
@@ -41,7 +45,12 @@ else
 const context_contract = @import("../workspace/context_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
+const mcp_command_provider = @import("../mcp/command_provider.zig");
+const mcp_health = @import("../mcp/health.zig");
+const project_config = @import("../mcp/project_config.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const text_utils = @import("../shared/text_utils.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
@@ -63,7 +72,9 @@ pub const Command = union(enum) {
     setup: []const [:0]const u8,
     status: []const [:0]const u8,
     permissions: []const [:0]const u8,
+    mcp: []const [:0]const u8,
     models: []const [:0]const u8,
+    provider: []const [:0]const u8,
     doctor: []const [:0]const u8,
     background: []const [:0]const u8,
     teams: []const [:0]const u8,
@@ -173,6 +184,7 @@ pub const Config = struct {
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
     gateway_provider: gateway_provider.Provider,
+    provider_set: provider_set.Set,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
@@ -191,15 +203,37 @@ pub const Config = struct {
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
+    inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
+        mcp_health.inspectLocalConfigUnavailable,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
+        mcp_command_provider.addProfileServerUnavailable,
+    remove_mcp_profile_server: mcp_command_provider.RemoveProfileServerFn =
+        mcp_command_provider.removeProfileServerUnavailable,
     acp_runner: acp_runner.Runner,
-    devbox_provider: ?devbox_executor.Provider = null,
-    permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
 };
 
 const LocalSurfaceOptions = struct {
     format: output_contracts.OutputFormat = .text,
 };
+
+fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
+    if (rest.len == 0) return null;
+    if (rest.len != 1) return error.InvalidLoginProviderArgs;
+    return provider_catalog.parse(rest[0]) orelse error.InvalidLoginProviderArgs;
+}
+
+fn selectCatalogModel(
+    entries: []const model_catalog.ModelCatalogEntry,
+    saved: ?[]const u8,
+) ?[]const u8 {
+    if (saved) |candidate| {
+        for (entries) |entry| {
+            if (std.mem.eql(u8, entry.id, candidate)) return entry.id;
+        }
+    }
+    return if (entries.len > 0) entries[0].id else null;
+}
 
 const UpgradeOptions = struct {
     format: output_contracts.OutputFormat = .text,
@@ -397,21 +431,26 @@ fn parseGlobalLaunchArgs(
 /// Startup uses this same surface to select the full runtime configuration
 /// before the allocating parser runs.
 pub fn commandAfterGlobalLaunchArgs(args: []const [:0]const u8) ?[]const u8 {
+    const remaining = argsAfterGlobalLaunchArgs(args);
+    return if (remaining.len > 0) remaining[0] else null;
+}
+
+pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u8 {
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
             index += 1;
-            if (index >= args.len) return null;
+            if (index >= args.len) return &.{};
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs"))
         {
-            return arg;
+            return args[index..];
         }
         index += 1;
     }
-    return null;
+    return &.{};
 }
 
 pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Command {
@@ -454,11 +493,13 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .logout)) return .{ .logout = args[1..] };
         },
         'm' => {
+            if (command_specs.matchesTopLevel(command_catalog, command, .mcp)) return .{ .mcp = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .models)) return .{ .models = args[1..] };
         },
         'p' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .pr)) return .{ .pr = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .permissions)) return .{ .permissions = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .provider)) return .{ .provider = args[1..] };
         },
         'r' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .@"resume")) return .{ .resume_session = .{ .args = args[1..] } };
@@ -614,6 +655,170 @@ fn runNoConfigIfRequestedWithDeps(
     return true;
 }
 
+const ProviderActivationCaller = enum {
+    provider_command,
+    provider_login,
+};
+
+fn writeProviderActivationError(
+    alloc: Allocator,
+    deps: RunDeps,
+    caller: ProviderActivationCaller,
+    detail: []const u8,
+) !void {
+    const message = try std.fmt.allocPrint(
+        alloc,
+        "{s}: {s}\n",
+        .{ if (caller == .provider_login) "fx login" else "fx provider", detail },
+    );
+    defer alloc.free(message);
+    try writeStderr(deps, message);
+}
+
+fn activateProviderSelection(
+    alloc: Allocator,
+    cfg: Config,
+    deps: RunDeps,
+    target: model_provider.ProviderId,
+    caller: ProviderActivationCaller,
+) !bool {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    var settings = config_runtime.loadMergedSettings(alloc, workspace_root) catch |err| {
+        try writeProviderActivationError(alloc, deps, caller, "could not load settings");
+        debug_trace.logf("config", "provider selection settings load failed err={s}", .{@errorName(err)});
+        return false;
+    };
+    defer settings.deinit(alloc);
+
+    var resolution = try credentials.resolveForProvider(
+        alloc,
+        cfg.gateway_provider.oauth_transport,
+        cfg.secret_store,
+        .refresh_if_needed,
+        target,
+        settings.credential_source,
+    );
+    defer if (resolution.credential) |*credential| credential.deinit(alloc);
+
+    const already_selected = (settings.provider orelse .gateway) == target;
+    if (caller == .provider_command and already_selected and resolution.credential != null) {
+        try writeStdout(deps, switch (target) {
+            .gateway => "Gateway is already selected.\n",
+            .codex => "Codex is already selected.\n",
+            .grok => "Grok is already selected.\n",
+        });
+        return true;
+    }
+
+    var performed_login: ?model_provider.ProviderId = null;
+    if (resolution.credential == null and target == .codex and caller == .provider_command) {
+        chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
+            debug_trace.logf("auth", "provider selection Codex login failed err={s}", .{@errorName(err)});
+            try writeProviderActivationError(alloc, deps, caller, "Codex login failed");
+            return false;
+        };
+        performed_login = .codex;
+        resolution = try credentials.resolveForProvider(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            .refresh_if_needed,
+            target,
+            settings.credential_source,
+        );
+    }
+    if (resolution.credential == null and target == .grok and caller == .provider_command) {
+        grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
+            debug_trace.logf("auth", "provider selection Grok login failed err={s}", .{@errorName(err)});
+            try writeProviderActivationError(alloc, deps, caller, "Grok login failed");
+            return false;
+        };
+        performed_login = .grok;
+        resolution = try credentials.resolveForProvider(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            .refresh_if_needed,
+            target,
+            settings.credential_source,
+        );
+    }
+
+    const credential = if (resolution.credential) |*value| value else {
+        try writeProviderActivationError(
+            alloc,
+            deps,
+            caller,
+            switch (target) {
+                .codex => "Codex credential is unavailable",
+                .grok => "Grok credential is unavailable",
+                .gateway => "configure a Gateway credential first",
+            },
+        );
+        return false;
+    };
+    const catalog_provider = cfg.provider_set.select(target).model_catalog orelse {
+        try writeProviderActivationError(alloc, deps, caller, switch (target) {
+            .codex => "Codex model catalog is unavailable",
+            .grok => "Grok model catalog is unavailable",
+            .gateway => "Gateway model catalog is unavailable",
+        });
+        return false;
+    };
+    const fetch_result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
+        .access = credentials.catalogAccessAt(credential.*, io_mod.milliTimestamp()),
+        .endpoint = cfg.models_path,
+        .view = .picker,
+    });
+    var loaded = switch (fetch_result) {
+        .loaded => |loaded| loaded,
+        .failed => |failure| {
+            debug_trace.logf("catalog", "provider selection catalog failed provider={s} category={s}", .{ @tagName(target), @tagName(failure.failure.category) });
+            const detail = try std.fmt.allocPrint(
+                alloc,
+                "could not load the target model catalog ({s})",
+                .{@tagName(failure.failure.category)},
+            );
+            defer alloc.free(detail);
+            try writeProviderActivationError(alloc, deps, caller, detail);
+            return false;
+        },
+    };
+    defer model_catalog.freeModelCatalog(alloc, &loaded.catalog);
+    const saved_model = settings.models.get(target);
+    const selected_model = selectCatalogModel(loaded.catalog.items, saved_model) orelse {
+        try writeProviderActivationError(alloc, deps, caller, "target model catalog is empty");
+        return false;
+    };
+    var attempt = config_runtime.attemptUserPreferences(alloc, .{
+        .provider = target,
+        .model_preference = .{ .provider = target, .model = selected_model },
+    });
+    defer attempt.deinit(alloc);
+    switch (attempt) {
+        .failure => |failure| {
+            debug_trace.logf("config", "provider selection persistence failed err={s}", .{@errorName(failure.err)});
+            try writeProviderActivationError(alloc, deps, caller, "failed to save provider selection");
+            return false;
+        },
+        .outcome => {},
+    }
+    if (performed_login) |provider| switch (provider) {
+        .codex => try writeStdout(deps, "Signed in with Codex.\n"),
+        .grok => try writeStdout(deps, "Signed in with Grok.\n"),
+        .gateway => unreachable,
+    };
+    if (caller == .provider_command) {
+        try writeStdout(deps, switch (target) {
+            .gateway => "Provider set to Gateway.\n",
+            .codex => "Provider set to Codex.\n",
+            .grok => "Provider set to Grok.\n",
+        });
+    }
+    return true;
+}
+
 fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
     const parsed_launch = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch |err| {
         if (err == error.RecordModifierRequiresInteractive) {
@@ -636,7 +841,10 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         return .handled_failure;
     };
     switch (parsed_launch) {
-        .interactive => |launch| return .{ .interactive = launch },
+        .interactive => |launch| {
+            try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
+            return .{ .interactive = launch };
+        },
         .noninteractive => |value| {
             var noninteractive = value;
             defer noninteractive.deinit(alloc);
@@ -686,6 +894,7 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .ask => |rest| {
+            try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
             const exit_code = try cli_ask.run(alloc, rest, workflowConfigWithLaunchModifiers(cfg, global_args.modifiers), cfg.context_registry, cfg.tool_set);
             return if (exit_code == 0) .handled_success else .handled_failure;
         },
@@ -701,6 +910,7 @@ fn runNonInteractiveWithDeps(
                 .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
                 .gateway_models_path = cfg.models_path,
                 .gateway_provider = cfg.gateway_provider,
+                .provider_set = cfg.provider_set,
                 .background_process_provider = cfg.background_process_provider,
                 .secret_store = cfg.secret_store,
                 .prompt_policy = cfg.prompt_policy,
@@ -714,8 +924,6 @@ fn runNonInteractiveWithDeps(
                 .max_history_turns = cfg.max_history_turns,
                 .context_registry = cfg.context_registry,
                 .mode_registry = cfg.mode_registry,
-                .devbox_provider = cfg.devbox_provider,
-                .permission_reviewer_provider = cfg.permission_reviewer_provider,
                 .context_limit_overrides = global_args.modifiers.context_limit_overrides,
                 .additional_directories = global_args.modifiers.additional_directories,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
@@ -727,39 +935,122 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
-            if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx login\n");
-                return .handled_failure;
-            }
-            login_flow.runLogin(
-                alloc,
-                cfg.gateway_provider.oauth_transport,
-                cfg.url_opener,
-            ) catch |err| {
-                const message = switch (err) {
-                    error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
-                    error.AccessDenied => "fx login: authorization denied\n",
-                    error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
-                    else => "fx login: failed to sign in\n",
-                };
-                try writeStderr(deps, message);
+            const maybe_login_provider = parseLoginProvider(rest) catch {
+                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
                 return .handled_failure;
             };
+            // Preserve the original `fx login` behavior for scripts and users.
+            const login_provider = maybe_login_provider orelse .gateway;
+            switch (login_provider) {
+                .gateway => login_flow.runLogin(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.url_opener,
+                ) catch |err| {
+                    const message = switch (err) {
+                        error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
+                        error.AccessDenied => "fx login: authorization denied\n",
+                        error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
+                        else => "fx login: failed to sign in\n",
+                    };
+                    try writeStderr(deps, message);
+                    return .handled_failure;
+                },
+                .codex => {
+                    chatgpt_oauth.runLogin(
+                        alloc,
+                        cfg.gateway_provider.oauth_transport,
+                        cfg.url_opener,
+                    ) catch |err| {
+                        const message = switch (err) {
+                            error.ChatGptLoginTimedOut => "fx login: Codex authorization expired; run fx login codex again\n",
+                            error.ChatGptAuthorizationFailed => "fx login: Codex authorization denied\n",
+                            else => "fx login: failed to sign in with Codex\n",
+                        };
+                        try writeStderr(deps, message);
+                        return .handled_failure;
+                    };
+                    if (!try activateProviderSelection(alloc, cfg, deps, .codex, .provider_login)) {
+                        return .handled_failure;
+                    }
+                    try writeStdout(deps, "Signed in with Codex.\n");
+                },
+                .grok => {
+                    grok_oauth.runLogin(
+                        alloc,
+                        cfg.gateway_provider.oauth_transport,
+                        cfg.url_opener,
+                    ) catch |err| {
+                        debug_trace.logf("auth", "Grok login failed err={s}", .{@errorName(err)});
+                        try writeStderr(deps, "fx login: failed to sign in with Grok\n");
+                        return .handled_failure;
+                    };
+                    if (!try activateProviderSelection(alloc, cfg, deps, .grok, .provider_login)) {
+                        return .handled_failure;
+                    }
+                    try writeStdout(deps, "Signed in with Grok.\n");
+                },
+            }
             return .handled_success;
         },
         .logout => |rest| {
-            if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx logout\n");
+            const maybe_login_provider = parseLoginProvider(rest) catch {
+                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
                 return .handled_failure;
+            };
+            // Preserve the original `fx logout` behavior for scripts and users.
+            const login_provider = maybe_login_provider orelse .gateway;
+            if (login_provider == .codex) {
+                const outcome = chatgpt_oauth.logout() catch {
+                    try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
+                    return .handled_failure;
+                };
+                return switch (outcome) {
+                    .deleted => result: {
+                        try writeStdout(deps, "Signed out of Codex.\n");
+                        break :result .handled_success;
+                    },
+                    .missing => result: {
+                        try writeStdout(deps, "No Codex login session found.\n");
+                        break :result .handled_success;
+                    },
+                    .deleted_not_durable => result: {
+                        try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
+                        break :result .handled_failure;
+                    },
+                };
+            }
+            if (login_provider == .grok) {
+                const outcome = grok_oauth.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
+                    try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
+                    return .handled_failure;
+                };
+                if (outcome.revocation_failed) {
+                    try writeStderr(deps, "fx logout: local Grok session removed, but remote revocation could not be confirmed\n");
+                }
+                return switch (outcome.deletion) {
+                    .deleted => result: {
+                        try writeStdout(deps, "Signed out of Grok.\n");
+                        break :result .handled_success;
+                    },
+                    .missing => result: {
+                        try writeStdout(deps, "No Grok login session found.\n");
+                        break :result .handled_success;
+                    },
+                    .deleted_not_durable => result: {
+                        try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
+                        break :result .handled_failure;
+                    },
+                };
             }
             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
+                    try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
                     return .handled_failure;
                 },
             };
             if (result.local_durability_failed) {
-                try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
+                try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
             } else {
                 try writeStdout(
                     deps,
@@ -791,6 +1082,20 @@ fn runNonInteractiveWithDeps(
             };
             return .handled_success;
         },
+        .provider => |rest| {
+            if (rest.len != 1) {
+                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                return .handled_failure;
+            }
+            const target = model_provider.parse(rest[0]) orelse {
+                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                return .handled_failure;
+            };
+            return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command))
+                .handled_success
+            else
+                .handled_failure;
+        },
         .setup => |rest| {
             if (rest.len == 0 or (rest.len == 1 and std.mem.eql(u8, rest[0], "openai-compatible"))) {
                 return if (try runOpenaiCompatibleSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
@@ -811,13 +1116,18 @@ fn runNonInteractiveWithDeps(
             );
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
-            const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
+            var mcp_inspection = try cfg.inspect_mcp_local_config(
+                alloc,
+                startup.workspace_root,
+            );
+            defer mcp_inspection.deinit(alloc);
 
-            const snapshot = statusSnapshotFromStartupWithBuild(startup, .{
+            var snapshot = statusSnapshotFromStartupWithBuild(startup, .{
                 .channel = cfg.build_channel,
                 .version = cfg.version,
                 .revision = cfg.revision,
-            }, mcp_config_diagnostic);
+            }, mcp_inspection.profile_diagnostic);
+            snapshot.mcp = localMcpView(&mcp_inspection);
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -850,6 +1160,9 @@ fn runNonInteractiveWithDeps(
             try writeFormattedOutput(deps, text, opts.format);
             return .handled_success;
         },
+        .mcp => |rest| {
+            return runTopLevelMcp(alloc, rest, cfg, deps);
+        },
         .models => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .models, "models", err, rest);
@@ -866,7 +1179,15 @@ fn runNonInteractiveWithDeps(
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
             const catalog_access = startup.modelCatalogAccess();
-            const loaded = switch (cfg.gateway_provider.cli_model_catalog.fetch(alloc, .{
+            const catalog_provider = cfg.provider_set.select(startup.provider).cli_model_catalog orelse {
+                try writeStderr(deps, switch (startup.provider) {
+                    .gateway => "fx models: Gateway model catalog is unavailable\n",
+                    .codex => "fx models: Codex model catalog is unavailable\n",
+                    .grok => "fx models: Grok model catalog is unavailable\n",
+                });
+                return .handled_failure;
+            };
+            const loaded = switch (catalog_provider.fetch(alloc, .{
                 .access = catalog_access,
                 .endpoint = cfg.models_path,
             })) {
@@ -900,6 +1221,7 @@ fn runNonInteractiveWithDeps(
 
             const text = try (output_contracts.ModelListSnapshot{
                 .ids = ids.items,
+                .provider = startup.provider,
                 .private_models_hidden = loaded.provenance.access.private_models_may_be_hidden,
                 .public_only_reason = loaded.provenance.access.public_only_reason,
             }).render(alloc, opts.format);
@@ -913,17 +1235,24 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
 
-            const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
+            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+            defer alloc.free(workspace_root);
+            var mcp_inspection = try cfg.inspect_mcp_local_config(
+                alloc,
+                workspace_root,
+            );
+            defer mcp_inspection.deinit(alloc);
             var snapshot = try doctor_runtime.collect(
                 alloc,
                 cfg.secret_store,
                 cfg.default_model,
                 cfg.default_agent_step_limit,
-                mcp_config_diagnostic,
+                mcp_inspection.profile_diagnostic,
             );
             defer snapshot.deinit(alloc);
 
-            const output_snapshot = doctorSnapshotFromRuntime(snapshot);
+            var output_snapshot = doctorSnapshotFromRuntime(snapshot);
+            output_snapshot.mcp = localMcpView(&mcp_inspection);
             if (opts.format == .json) {
                 try writeDoctorJsonLine(alloc, deps, output_snapshot);
                 return .handled_success;
@@ -1268,8 +1597,11 @@ fn runNonInteractiveWithDeps(
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
-            var snapshot = cfg.gateway_provider.credits.fetch(alloc, .{
+            const credits = cfg.provider_set.select(startup.provider).credits orelse
+                gateway_provider.unavailable_credits_provider;
+            var snapshot = credits.fetch(alloc, .{
                 .credential = startup.apiKey(),
+                .credential_source = if (startup.credential) |credential| credential.source else null,
                 .tenant = startup.gatewayTeam(),
             });
             defer snapshot.deinit(alloc);
@@ -1794,13 +2126,10 @@ fn statusSnapshotFromStartupWithBuild(
 ) output_contracts.StatusSnapshot {
     return .{
         .model = startup.selected_model,
+        .provider = startup.provider,
         .auth = startup.auth,
         .auth_help = startup.auth.missingHelp(.cli),
         .permission_mode = permissionModeForSnapshot(startup.permission_mode),
-        .sandbox_backend = sandbox.effectiveBackend(
-            startup.permission_mode,
-            startup.sandbox_backend,
-        ),
         .workspace_root = startup.workspace_root,
         .history_turns = 0,
         .session_permission_grants = 0,
@@ -1809,8 +2138,12 @@ fn statusSnapshotFromStartupWithBuild(
         .build_channel = build.channel.label(),
         .build_revision = build.revision,
         .mcp_config_error = switch (mcp_config_diagnostic) {
-            .clear => null,
+            .clear, .warning => null,
             .failed => |err| @errorName(err),
+        },
+        .mcp_config_warning = switch (mcp_config_diagnostic) {
+            .warning => |warning| warning,
+            .clear, .failed => null,
         },
     };
 }
@@ -1824,6 +2157,7 @@ fn doctorSnapshotFromRuntime(snapshot: doctor_runtime.Snapshot) output_contracts
     return .{
         .workspace_root = snapshot.workspace_root,
         .model = snapshot.model,
+        .provider = snapshot.provider,
         .auth = snapshot.auth,
         .permission_mode = permissionModeForSnapshot(snapshot.permission_mode),
         .agent_step_limit = snapshot.agent_step_limit,
@@ -1873,6 +2207,439 @@ fn writeTopLevelUsage(command_catalog: CommandCatalog, deps: RunDeps, kind: TopL
     try writeStderr(deps, "usage: fx ");
     try writeStderr(deps, command_specs.topLevelUsage(command_catalog, kind));
     try writeStderr(deps, "\n");
+}
+
+const McpCommandRuntime = struct {
+    startup: app_lifecycle.StartupState,
+    runtime: ?*mcp_runtime.McpRuntime,
+
+    fn deinit(self: *McpCommandRuntime, alloc: Allocator) void {
+        if (self.runtime) |runtime| {
+            runtime.deinit();
+            alloc.destroy(runtime);
+        }
+        self.startup.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn localMcpView(
+    inspection: *const mcp_health.LocalConfigInspection,
+) output_contracts.McpLocalSnapshot {
+    return .{
+        .servers = inspection.snapshot.servers,
+        .configuration_issues = inspection.snapshot.configuration_issues,
+        .inspection_error = inspection.inspection_error,
+    };
+}
+
+fn loadMcpCommandRuntime(
+    alloc: Allocator,
+    cfg: Config,
+    deps: RunDeps,
+) !McpCommandRuntime {
+    var startup = try deps.load_startup_state_without_credentials(
+        alloc,
+        cfg.default_model,
+        cfg.default_agent_step_limit,
+    );
+    errdefer startup.deinit(alloc);
+    const runtime = try cfg.load_mcp_runtime(
+        alloc,
+        startup.workspace_root,
+        .{ .form = true, .url = true },
+    );
+    return .{ .startup = startup, .runtime = runtime };
+}
+
+fn runTopLevelMcp(
+    alloc: Allocator,
+    rest: []const [:0]const u8,
+    cfg: Config,
+    deps: RunDeps,
+) !RunResult {
+    if (rest.len == 0) {
+        try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+        return .handled_failure;
+    }
+    const operation = rest[0];
+    if (std.mem.eql(u8, operation, "add")) {
+        var tokens: std.ArrayList([]const u8) = .empty;
+        defer tokens.deinit(alloc);
+        try tokens.ensureTotalCapacity(alloc, rest.len - 1);
+        for (rest[1..]) |token| tokens.appendAssumeCapacity(token);
+        const intent = mcp_command_provider.parseAddIntent(tokens.items) catch |err| {
+            if (err == error.McpAddUsage) {
+                try writeMcpAddUsage(deps);
+            } else {
+                try writeMcpOperationFailure(alloc, deps, "add", err);
+            }
+            return .handled_failure;
+        };
+        var result = cfg.add_mcp_profile_server(alloc, intent) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "add", err);
+            return .handled_failure;
+        };
+        defer result.deinit(alloc);
+        if (result.warning) |warning| try writeMcpProfileWarning(alloc, deps, warning);
+        const name = switch (intent) {
+            .local => |local| local.name,
+            .http => |http| http.name,
+        };
+        try writeMcpProfileMutationSuccess(
+            alloc,
+            deps,
+            "Saved",
+            "to",
+            name,
+            result.profile_path,
+        );
+        return .handled_success;
+    }
+    if (std.mem.eql(u8, operation, "trust")) {
+        const action = parseTopLevelProjectMcpAction(rest[1..]) catch {
+            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            return .handled_failure;
+        };
+        const workspace_root = io_mod.realpathAlloc(alloc, ".") catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "trust", err);
+            return .handled_failure;
+        };
+        defer alloc.free(workspace_root);
+        var attempt = config_runtime.attemptProjectMcpMutation(
+            alloc,
+            workspace_root,
+            action,
+        );
+        defer attempt.deinit(alloc);
+        switch (attempt) {
+            .failure => |failure| {
+                try writeMcpOperationFailure(alloc, deps, "trust", failure.err);
+                return .handled_failure;
+            },
+            .outcome => {},
+        }
+        try writeMcpTrustSuccess(alloc, deps, workspace_root, action);
+        return .handled_success;
+    }
+    if (std.mem.eql(u8, operation, "path")) {
+        if (rest.len != 1) {
+            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            return .handled_failure;
+        }
+        const home = deps.getenv(deps.env_ctx, "HOME") orelse {
+            try writeMcpOperationFailure(alloc, deps, "path", error.HomeNotSet);
+            return .handled_failure;
+        };
+        const path = try profile_paths.mcpConfigPath(alloc, home);
+        defer alloc.free(path);
+        var encoded_path = try text_utils.encodeTerminalSafe(alloc, path, 512);
+        defer encoded_path.deinit(alloc);
+        try writeStdout(deps, encoded_path.bytes);
+        try writeStdout(deps, "\n");
+        return .handled_success;
+    }
+    if (std.mem.eql(u8, operation, "remove")) {
+        if (rest.len != 2 or rest[1].len == 0) {
+            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            return .handled_failure;
+        }
+        var result = cfg.remove_mcp_profile_server(alloc, rest[1]) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "remove", err);
+            return .handled_failure;
+        };
+        defer result.deinit(alloc);
+        if (result.warning) |warning| try writeMcpProfileWarning(alloc, deps, warning);
+        if (!result.removed) {
+            var encoded_name = try text_utils.encodeTerminalSafe(alloc, rest[1], 160);
+            defer encoded_name.deinit(alloc);
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try out.writer.print(
+                "MCP server '{s}' was not found in the profile.\n",
+                .{encoded_name.bytes},
+            );
+            try writeStderr(deps, out.written());
+            return .handled_failure;
+        }
+        try writeMcpProfileMutationSuccess(
+            alloc,
+            deps,
+            "Removed",
+            "from",
+            rest[1],
+            result.profile_path,
+        );
+        return .handled_success;
+    }
+    if (std.mem.eql(u8, operation, "list")) {
+        const connect = rest.len == 2 and std.mem.eql(u8, rest[1], "--connect");
+        if (rest.len != 1 and !connect) {
+            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            return .handled_failure;
+        }
+        var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "list", err);
+            return .handled_failure;
+        };
+        defer loaded.deinit(alloc);
+        try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
+        const listing = if (loaded.runtime) |runtime| listing: {
+            if (connect) {
+                runtime.connectAll(cfg.tool_set.registry);
+            } else {
+                try runtime.loadStoredCredentialsForHealthSnapshot();
+            }
+            break :listing try runtime.listServersAndTools(alloc);
+        } else try alloc.dupe(u8, "No MCP servers configured.\n");
+        defer alloc.free(listing);
+        try writeStdout(deps, listing);
+        return .handled_success;
+    }
+    if (std.mem.eql(u8, operation, "auth")) {
+        if (rest.len != 2 or rest[1].len == 0) {
+            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            return .handled_failure;
+        }
+        var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "auth", err);
+            return .handled_failure;
+        };
+        defer loaded.deinit(alloc);
+        try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
+        const runtime = loaded.runtime orelse {
+            try writeMcpOperationFailure(alloc, deps, "auth", error.McpServerNotFound);
+            return .handled_failure;
+        };
+        var opener = cfg.url_opener;
+        var result = runtime.authenticateServer(
+            rest[1],
+            &opener,
+            openTopLevelMcpUrl,
+        ) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "auth", err);
+            return .handled_failure;
+        };
+        defer result.deinit();
+        switch (result) {
+            .authenticated => |authenticated| {
+                var encoded_name = try text_utils.encodeTerminalSafe(alloc, rest[1], 160);
+                defer encoded_name.deinit(alloc);
+                var out: std.Io.Writer.Allocating = .init(alloc);
+                defer out.deinit();
+                try out.writer.print("Authenticated MCP server '{s}'.", .{encoded_name.bytes});
+                if (authenticated.repaired_entries > 0) {
+                    try out.writer.print(
+                        " Removed {d} unreadable MCP credential {s}.",
+                        .{
+                            authenticated.repaired_entries,
+                            if (authenticated.repaired_entries == 1) "entry" else "entries",
+                        },
+                    );
+                }
+                try out.writer.writeByte('\n');
+                try writeStdout(deps, out.written());
+                return .handled_success;
+            },
+            .issuer_mismatch => {
+                try writeMcpOperationFailure(
+                    alloc,
+                    deps,
+                    "auth",
+                    error.McpAuthorizationIssuerMismatch,
+                );
+                return .handled_failure;
+            },
+        }
+    }
+    if (std.mem.eql(u8, operation, "logout")) {
+        if (rest.len != 2 or rest[1].len == 0) {
+            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            return .handled_failure;
+        }
+        var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "logout", err);
+            return .handled_failure;
+        };
+        defer loaded.deinit(alloc);
+        try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
+        const runtime = loaded.runtime orelse {
+            try writeMcpOperationFailure(alloc, deps, "logout", error.McpServerNotFound);
+            return .handled_failure;
+        };
+        const result = runtime.logoutServer(rest[1]) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "logout", err);
+            return .handled_failure;
+        };
+        var encoded_name = try text_utils.encodeTerminalSafe(alloc, rest[1], 160);
+        defer encoded_name.deinit(alloc);
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        if (!result.removed) {
+            try out.writer.print(
+                "No stored MCP credentials found for '{s}'.\n",
+                .{encoded_name.bytes},
+            );
+        } else if (result.local_only) {
+            try out.writer.print(
+                "Logged out of MCP server '{s}' locally.\n",
+                .{encoded_name.bytes},
+            );
+        } else if (result.revocation_failed) {
+            try out.writer.print(
+                "Logged out of MCP server '{s}' locally; remote revocation failed.\n",
+                .{encoded_name.bytes},
+            );
+        } else {
+            try out.writer.print(
+                "Logged out of MCP server '{s}'.\n",
+                .{encoded_name.bytes},
+            );
+        }
+        try writeStdout(deps, out.written());
+        return .handled_success;
+    }
+
+    try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+    return .handled_failure;
+}
+
+fn parseTopLevelProjectMcpAction(
+    args: []const [:0]const u8,
+) error{InvalidProjectMcpTrustArgs}!project_config.ProjectMcpAction {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "approve-all")) return .approve_all;
+    if (args.len == 1 and std.mem.eql(u8, args[0], "reset")) return .reset;
+    if (args.len != 2 or args[1].len == 0) return error.InvalidProjectMcpTrustArgs;
+    if (std.mem.eql(u8, args[0], "approve")) return .{ .approve = args[1] };
+    if (std.mem.eql(u8, args[0], "reject")) return .{ .reject = args[1] };
+    return error.InvalidProjectMcpTrustArgs;
+}
+
+fn writeMcpTrustSuccess(
+    alloc: Allocator,
+    deps: RunDeps,
+    workspace_root: []const u8,
+    action: project_config.ProjectMcpAction,
+) !void {
+    var encoded_root = try text_utils.encodeTerminalSafe(alloc, workspace_root, 512);
+    defer encoded_root.deinit(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    switch (action) {
+        .approve => |name| {
+            var encoded_name = try text_utils.encodeTerminalSafe(alloc, name, 160);
+            defer encoded_name.deinit(alloc);
+            try out.writer.print(
+                "Approved project MCP server '{s}' for {s}.\n",
+                .{ encoded_name.bytes, encoded_root.bytes },
+            );
+        },
+        .reject => |name| {
+            var encoded_name = try text_utils.encodeTerminalSafe(alloc, name, 160);
+            defer encoded_name.deinit(alloc);
+            try out.writer.print(
+                "Rejected project MCP server '{s}' for {s}.\n",
+                .{ encoded_name.bytes, encoded_root.bytes },
+            );
+        },
+        .approve_all => try out.writer.print(
+            "Approved all project MCP servers for {s}.\n",
+            .{encoded_root.bytes},
+        ),
+        .reset => try out.writer.print(
+            "Reset project MCP trust for {s}.\n",
+            .{encoded_root.bytes},
+        ),
+    }
+    try writeStdout(deps, out.written());
+}
+
+fn openTopLevelMcpUrl(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    url: []const u8,
+) anyerror!bool {
+    const opener: *const host.UrlOpener = @ptrCast(@alignCast(raw.?));
+    return opener.open(alloc, url);
+}
+
+fn writeMcpProfileMutationSuccess(
+    alloc: Allocator,
+    deps: RunDeps,
+    action: []const u8,
+    preposition: []const u8,
+    name: []const u8,
+    path: []const u8,
+) !void {
+    var encoded_name = try text_utils.encodeTerminalSafe(alloc, name, 160);
+    defer encoded_name.deinit(alloc);
+    var encoded_path = try text_utils.encodeTerminalSafe(alloc, path, 512);
+    defer encoded_path.deinit(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print(
+        "{s} MCP server '{s}' {s} {s}.\n",
+        .{ action, encoded_name.bytes, preposition, encoded_path.bytes },
+    );
+    try writeStdout(deps, out.written());
+}
+
+fn writeMcpAddUsage(deps: RunDeps) !void {
+    return writeStderr(
+        deps,
+        "usage: fx mcp add NAME COMMAND [ARGS...] | fx mcp add --transport http NAME URL\n",
+    );
+}
+
+fn writeMcpOperationFailure(
+    alloc: Allocator,
+    deps: RunDeps,
+    operation: []const u8,
+    err: anyerror,
+) !void {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print(
+        "fx mcp {s} failed: {s}.\n",
+        .{ operation, @errorName(err) },
+    );
+    try writeStderr(deps, out.written());
+}
+
+fn writeMcpProfileWarningIfPresent(
+    alloc: Allocator,
+    cfg: Config,
+    deps: RunDeps,
+) !void {
+    const diagnostic = try cfg.inspect_mcp_profile_config(alloc);
+    const warning = switch (diagnostic) {
+        .warning => |value| value,
+        .clear, .failed => return,
+    };
+    try writeMcpProfileWarning(alloc, deps, warning);
+}
+
+fn writeMcpProfileWarning(
+    alloc: Allocator,
+    deps: RunDeps,
+    warning: mcp_contract.ProfileConfigWarning,
+) !void {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print(
+        "fx: ~/.fx/mcp.json warning: {s}",
+        .{@tagName(warning.cause)},
+    );
+    if (warning.key()) |key| {
+        var encoded = try text_utils.encodeTerminalSafe(alloc, key, 128);
+        defer encoded.deinit(alloc);
+        try out.writer.print(" key={s}", .{encoded.bytes});
+    }
+    try out.writer.print(
+        " additional_matches={d}\n",
+        .{warning.additional_matches},
+    );
+    try writeStderr(deps, out.written());
 }
 
 fn writeUsageOrJsonError(
@@ -2762,6 +3529,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
         .gateway_models_path = cfg.models_path,
         .gateway_provider = cfg.gateway_provider,
+        .provider_set = cfg.provider_set,
         .background_process_provider = cfg.background_process_provider,
         .secret_store = cfg.secret_store,
         .prompt_policy = cfg.prompt_policy,
@@ -2776,8 +3544,6 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .max_history_turns = cfg.max_history_turns,
         .mode_registry = cfg.mode_registry,
         .load_mcp_runtime = cfg.load_mcp_runtime,
-        .devbox_provider = cfg.devbox_provider,
-        .permission_reviewer_provider = cfg.permission_reviewer_provider,
     };
 }
 
@@ -3283,6 +4049,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
         .models => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
         else => return error.TestExpectedEqual,
     }
+    switch (parse(command_catalog, &.{ @constCast("mcp"), @constCast("add"), @constCast("fixture"), @constCast("node") })) {
+        .mcp => |rest| try std.testing.expectEqual(@as(usize, 3), rest.len),
+        else => return error.TestExpectedEqual,
+    }
     switch (parse(command_catalog, &.{@constCast("doctor")})) {
         .doctor => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
         else => return error.TestExpectedEqual,
@@ -3491,8 +4261,7 @@ test "ACP command routes parsed options and launch config through the injected r
                     expected.context_registry.defaultProvider().id,
                 ) and
                 std.mem.eql(u8, cfg.mode_registry.default_mode_id, expected.mode_registry.default_mode_id) and
-                cfg.devbox_provider.?.execute_fn == expected.devbox_provider.?.execute_fn and
-                cfg.permission_reviewer_provider.?.review_fn == expected.permission_reviewer_provider.?.review_fn;
+                cfg.provider_set.gateway.permission_reviewer.?.review_fn == expected.provider_set.gateway.permission_reviewer.?.review_fn;
 
             const limit_matches = cfg.context_limit_overrides.len == 1 and
                 cfg.context_limit_overrides[0].name == .project_instructions_total_bytes and
@@ -3511,7 +4280,7 @@ test "ACP command routes parsed options and launch config through the injected r
     };
 
     var cfg = testConfig();
-    cfg.permission_reviewer_provider = test_builtin_gateway.permission_reviewer.provider;
+    cfg.provider_set.gateway.permission_reviewer = test_builtin_gateway.permission_reviewer.provider;
     var capture = Capture{ .expected = cfg };
     cfg.acp_runner = .{ .context = &capture, .run_fn = Capture.run };
     const result = try runIfRequestedWithDeps(
@@ -3948,6 +4717,133 @@ test "runIfRequested help writes top-level help" {
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
+test "top-level MCP add mutates through the focused provider without startup" {
+    const alloc = std.testing.allocator;
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+    var cfg = testConfig();
+    cfg.add_mcp_profile_server = captureMcpProfileAddForTest;
+    mcp_profile_add_calls_for_test = 0;
+    var deps = capture.deps();
+    deps.load_startup_state = failingStartupState;
+
+    const result = try runIfRequestedWithDeps(
+        alloc,
+        &.{
+            @constCast("mcp"),
+            @constCast("add"),
+            @constCast("fixture"),
+            @constCast("node"),
+            @constCast("server.js"),
+        },
+        cfg,
+        deps,
+    );
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    try std.testing.expectEqual(@as(usize, 1), mcp_profile_add_calls_for_test);
+    try std.testing.expectEqualStrings(
+        "Saved MCP server 'fixture' to /tmp/test-home/.fx/mcp.json.\n",
+        capture.stdout.written(),
+    );
+    try std.testing.expectEqualStrings("", capture.stderr.written());
+}
+
+test "top-level MCP list loads configuration without discovery and remove uses its provider" {
+    const alloc = std.testing.allocator;
+    {
+        var capture = CaptureOutput.init(alloc);
+        defer capture.deinit();
+        var cfg = testConfig();
+        cfg.load_mcp_runtime = configuredMcpRuntimeForTest;
+        var deps = capture.deps();
+        deps.load_startup_state_without_credentials = stubLoadStartupStateWithoutCredentials;
+
+        const result = try runIfRequestedWithDeps(
+            alloc,
+            &.{ @constCast("mcp"), @constCast("list") },
+            cfg,
+            deps,
+        );
+        try std.testing.expectEqual(RunResult.handled_success, result);
+        try std.testing.expect(std.mem.find(
+            u8,
+            capture.stdout.written(),
+            "fixture source=profile scope=profile",
+        ) != null);
+        try std.testing.expect(std.mem.find(
+            u8,
+            capture.stdout.written(),
+            "state=disconnected",
+        ) != null);
+        try std.testing.expectEqualStrings("", capture.stderr.written());
+    }
+
+    {
+        var capture = CaptureOutput.init(alloc);
+        defer capture.deinit();
+        var cfg = testConfig();
+        cfg.remove_mcp_profile_server = captureMcpProfileRemoveForTest;
+        mcp_profile_remove_calls_for_test = 0;
+
+        const result = try runIfRequestedWithDeps(
+            alloc,
+            &.{ @constCast("mcp"), @constCast("remove"), @constCast("fixture") },
+            cfg,
+            capture.deps(),
+        );
+        try std.testing.expectEqual(RunResult.handled_success, result);
+        try std.testing.expectEqual(@as(usize, 1), mcp_profile_remove_calls_for_test);
+        try std.testing.expectEqualStrings(
+            "Removed MCP server 'fixture' from /tmp/test-home/.fx/mcp.json.\n",
+            capture.stdout.written(),
+        );
+        try std.testing.expectEqualStrings("", capture.stderr.written());
+    }
+}
+
+test "top-level MCP trust persists project approval without interactive startup" {
+    const alloc = std.testing.allocator;
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try environ.put("HOME", home);
+    try environ.put("PATH", "");
+    const stable_environ = try stableCliTestEnviron();
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.setEnvironMap(stable_environ);
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+    var deps = capture.deps();
+    deps.load_startup_state_without_credentials = failingStartupStateWithoutCredentials;
+
+    const result = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("mcp"), @constCast("trust"), @constCast("approve"), @constCast("fixture") },
+        testConfig(),
+        deps,
+    );
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    const expected = try std.fmt.allocPrint(
+        alloc,
+        "Approved project MCP server 'fixture' for {s}.\n",
+        .{workspace_root},
+    );
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, capture.stdout.written());
+    try std.testing.expectEqualStrings("", capture.stderr.written());
+
+    var choices = try config_runtime.loadProjectMcpChoices(alloc, workspace_root);
+    defer choices.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), choices.choices.approved.len);
+    try std.testing.expectEqualStrings("fixture", choices.choices.approved[0]);
+}
+
 test "workspace launch modifiers preserve supported command help" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
@@ -4340,7 +5236,6 @@ test "workflow config does not carry placeholder gateway tools" {
     try std.testing.expectEqualStrings("surface", cfg.mode_registry.default_mode_id);
     try std.testing.expectEqualStrings("skills", cfg.skill_root_policy.workspace_roots[0].path);
     try std.testing.expect(cfg.load_mcp_runtime == noMcpRuntimeForTest);
-    try std.testing.expect(cfg.devbox_provider.?.execute_fn == unavailableDevboxForTest);
 }
 test "runIfRequested invalid local flags write usage" {
     var capture = CaptureOutput.init(std.testing.allocator);
@@ -4565,7 +5460,7 @@ test "runIfRequested model fetch failure is handled" {
     defer capture.deinit();
     var probe = ModelFetchProbe{ .outcome = .failure };
     var cfg = testConfig();
-    cfg.gateway_provider.cli_model_catalog = probe.provider();
+    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
     deps.load_startup_state = failingStartupState;
@@ -4584,7 +5479,7 @@ test "runIfRequested model fetch failure preserves json output" {
     defer capture.deinit();
     var probe = ModelFetchProbe{ .outcome = .failure };
     var cfg = testConfig();
-    cfg.gateway_provider.cli_model_catalog = probe.provider();
+    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
     deps.load_catalog_startup_state = stubLoadCatalogStartupState;
@@ -4608,7 +5503,7 @@ test "runIfRequested model provider cancellation is handled" {
     defer capture.deinit();
     var probe = ModelFetchProbe{ .outcome = .cancelled };
     var cfg = testConfig();
-    cfg.gateway_provider.cli_model_catalog = probe.provider();
+    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
     deps.load_catalog_startup_state = stubLoadCatalogStartupState;
@@ -4626,7 +5521,7 @@ test "runIfRequested models passes startup team to fetch seam" {
     defer capture.deinit();
     var probe = ModelFetchProbe{};
     var cfg = testConfig();
-    cfg.gateway_provider.cli_model_catalog = probe.provider();
+    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
     deps.load_catalog_startup_state = stubLoadCatalogStartupState;
@@ -4645,7 +5540,7 @@ test "runIfRequested credits renders through the configured provider" {
     defer capture.deinit();
     var probe = CreditsProviderProbe{ .outcome = .success };
     var cfg = testConfig();
-    cfg.gateway_provider.credits = probe.provider();
+    cfg.provider_set.gateway.credits = probe.provider();
 
     var deps = capture.deps();
     deps.load_startup_state = stubLoadStartupState;
@@ -4665,7 +5560,7 @@ test "runIfRequested credits failures use nonzero text and json contracts" {
     defer text_capture.deinit();
     var text_probe = CreditsProviderProbe{ .outcome = .failure };
     var text_cfg = testConfig();
-    text_cfg.gateway_provider.credits = text_probe.provider();
+    text_cfg.provider_set.gateway.credits = text_probe.provider();
     var text_deps = text_capture.deps();
     text_deps.load_startup_state = stubLoadStartupState;
 
@@ -4686,7 +5581,7 @@ test "runIfRequested credits failures use nonzero text and json contracts" {
     defer json_capture.deinit();
     var json_probe = CreditsProviderProbe{ .outcome = .failure };
     var json_cfg = testConfig();
-    json_cfg.gateway_provider.credits = json_probe.provider();
+    json_cfg.provider_set.gateway.credits = json_probe.provider();
     var json_deps = json_capture.deps();
     json_deps.load_startup_state = stubLoadStartupState;
 
@@ -4714,13 +5609,13 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
 }
 
-test "status and doctor inspect the supplied MCP profile diagnostic once" {
+test "status and doctor inspect MCP configuration once per command" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4735,11 +5630,9 @@ test "status and doctor inspect the supplied MCP profile diagnostic once" {
     io_mod.setEnvironMap(&environ);
     defer io_mod.setEnvironMap(stable_environ);
 
-    mcp_config_inspection_calls_for_test = 0;
-    mcp_runtime_load_calls_for_test = 0;
+    mcp_local_inspection_calls_for_test = 0;
     var cfg = testConfig();
-    cfg.inspect_mcp_profile_config = failingMcpConfigInspectionForTest;
-    cfg.load_mcp_runtime = countingMcpRuntimeForTest;
+    cfg.inspect_mcp_local_config = failingMcpLocalInspectionForTest;
 
     var status_capture = CaptureOutput.init(alloc);
     defer status_capture.deinit();
@@ -4752,15 +5645,14 @@ test "status and doctor inspect the supplied MCP profile diagnostic once" {
         status_deps,
     );
     try std.testing.expectEqual(RunResult.handled_success, status_result);
-    try std.testing.expectEqual(@as(usize, 1), mcp_config_inspection_calls_for_test);
-    try std.testing.expectEqual(@as(usize, 0), mcp_runtime_load_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 1), mcp_local_inspection_calls_for_test);
     try std.testing.expect(std.mem.find(
         u8,
         status_capture.stdout.written(),
         "\"mcp_config_error\":\"McpConfigInvalidJson\"",
     ) != null);
 
-    mcp_config_inspection_calls_for_test = 0;
+    mcp_local_inspection_calls_for_test = 0;
     var doctor_capture = CaptureOutput.init(alloc);
     defer doctor_capture.deinit();
     const doctor_result = try runIfRequestedWithDeps(
@@ -4770,8 +5662,7 @@ test "status and doctor inspect the supplied MCP profile diagnostic once" {
         doctor_capture.deps(),
     );
     try std.testing.expectEqual(RunResult.handled_success, doctor_result);
-    try std.testing.expectEqual(@as(usize, 1), mcp_config_inspection_calls_for_test);
-    try std.testing.expectEqual(@as(usize, 0), mcp_runtime_load_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 1), mcp_local_inspection_calls_for_test);
     try std.testing.expectEqual(
         @as(usize, 1),
         std.mem.count(
@@ -4807,24 +5698,9 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
-}
-
-test "status snapshot reports yolo effective sandbox without mutating startup" {
-    const startup = app_lifecycle.StartupStatus{
-        .workspace_root = @constCast("/tmp/fx"),
-        .selected_model = "test-model",
-        .permission_mode = .yolo,
-        .sandbox_backend = .macos,
-        .agent_step_limit = 42,
-    };
-
-    const snapshot = statusSnapshotFromStartup(startup);
-    try std.testing.expectEqual(types.PermissionMode.yolo, snapshot.permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.none, snapshot.sandbox_backend);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, startup.sandbox_backend);
 }
 
 test "writeRenderedJsonLine renders doctor json through output contract" {
@@ -4984,17 +5860,7 @@ const test_surface_context_registry = context_contract.Registry{ .default_provid
     .append_transient_fn = appendNoopTransientContextForTest,
 } };
 
-fn unavailableDevboxForTest(
-    _: ?*anyopaque,
-    _: Allocator,
-    _: []const u8,
-    _: []const u8,
-    _: devbox_executor.Control,
-) devbox_executor.ProviderError!devbox_executor.VercelOutcome {
-    return .unavailable;
-}
-
-fn noMcpRuntimeForTest(_: Allocator, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+fn noMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
     return null;
 }
 
@@ -5004,22 +5870,69 @@ fn clearMcpConfigInspectionForTest(
     return .clear;
 }
 
-var mcp_config_inspection_calls_for_test: usize = 0;
-var mcp_runtime_load_calls_for_test: usize = 0;
+var mcp_local_inspection_calls_for_test: usize = 0;
+var mcp_profile_add_calls_for_test: usize = 0;
+var mcp_profile_remove_calls_for_test: usize = 0;
 
-fn failingMcpConfigInspectionForTest(
-    _: Allocator,
-) error{OutOfMemory}!mcp_contract.ProfileConfigDiagnostic {
-    mcp_config_inspection_calls_for_test += 1;
-    return .{ .failed = error.McpConfigInvalidJson };
+fn captureMcpProfileAddForTest(
+    alloc: Allocator,
+    intent: mcp_command_provider.AddIntent,
+) anyerror!mcp_command_provider.ProfileAddResult {
+    mcp_profile_add_calls_for_test += 1;
+    switch (intent) {
+        .local => |local| {
+            try std.testing.expectEqualStrings("fixture", local.name);
+            try std.testing.expectEqualStrings("node", local.command);
+            try std.testing.expectEqualSlices([]const u8, &.{"server.js"}, local.args);
+        },
+        .http => return error.TestUnexpectedResult,
+    }
+    return .{
+        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.fx/mcp.json"),
+    };
 }
 
-fn countingMcpRuntimeForTest(
-    _: Allocator,
+fn captureMcpProfileRemoveForTest(
+    alloc: Allocator,
+    name: []const u8,
+) anyerror!mcp_command_provider.ProfileRemoveResult {
+    mcp_profile_remove_calls_for_test += 1;
+    try std.testing.expectEqualStrings("fixture", name);
+    return .{
+        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.fx/mcp.json"),
+        .removed = true,
+    };
+}
+
+fn configuredMcpRuntimeForTest(
+    alloc: Allocator,
+    workspace_root: []const u8,
     _: @import("../mcp/elicitation.zig").Capabilities,
 ) !?*mcp_runtime.McpRuntime {
-    mcp_runtime_load_calls_for_test += 1;
-    return null;
+    try std.testing.expectEqualStrings("/tmp/fx", workspace_root);
+    const runtime = try alloc.create(mcp_runtime.McpRuntime);
+    errdefer alloc.destroy(runtime);
+    runtime.* = mcp_runtime.McpRuntime.init(alloc);
+    errdefer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "fixture"),
+        .command = try alloc.dupe(u8, "node"),
+    });
+    return runtime;
+}
+
+fn failingMcpLocalInspectionForTest(
+    alloc: Allocator,
+    workspace_root: []const u8,
+) error{OutOfMemory}!mcp_health.LocalConfigInspection {
+    mcp_local_inspection_calls_for_test += 1;
+    var result = try mcp_health.inspectLocalConfigUnavailable(
+        alloc,
+        workspace_root,
+    );
+    result.profile_diagnostic = .{ .failed = error.McpConfigInvalidJson };
+    result.inspection_error = "McpConfigInvalidJson";
+    return result;
 }
 
 var stable_cli_test_environ: ?*std.process.Environ.Map = null;
@@ -5048,6 +5961,7 @@ fn testConfig() Config {
         .gateway_retry_count = 1,
         .gateway_chat_url = "https://example.test/chat",
         .gateway_provider = test_builtin_gateway.provider,
+        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
         .url_opener = host.unavailable_url_opener,
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "system" },
@@ -5065,7 +5979,6 @@ fn testConfig() Config {
         .inspect_mcp_profile_config = clearMcpConfigInspectionForTest,
         .load_mcp_runtime = noMcpRuntimeForTest,
         .acp_runner = .{ .run_fn = unexpectedAcpRunForTest },
-        .devbox_provider = .{ .execute_fn = unavailableDevboxForTest },
         .tool_set = .{
             .registry = .{ .tools = &.{} },
             .order = &.{},
@@ -5091,6 +6004,27 @@ fn stubLoadStartupState(
     };
     state.credential.?.team_id = try alloc.dupe(u8, "team_123");
     return state;
+}
+
+fn stubLoadStartupStateWithoutCredentials(
+    alloc: Allocator,
+    _: []const u8,
+    default_agent_step_limit: usize,
+) !app_lifecycle.StartupState {
+    var state = app_lifecycle.StartupState{
+        .agent_step_limit = default_agent_step_limit,
+    };
+    errdefer state.deinit(alloc);
+    state.workspace_root = try alloc.dupe(u8, "/tmp/fx");
+    return state;
+}
+
+fn failingStartupStateWithoutCredentials(
+    _: Allocator,
+    _: []const u8,
+    _: usize,
+) !app_lifecycle.StartupState {
+    return error.StartupShouldNotRun;
 }
 
 fn stubLoadCatalogStartupState(

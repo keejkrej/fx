@@ -85,7 +85,9 @@ If you cannot manage labels, a maintainer or repository agent will apply the lab
 
 * `src/gateway/`: AI Gateway client transport
 
-* `skills/`: optional workspace-level skill root if the project wants one
+* `.fx/skills/`: optional fx-native workspace-level skill root
+
+* `skills/`: optional shared workspace-level skill root
 
 ## Collaboration Rules
 
@@ -143,13 +145,13 @@ Subagent children are ordinary sessions with their own `~/.fx/sessions/<child-id
 
 There are two distinct skill categories in `fx`:
 
-* `fx` roots that belong to the product itself: `skills/`, `~/.fx/skills`
+* `fx` roots that belong to the product itself: `.fx/skills`, `skills/`, `~/.fx/skills`
 
 * compatibility roots discovered for other agent installs: `.opencode/skills`, `.codex/skills`, `.claude/skills`, `.agents/skills`, `.claw/skills`, plus their global equivalents
 
 `/skills list` should make that distinction visible to the user.
 
-`/skills add` and `/skills install` install full skill directories into the profile-owned `~/.fx/skills` managed root, not just `SKILL.md`. Workspace `skills/` remains discoverable project-local instructions, not a managed install target.
+`/skills add` and `/skills install` install full skill directories into the profile-owned `~/.fx/skills` managed root, not just `SKILL.md`. Workspace `.fx/skills` and `skills/` remain discoverable project-local instructions, not managed install targets.
 
 The interactive agent can also install skills via the `install_skill` tool when the user asks to install one in conversation, including pasted `npx skills add ...` syntax.
 
@@ -158,12 +160,40 @@ The interactive agent can also install skills via the `install_skill` tool when 
 fx negotiates MCP `2026-07-28` over local stdio and stateless Streamable HTTP.
 Version-scoped adapters retain legacy stdio,
 `2025-11-25`/`2025-06-18`/`2025-03-26` Streamable HTTP, and deprecated
-`2024-11-05` HTTP+SSE. Native sessions load runnable MCP configuration only
-from the trusted profile:
+`2024-11-05` HTTP+SSE. Native sessions load trusted MCP configuration from the
+profile:
 
 * `~/.fx/mcp.json`
 
+They also read Claude-compatible workspace configuration from:
+
+* `<workspace>/.mcp.json`
+
 Project `.fx.json` does not define runnable MCP commands, URLs, env, or secrets.
+The profile file reads top-level `mcp` and accepts `mcpServers` as a
+compatibility alias; `mcp` wins when both exist, and every write uses `mcp`.
+Suspicious server-like unsupported keys produce a bounded warning and block
+profile mutation instead of being overwritten. The workspace file reads only
+top-level `mcpServers`, accepts `command` plus `args`, and is opened as a
+bounded no-follow regular file. Profile entries win native name collisions;
+ACP request entries win ACP name collisions without deduplicating the request
+array. Workspace entries are always optional and never load stored credentials.
+Approved workspace `command`, `args`, `env`, and HTTP header values expand
+`${VAR}` and `${VAR:-default}` from the fx process environment. Pending and
+rejected entries do not read environment values. Missing required variables
+leave an approved server unloaded and appear in `/mcp list` without exposing
+values.
+
+Interactive sessions keep pending workspace servers disconnected and request
+project trust before any project-defined process or network effect. Pending
+resource, prompt, completion, and authentication commands require explicit
+`/mcp trust approve <name>` and a retry. Rejected servers remain disconnected.
+Choices live only in profile `settings.json` under the canonical workspace key,
+using `enabledMcpjsonServers`, `disabledMcpjsonServers`, and
+`enableAllProjectMcpServers`. Repository files cannot persist their own
+approval. `fx ask` and ACP skip pending workspace servers. Noninteractive users
+approve them first with `fx mcp trust approve <name>`; rejected servers remain
+disabled.
 
 The core feature surface is Tools, Resources and Resource Templates, Prompts,
 Completion, pagination, cache-aware discovery, subscriptions, progress,
@@ -195,6 +225,8 @@ The interactive surface supports:
 
 * `/mcp add <name> <command> [args...]`
 
+* `/mcp add --transport http <name> <url>`
+
 * `/mcp remove <name>`
 
 * `/mcp reload`
@@ -203,13 +235,66 @@ The interactive surface supports:
 
 * `/mcp logout <name>`
 
+* `/mcp trust approve <name>`
+
+* `/mcp trust reject <name>`
+
+* `/mcp trust approve-all`
+
+* `/mcp trust reset`
+
 * `/mcp path`
+
+The noninteractive MCP surface supports:
+
+* `fx mcp add <name> <command> [args...]`
+
+* `fx mcp add --transport http <name> <url>`
+
+* `fx mcp auth <name>`
+
+* `fx mcp list`
+
+* `fx mcp logout <name>`
+
+* `fx mcp path`
+
+* `fx mcp remove <name>`
+
+* `fx mcp trust approve <name>`
+
+* `fx mcp trust reject <name>`
+
+* `fx mcp trust approve-all`
+
+* `fx mcp trust reset`
+
+The local form saves a stdio command. The HTTP form saves a remote Streamable
+HTTP endpoint. List reads effective profile and workspace configuration plus
+stored authentication state without connecting servers. Path prints the profile
+configuration path. Remove uses the same locked canonical profile writer as
+add. Trust updates the canonical workspace entry in profile settings. Auth and
+logout run the existing remote credential lifecycle. None of these commands
+constructs the TUI or contacts the Gateway.
+
+The default MCP startup timeout is 30 seconds and remains overridable per
+server with `startup_timeout_ms`. Exact direct `docker run` stdio commands
+without `--cidfile` receive a private cidfile so fx can remove the container
+after shutdown or startup failure. An explicit cidfile remains user-owned.
+
+MongoDB Atlas Managed MCP configuration service accounts use the OAuth
+client-credentials grant. fx does not implement that grant directly. Use
+MongoDB's `mongodb-atlas-mcp-remote` stdio wrapper with inherited
+`MDB_MCP_API_CLIENT_ID` and `MDB_MCP_API_CLIENT_SECRET` environment variables.
+The Atlas App Connection browser flow is user-delegated access and must not be
+treated as equivalent to configuration service-account credentials.
 
 Remote authentication supports configured bearer tokens and OAuth credential
 discovery, persistence, refresh, scope challenges, and logout. Credential and
 private-cache identity changes invalidate prior private state. macOS persists
 OAuth credentials in Keychain and migrates the private profile credential file
-only after verified publication. Other platforms use the `0600` credential file
+only after verified publication. If the user account has no default Keychain,
+macOS falls back to the same `0600` credential file used on other platforms
 under the `0700` profile directory. `FX_DISABLE_KEYCHAIN=1` selects that portable
 backend explicitly for deterministic tests and local troubleshooting.
 
@@ -243,11 +328,11 @@ Security is permission-first.
 
 * routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy; unknown, destructive, hidden, credential-bearing, public, and overwrite effects remain on the review or approval path
 
-* unresolved sensitive calls in `auto` mode receive one exact automatic review using bounded current, first, and recent proven root requests; historical permission feedback is excluded, and non-allow, unavailable, and invalid review results return a recoverable denial with an opaque action-bound approval request when capacity permits
+* every unresolved `auto` action receives one narrow safety review after configured policy, saved-session rules, grants, and deterministic safe authority; review input contains the current proven root request, the exact action and targets, origin and call identity, optional host-proven current-branch evidence, exact-copy provenance, and bounded masked terminal-safe excerpts of earlier current-turn tool results. Those excerpts are untrusted evidence and never authority; assistant prose, permission feedback, the pending tool group, later results, and historical requests do not enter review
 
-* the main agent may pass that exact request ID through `ask_user_question` to open the existing permission screen; generic question text cannot authorize an action, and the resulting once or always approval is revalidated and consumed only by the exact bound action
+* a `clear` review authorizes only the exact unchanged action; a `caution` or unavailable review holds only that action and returns advice without opening a human permission screen, disabling tools, or ending the turn
 
-* after three consecutive all-blocked response groups, the next unresolved sensitive action skips another automatic review and uses the existing human approval path; any completed successful tool resets that recovery count, and configured and saved-session rules remain authoritative
+* exact cautions are cached only for the current turn; changed actions receive a new review, unavailable reviews are not cached as security judgments, and legacy `permission_request_id` input is rejected without prompting
 
 * the sandbox backend is configured independently; yolo uses an effective backend of `none` without rewriting the saved sandbox setting
 

@@ -135,6 +135,7 @@ const Summary = struct {
     total: usize = 0,
     categories: [category_labels.len]usize = @splat(0),
     failed: usize = 0,
+    timed_out: usize = 0,
     denied: usize = 0,
     cancelled: usize = 0,
     deferred: usize = 0,
@@ -238,8 +239,14 @@ fn commandProcessFailed(record: *const ToolDetailRecord) bool {
     const presentation = record.command_process_presentation orelse return false;
     return switch (presentation) {
         .exit_code => |code| code != 0,
-        .signal => true,
+        .signal, .timed_out, .output_capture_failed => true,
     };
+}
+
+fn commandProcessTimedOut(record: *const ToolDetailRecord) bool {
+    if (record.activity_kind != .command) return false;
+    const presentation = record.command_process_presentation orelse return false;
+    return presentation == .timed_out;
 }
 
 fn observeTool(summary: *Summary, detail: ?*const ToolDetailRecord) void {
@@ -256,12 +263,21 @@ fn observeTool(summary: *Summary, detail: ?*const ToolDetailRecord) void {
         return;
     }
     const process_failed = commandProcessFailed(record);
+    const process_timed_out = commandProcessTimedOut(record);
     if (record.outcome) |outcome| {
         switch (outcome) {
             .completed => {
-                if (process_failed) summary.failed += 1;
+                if (process_timed_out)
+                    summary.timed_out += 1
+                else if (process_failed)
+                    summary.failed += 1;
             },
-            .failed => summary.failed += 1,
+            .failed => {
+                if (process_timed_out)
+                    summary.timed_out += 1
+                else
+                    summary.failed += 1;
+            },
             .denied => summary.denied += 1,
             .cancelled => summary.cancelled += 1,
             .deferred => summary.deferred += 1,
@@ -280,12 +296,10 @@ fn normalizeCanonicalStatus(
 ) !?[]const u8 {
     var index: usize = 0;
     while (skipSgrSequence(text, &index)) {}
-    const marker = if (std.mem.startsWith(u8, text[index..], "●"))
-        "●"
-    else if (std.mem.startsWith(u8, text[index..], "■"))
-        "■"
-    else
-        return null;
+    const markers = [_][]const u8{ "●", "■", "⊘", "↻" };
+    const marker = for (markers) |candidate| {
+        if (std.mem.startsWith(u8, text[index..], candidate)) break candidate;
+    } else return null;
     index += marker.len;
     while (skipSgrSequence(text, &index)) {}
     while (index < text.len and (text[index] == ' ' or text[index] == '\t')) : (index += 1) {}
@@ -403,6 +417,7 @@ fn formatGroupHeader(
     }
     try appendSegment(&out.writer, summary.completion_unreported, "unreported");
     try appendSegment(&out.writer, summary.not_executed, "not executed");
+    try appendSegment(&out.writer, summary.timed_out, "timed out");
     try appendSegment(&out.writer, summary.failed, "failed");
     try appendSegment(&out.writer, summary.denied, "denied");
     try appendSegment(&out.writer, summary.cancelled, "cancelled");
@@ -423,11 +438,13 @@ fn formatGroupBlock(
     detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
     summary: Summary,
     focused_entry_id: ?u32,
+    collapse_tool_calls: bool,
     cols: u16,
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
 ) ![]u8 {
     const header = try formatGroupHeader(alloc, summary, cols, style);
+    if (collapse_tool_calls) return header;
     defer alloc.free(header);
 
     var focused_in_group = false;
@@ -630,7 +647,7 @@ fn build(
     details: []const ToolDetailRecord,
     cols: u16,
 ) !Projection {
-    return buildWithStyleAndStats(alloc, entries, details, cols, null, .{}, .{}, .compact, null, null) catch |err| switch (err) {
+    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, .{}, .{}, .compact, null, null) catch |err| switch (err) {
         error.InputPending => unreachable,
         else => |other| return other,
     };
@@ -644,7 +661,7 @@ pub fn buildStyled(
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
 ) !Projection {
-    return buildWithStyleAndStats(alloc, entries, details, cols, null, style, styles, .compact, null, null) catch |err| switch (err) {
+    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, style, styles, .compact, null, null) catch |err| switch (err) {
         error.InputPending => unreachable,
         else => |other| return other,
     };
@@ -659,7 +676,7 @@ pub fn buildExpandedStyledInterruptible(
     styles: transcript_blocks.Styles,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !Projection {
-    return buildWithStyleAndStats(alloc, entries, details, cols, null, style, styles, .expanded, null, checkpoint);
+    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, style, styles, .expanded, null, checkpoint);
 }
 
 pub fn buildExpandedRelationshipsInterruptible(
@@ -674,6 +691,7 @@ pub fn buildExpandedRelationshipsInterruptible(
         details,
         std.math.maxInt(u16),
         null,
+        false,
         .{},
         .{},
         .expanded,
@@ -748,6 +766,7 @@ pub fn buildStyledFocused(
     details: []const ToolDetailRecord,
     cols: u16,
     focused_entry_id: ?u32,
+    collapse_tool_calls: bool,
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
 ) !Projection {
@@ -757,6 +776,7 @@ pub fn buildStyledFocused(
         details,
         cols,
         focused_entry_id,
+        collapse_tool_calls,
         style,
         styles,
         null,
@@ -772,6 +792,7 @@ pub fn buildStyledFocusedInterruptible(
     details: []const ToolDetailRecord,
     cols: u16,
     focused_entry_id: ?u32,
+    collapse_tool_calls: bool,
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
@@ -782,6 +803,7 @@ pub fn buildStyledFocusedInterruptible(
         details,
         cols,
         focused_entry_id,
+        collapse_tool_calls,
         style,
         styles,
         .compact,
@@ -797,7 +819,7 @@ fn buildWithStats(
     cols: u16,
     stats: ?*BuildStats,
 ) !Projection {
-    return buildWithStyleAndStats(alloc, entries, details, cols, null, .{}, .{}, .compact, stats, null);
+    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, .{}, .{}, .compact, stats, null);
 }
 
 fn buildWithStyleAndStats(
@@ -806,6 +828,7 @@ fn buildWithStyleAndStats(
     details: []const ToolDetailRecord,
     cols: u16,
     focused_entry_id: ?u32,
+    collapse_tool_calls: bool,
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
     mode: ProjectionMode,
@@ -979,6 +1002,7 @@ fn buildWithStyleAndStats(
                 &detail_indices,
                 group.summary,
                 focused_entry_id,
+                collapse_tool_calls,
                 cols,
                 style,
                 styles,
@@ -1025,6 +1049,7 @@ fn buildWithStyleAndStats(
             &detail_indices,
             summary,
             focused_entry_id,
+            collapse_tool_calls,
             cols,
             style,
             styles,
@@ -1033,6 +1058,25 @@ fn buildWithStyleAndStats(
     }
 
     return projection;
+}
+
+test "collapsed tool groups render only the summary header" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = @constCast("● Read file\n"), .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = @constCast("● List files\n"), .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read },
+        .{ .entry_id = 2, .tool_name = @constCast("list_files"), .activity_kind = .list },
+    };
+
+    var projection = try buildStyledFocused(alloc, &entries, &details, 120, null, true, .{}, .{});
+    defer projection.deinit(alloc);
+    const block = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, block, "2 tool calls") != null);
+    try std.testing.expect(std.mem.find(u8, block, "Read file") == null);
+    try std.testing.expect(projection.entry_actions.items[1] == .hide);
 }
 
 test "tool relationship grouping retries cleanly after cancellation" {
@@ -1118,6 +1162,28 @@ test "small minimal tool groups surface canonical action targets" {
     );
 }
 
+test "minimal tool groups preserve denied and deferred action text" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "⊘ Denied by auto agent zig build\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "↻ Context updated runtime.zig\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("terminal"), .activity_kind = .command, .outcome = .denied },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .deferred },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 2 tool calls · 1 read · 1 command · 1 denied · 1 deferred\n" ++
+            "├ Denied by auto agent zig build\n" ++
+            "└ Context updated runtime.zig",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
 test "focused tool remains counted but is omitted from stable child rows" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
@@ -1129,7 +1195,7 @@ test "focused tool remains counted but is omitted from stable child rows" {
         .{ .entry_id = 2, .tool_name = @constCast("run_command"), .activity_kind = .command },
     };
 
-    var projection = try buildStyledFocused(alloc, &entries, &details, 120, 2, .{}, .{});
+    var projection = try buildStyledFocused(alloc, &entries, &details, 120, 2, false, .{}, .{});
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
@@ -1160,6 +1226,31 @@ test "minimal command details expose running completed and failed process states
             "├ Running rg snapshot\n" ++
             "├ Ran zig build\n" ++
             "└ Ran zig build test",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "minimal command timeout uses its typed cause in the row and group" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Timed out sleep 5\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("run_command"),
+            .activity_kind = .command,
+            .outcome = .failed,
+            .command_process_presentation = .timed_out,
+        },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command · 1 timed out\n" ++
+            "└ Timed out sleep 5",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -1592,8 +1683,8 @@ test "visible assistant messages split groups while silent entries do not" {
         .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
         .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
         .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
-        .{ .entry_id = 4, .tool_name = @constCast("list_files"), .activity_kind = .list, .outcome = .completed },
-        .{ .entry_id = 5, .tool_name = @constCast("list_files"), .activity_kind = .list, .outcome = .completed },
+        .{ .entry_id = 4, .tool_name = @constCast("glob_files"), .activity_kind = .list, .outcome = .completed },
+        .{ .entry_id = 5, .tool_name = @constCast("glob_files"), .activity_kind = .list, .outcome = .completed },
         .{ .entry_id = 7, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
         .{ .entry_id = 9, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
         .{ .entry_id = 10, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
@@ -1606,7 +1697,7 @@ test "visible assistant messages split groups while silent entries do not" {
 
     try std.testing.expectEqualStrings(
         "● 5 tool calls · 3 read · 2 list\n" ++
-            "├ read_file\n├ read_file\n├ read_file\n├ list_files\n└ list_files",
+            "├ read_file\n├ read_file\n├ read_file\n├ glob_files\n└ glob_files",
         projection.entry_actions.items[0].override.bytes,
     );
     for (projection.entry_actions.items[1..5]) |action| {
@@ -1798,7 +1889,7 @@ test "expanded tool title stays primary while the group summary stays secondary"
         .{ .raw_bytes = .{ .id = 1, .bytes = "Listed .", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
-        .{ .entry_id = 1, .tool_name = @constCast("list_files"), .activity_kind = .list },
+        .{ .entry_id = 1, .tool_name = @constCast("glob_files"), .activity_kind = .list },
     };
 
     var projection = try buildExpandedStyledInterruptible(alloc, &entries, &details, 80, .{
@@ -1821,7 +1912,7 @@ test "expanded tool relationships materialize at multiple widths" {
         .{ .raw_bytes = .{ .id = 1, .bytes = "Listed .", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
-        .{ .entry_id = 1, .tool_name = @constCast("list_files"), .activity_kind = .list },
+        .{ .entry_id = 1, .tool_name = @constCast("glob_files"), .activity_kind = .list },
     };
     const style = SummaryStyle{
         .marker_style = "\x1b[38;5;81m",

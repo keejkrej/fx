@@ -3,6 +3,7 @@ const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_usage = @import("session_usage.zig");
 const types = @import("../shared/types.zig");
+const model_provider = @import("../config/model_provider.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -52,6 +53,7 @@ pub const SessionStarted = struct {
 };
 
 pub const PreferencesChanged = struct {
+    provider: ?model_provider.ProviderId = null,
     model: ?[]u8 = null,
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
@@ -267,20 +269,35 @@ pub fn encodeFrame(alloc: Allocator, envelope: Envelope) ![]u8 {
     return try out.toOwnedSlice();
 }
 
+inline fn failEnvelope(err: anytype) @TypeOf(err)!Envelope {
+    return @errorCast(failEnvelopeDynamic(err));
+}
+
+noinline fn failEnvelopeDynamic(err: anyerror) anyerror!Envelope {
+    return err;
+}
+
+test "session envelope failures preserve exact error types and identities" {
+    const invalid = failEnvelope(error.InvalidEventFrame);
+    try std.testing.expect(@TypeOf(invalid) == error{InvalidEventFrame}!Envelope);
+    try std.testing.expectError(error.InvalidEventFrame, invalid);
+    try std.testing.expectError(error.OutOfMemory, failEnvelope(error.OutOfMemory));
+}
+
 pub fn decodeFrame(alloc: Allocator, line: []const u8) !Envelope {
-    if (line.len > event_frame_max_bytes) return error.EventFrameTooLarge;
+    if (line.len > event_frame_max_bytes) return failEnvelope(error.EventFrameTooLarge);
     if (line.len == 0 or line[line.len - 1] != '\n') {
-        return error.InvalidEventFrame;
+        return failEnvelope(error.InvalidEventFrame);
     }
     if (std.mem.indexOfScalar(u8, line[0 .. line.len - 1], '\n') != null) {
-        return error.InvalidEventFrame;
+        return failEnvelope(error.InvalidEventFrame);
     }
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, line[0 .. line.len - 1], .{
         .parse_numbers = false,
     }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidEventFrame,
+        error.OutOfMemory => return failEnvelope(error.OutOfMemory),
+        else => return failEnvelope(error.InvalidEventFrame),
     };
     defer parsed.deinit();
     const root = try exactObject(parsed.value, &.{
@@ -292,15 +309,15 @@ pub fn decodeFrame(alloc: Allocator, line: []const u8) !Envelope {
         "kind",
         "payload",
     });
-    if (try requireU64(root, "schema_version") != 1) return error.UnsupportedEventSchema;
+    if (try requireU64(root, "schema_version") != 1) return failEnvelope(error.UnsupportedEventSchema);
     const kind = std.meta.stringToEnum(Kind, try requireString(root, "kind")) orelse
-        return error.InvalidEventFrame;
+        return failEnvelope(error.InvalidEventFrame);
     var envelope = Envelope{
         .log_generation = try parseIdentifier(try requireString(root, "log_generation")),
         .seq = try requireU64(root, "seq"),
         .event_id = try parseIdentifier(try requireString(root, "event_id")),
         .timestamp_ms = try requireI64(root, "timestamp_ms"),
-        .event = try parsePayload(alloc, kind, root.get("payload") orelse return error.InvalidEventFrame),
+        .event = try parsePayload(alloc, kind, root.get("payload") orelse return failEnvelope(error.InvalidEventFrame)),
     };
     errdefer envelope.deinit(alloc);
     try validateEnvelope(envelope);
@@ -431,6 +448,23 @@ pub fn applyEventFrame(
     return reductionBoundary(envelope, frame_bytes);
 }
 
+inline fn failReduction(err: anytype) @TypeOf(err)!Reduction {
+    return @errorCast(failReductionDynamic(err));
+}
+
+noinline fn failReductionDynamic(err: anyerror) anyerror!Reduction {
+    return err;
+}
+
+test "session event reduction failures preserve exact error types and identities" {
+    const invalid = failReduction(error.InvalidReductionStart);
+    try std.testing.expect(
+        @TypeOf(invalid) == error{InvalidReductionStart}!Reduction,
+    );
+    try std.testing.expectError(error.InvalidReductionStart, invalid);
+    try std.testing.expectError(error.MissingSessionStarted, failReduction(error.MissingSessionStarted));
+}
+
 pub fn reduceJsonlFrom(
     alloc: Allocator,
     source: *std.Io.Reader,
@@ -442,7 +476,7 @@ pub fn reduceJsonlFrom(
     if (start.next_seq == 0 or
         (state == null and (start.generation != null or start.next_seq != 1)))
     {
-        return error.InvalidReductionStart;
+        return failReduction(error.InvalidReductionStart);
     }
     var validator = SequenceValidator{
         .generation = start.generation,
@@ -465,7 +499,7 @@ pub fn reduceJsonlFrom(
         try validator.validate(envelope);
 
         if (envelope.kind() == .state_replacement_started) {
-            if (state == null) return error.InvalidReplacement;
+            if (state == null) return failReduction(error.InvalidReplacement);
             const replacement = try reduceReplacement(
                 alloc,
                 source,
@@ -491,14 +525,14 @@ pub fn reduceJsonlFrom(
         if (envelope.kind() == .state_replacement_chunk or
             envelope.kind() == .state_replacement_committed)
         {
-            return error.InvalidReplacement;
+            return failReduction(error.InvalidReplacement);
         }
         try applyDelta(alloc, &state, envelope);
         through = reductionBoundary(envelope, byte_offset);
     }
 
     return .{
-        .state = state orelse return error.MissingSessionStarted,
+        .state = state orelse return failReduction(error.MissingSessionStarted),
         .through = through,
         .bytes_consumed = byte_offset,
     };
@@ -904,6 +938,7 @@ fn applyDelta(
         .preferences_changed => |payload| {
             var current = &(state.* orelse return error.MissingSessionStarted);
             var proposed = current.*;
+            if (payload.provider) |provider| proposed.preferences.provider = provider;
             if (payload.model) |model| proposed.preferences.model = model;
             if (payload.effort) |effort| proposed.preferences.effort = effort;
             if (payload.fast_mode) |fast_mode| proposed.preferences.fast_mode = fast_mode;
@@ -917,6 +952,7 @@ fn applyDelta(
                 alloc.free(current.preferences.model);
                 current.preferences.model = copy;
             }
+            if (payload.provider) |provider| current.preferences.provider = provider;
             if (payload.effort) |effort| current.preferences.effort = effort;
             if (payload.fast_mode) |fast_mode| current.preferences.fast_mode = fast_mode;
             current.updated_at_ms = envelope.timestamp_ms;
@@ -1019,7 +1055,7 @@ fn validateEnvelope(envelope: Envelope) !void {
             try session_codec.validateState(state);
         },
         .preferences_changed => |payload| {
-            if (payload.model == null and payload.effort == null and payload.fast_mode == null) {
+            if (payload.provider == null and payload.model == null and payload.effort == null and payload.fast_mode == null) {
                 return error.InvalidEventFrame;
             }
             if (payload.model) |model| {
@@ -1116,7 +1152,13 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
         .preferences_changed => |payload| {
             try writer.writeByte('{');
             var wrote = false;
+            if (payload.provider) |provider| {
+                try writer.writeAll("\"provider\":");
+                try writeJsonString(writer, @tagName(provider));
+                wrote = true;
+            }
             if (payload.model) |model| {
+                if (wrote) try writer.writeByte(',');
                 try writer.writeAll("\"model\":");
                 try writeJsonString(writer, model);
                 wrote = true;
@@ -1255,8 +1297,12 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
         },
         .preferences_changed => blk: {
             const object = try requireObject(value);
-            if (object.count() == 0 or object.count() > 3) return error.InvalidEventFrame;
-            try rejectUnknownKeys(object, &.{ "model", "effort", "fast_mode" });
+            if (object.count() == 0 or object.count() > 4) return error.InvalidEventFrame;
+            try rejectUnknownKeys(object, &.{ "provider", "model", "effort", "fast_mode" });
+            const provider = if (object.get("provider")) |provider_value| provider_blk: {
+                if (provider_value != .string) return error.InvalidEventFrame;
+                break :provider_blk model_provider.parse(provider_value.string) orelse return error.InvalidEventFrame;
+            } else null;
             const model = if (object.get("model")) |_| try dupeString(alloc, object, "model") else null;
             errdefer if (model) |owned| alloc.free(owned);
             const effort = if (object.get("effort")) |_|
@@ -1266,6 +1312,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 null;
             const fast_mode = if (object.get("fast_mode")) |_| try requireBool(object, "fast_mode") else null;
             break :blk .{ .preferences_changed = .{
+                .provider = provider,
                 .model = model,
                 .effort = effort,
                 .fast_mode = fast_mode,
@@ -1428,10 +1475,18 @@ fn readFrameLine(alloc: Allocator, source: *std.Io.Reader) ![]u8 {
 }
 
 fn parsePreferences(alloc: Allocator, value: std.json.Value) !session_codec.DurableSessionPreferences {
-    const object = try exactObject(value, &.{ "model", "effort", "fast_mode" });
+    const raw_object = try requireObject(value);
+    const object = if (raw_object.get("provider") != null)
+        try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" })
+    else
+        try exactObject(value, &.{ "model", "effort", "fast_mode" });
     const model = try dupeString(alloc, object, "model");
     errdefer alloc.free(model);
     return .{
+        .provider = if (object.get("provider")) |provider_value| blk: {
+            if (provider_value != .string) return error.InvalidEventFrame;
+            break :blk model_provider.parse(provider_value.string) orelse return error.InvalidEventFrame;
+        } else .gateway,
         .model = model,
         .effort = types.ReasoningEffort.parse(
             try requireString(object, "effort"),
@@ -1448,9 +1503,11 @@ fn writePreferences(
     try writeJsonString(writer, preferences.model);
     try writer.writeAll(",\"effort\":");
     try writeJsonString(writer, preferences.effort.label());
-    try writer.print(",\"fast_mode\":{s}}}", .{
+    try writer.print(",\"fast_mode\":{s},\"provider\":", .{
         if (preferences.fast_mode) "true" else "false",
     });
+    try writeJsonString(writer, @tagName(preferences.provider));
+    try writer.writeByte('}');
 }
 
 fn exactObject(value: std.json.Value, keys: []const []const u8) !std.json.ObjectMap {
@@ -2706,7 +2763,7 @@ test "recovery checkpoint events replace and clear deterministically" {
         .assistant_source = @constCast("partial"),
         .cause = .network_interrupted,
         .action = .continuing_response,
-        .route_model = @constCast("test/model"),
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
         .requested_fast_mode = false,
         .fast_mode = false,
         .max_provider_attempts = 10,

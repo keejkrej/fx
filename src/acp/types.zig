@@ -270,7 +270,7 @@ test "writeToolCallUpdate can include structured command result" {
         "call_002",
         .completed,
         "exit_code=0\n<stdout>\nok\n</stdout>\n",
-        "{\"kind\":\"foreground\",\"command\":\"printf ok\",\"cwd\":\"/tmp\",\"exit_code\":0,\"signal\":null,\"timed_out\":false,\"stdout_bytes\":2,\"stderr_bytes\":0,\"truncated\":false,\"sandbox_denied\":false}",
+        "{\"kind\":\"foreground\",\"command\":\"printf ok\",\"cwd\":\"/tmp\",\"exit_code\":0,\"signal\":null,\"timed_out\":false,\"stdout_bytes\":2,\"stderr_bytes\":0,\"truncated\":false}",
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
     defer parsed.deinit();
@@ -345,12 +345,14 @@ test "model recovery info update is structured and clearable" {
         .cause = .system_resumed,
         .action = .paused,
         .required_action = .continue_later,
+        .delay_seconds = 4,
         .diagnostic = core_types.ModelFailureDiagnostic.init("ConnectionResetByPeer"),
     }, true);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"state\":\"paused\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"cause\":\"system_resumed\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"requiredAction\":\"continue_later\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"attempt\":4") != null);
+    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"delaySeconds\":4") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"durable\":true") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "ConnectionResetByPeer") != null);
 

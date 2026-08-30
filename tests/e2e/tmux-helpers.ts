@@ -149,13 +149,12 @@ export function fakeGatewayToolCall(
 }
 
 export function fakeGatewayPermissionDecision(
-  decision: "allow" | "ask" = "allow",
+  decision: "clear" | "caution" = "clear",
   toolCallId = "permission_decision_1",
   rationale = "test fixture",
 ) {
   return fakeGatewayToolCall(toolCallId, "permission_decision", {
-    risk: decision === "allow" ? "low" : "high",
-    authorization: decision === "allow" ? "medium" : "unknown",
+    risk: decision === "clear" ? "low" : "high",
     decision,
     rationale,
   });
@@ -313,7 +312,7 @@ export type FakeGatewayOptions = {
       | FakeGatewayModel[]
       | Response
       | Promise<FakeGatewayModel[] | Response>);
-  classifierDecision?: "allow" | "ask";
+  classifierDecision?: "clear" | "caution";
   classifierResponses?: FakeGatewayResponse[];
   generationResponse?: (
     generationId: string,
@@ -363,7 +362,7 @@ function serveFakeGateway(
         classifierRequests.push({ body, headers });
         const next = classifierResponses.shift();
         if (next) return typeof next === "function" ? await next(body) : next;
-        return fakeGatewayPermissionDecision(options.classifierDecision ?? "allow");
+        return fakeGatewayPermissionDecision(options.classifierDecision ?? "clear");
       }
       requests.push({ body, headers });
       return nextCompletion(body);
@@ -1172,6 +1171,36 @@ export class TmuxSession {
     }
     throw new Error(
       `Timed out waiting for stable composer in ${this.name}.\nLast pane:\n${lastPane}`,
+    );
+  }
+
+  async waitForStableScrollback(
+    predicate: (scrollback: string) => boolean,
+    timeoutMs = 15_000,
+    stableMs = 100,
+  ): Promise<string> {
+    const deadline = Date.now() + timeoutMs;
+    let stableSince: number | null = null;
+    let previousScrollback = "";
+    let lastScrollback = "";
+    while (Date.now() < deadline) {
+      const scrollback = await this.captureFullScrollback();
+      lastScrollback = scrollback;
+      if (predicate(scrollback)) {
+        if (scrollback !== previousScrollback) {
+          previousScrollback = scrollback;
+          stableSince = Date.now();
+        } else if (stableSince !== null && Date.now() - stableSince >= stableMs) {
+          return scrollback;
+        }
+      } else {
+        previousScrollback = "";
+        stableSince = null;
+      }
+      await sleep(25);
+    }
+    throw new Error(
+      `Timed out waiting for stable scrollback in ${this.name}.\nLast scrollback:\n${lastScrollback}`,
     );
   }
 

@@ -46,8 +46,14 @@ pub fn appendAssistantToolCallStep(
     within_turn_suffix: *std.ArrayList(ChatMessage),
     content: ?[]const u8,
     tool_calls: []const ToolCall,
+    provider_state_json: ?[]const u8,
 ) !void {
-    try within_turn_suffix.append(arena, .{ .role = .assistant, .content = content, .tool_calls = tool_calls });
+    try within_turn_suffix.append(arena, .{
+        .role = .assistant,
+        .content = content,
+        .tool_calls = tool_calls,
+        .provider_state_json = provider_state_json,
+    });
 }
 
 pub fn appendToolResultContent(
@@ -275,7 +281,7 @@ pub fn processCommittedFileResult(
     execution: ToolExecutionResult,
     committed_file_tool_name: []u8,
     status_started: bool,
-    file_display_path: ?[]const u8,
+    display_target: ?[]const u8,
     is_file_mutation: bool,
     turn_id: u64,
     advertised_dynamic_tool_names: []const []const u8,
@@ -305,23 +311,23 @@ pub fn processCommittedFileResult(
     }
     const committed_contract_degraded =
         execution.status != .success or
-        execution.prepared_result_memory == null or
+        !execution.tool_result_memory_prepared or
+        execution.tool_result_memory == null or
         execution.diff_entry != null or
-        execution.display_output != null or
         execution.finish_turn;
     if (committed_contract_degraded) {
         debug_trace.eventf(
             "tool",
             "committed_result_contract_degraded",
             step_ctx,
-            "call_id={s} name={s} status={s} memory={s} diff={s} display={s} finish_turn={s}",
+            "call_id={s} name={s} status={s} memory={s} diff={s} finish_turn={s}",
             .{
                 tool_call.id,
                 tool_call.name,
                 @tagName(execution.status),
-                if (execution.prepared_result_memory != null) "true" else "false",
+                if (execution.tool_result_memory_prepared and
+                    execution.tool_result_memory != null) "true" else "false",
                 if (execution.diff_entry != null) "true" else "false",
-                if (execution.display_output != null) "true" else "false",
                 if (execution.finish_turn) "true" else "false",
             },
         );
@@ -330,11 +336,14 @@ pub fn processCommittedFileResult(
         }
     }
 
-    var prepared_memory = execution.prepared_result_memory orelse
-        types.ToolResultMemory{
-            .output_bytes = execution.model_output.len,
-            .stored_output_bytes = execution.model_output.len,
-        };
+    const fallback_memory = types.ToolResultMemory{
+        .output_bytes = execution.model_output.len,
+        .stored_output_bytes = execution.model_output.len,
+    };
+    var prepared_memory = if (execution.tool_result_memory_prepared)
+        execution.tool_result_memory orelse fallback_memory
+    else
+        fallback_memory;
     prepared_memory.committed_file_presentation = runtime_execution_memory.captureCommittedFilePresentation(
         history_allocator,
         handoff,
@@ -389,7 +398,7 @@ pub fn processCommittedFileResult(
         turn_id,
         execution_call,
         status_started,
-        file_display_path,
+        display_target,
         handoff.preview,
         advertised_dynamic_tool_names,
     ) catch |err| {
@@ -549,7 +558,7 @@ test "drained batch feedback follows all tool results and keeps its source call"
         .{ .id = "call_second", .name = "run_command", .arguments_json = "{}" },
     };
 
-    try appendAssistantToolCallStep(alloc, &suffix, null, &calls);
+    try appendAssistantToolCallStep(alloc, &suffix, null, &calls, null);
     try appendToolResultContent(
         alloc,
         &suffix,

@@ -13,7 +13,6 @@ pub const AuthorityPreparation = struct {
     workspace_root: []const u8,
     cwd: []const u8,
     transport_role: contracts.TransportRole,
-    sandbox_backend: @FieldType(contracts.Principal, "sandbox_backend"),
     backend: contracts.Backend,
     actor: contracts.ActorRole,
     controls: contracts.AllowedControls,
@@ -119,7 +118,6 @@ fn construct_start_persistence(
                 .workspace_root = input.workspace_root,
                 .cwd = input.cwd,
                 .transport_role = input.transport_role,
-                .sandbox_backend = input.sandbox_backend,
                 .backend = input.backend,
                 .lifetime = input.lifetime,
             },
@@ -197,17 +195,42 @@ fn free_repeated_probes(
     alloc.free(probes);
 }
 
+inline fn failOwnedAuthorityClaim(err: anytype) @TypeOf(err)!OwnedAuthorityClaim {
+    return @errorCast(failOwnedAuthorityClaimDynamic(err));
+}
+
+noinline fn failOwnedAuthorityClaimDynamic(err: anyerror) anyerror!OwnedAuthorityClaim {
+    return err;
+}
+
+test "owned authority claim failures preserve exact error types and identities" {
+    const invalid = failOwnedAuthorityClaim(error.InvalidAuthorityGrant);
+    try std.testing.expect(
+        @TypeOf(invalid) == error{InvalidAuthorityGrant}!OwnedAuthorityClaim,
+    );
+    try std.testing.expectError(error.InvalidAuthorityGrant, invalid);
+    try std.testing.expectError(
+        error.OutOfMemory,
+        failOwnedAuthorityClaim(error.OutOfMemory),
+    );
+}
+
 pub fn ownAuthorityClaim(
     alloc: Allocator,
     authority_claim: contracts.AuthorityClaim,
     controls: contracts.AllowedControls,
 ) !OwnedAuthorityClaim {
-    try authority_claim.validate();
-    if (!controls.any()) return error.InvalidAuthorityGrant;
+    authority_claim.validate() catch |err|
+        return failOwnedAuthorityClaim(err);
+    if (!controls.any()) {
+        return failOwnedAuthorityClaim(error.InvalidAuthorityGrant);
+    }
+    const principal = dupe_principal(alloc, authority_claim.principal) catch |err|
+        return failOwnedAuthorityClaim(err);
     return .{
         .alloc = alloc,
         .value = .{
-            .principal = try dupe_principal(alloc, authority_claim.principal),
+            .principal = principal,
             .actor = authority_claim.actor,
             .generation = authority_claim.generation,
             .proof = authority_claim.proof,
@@ -252,7 +275,6 @@ fn dupe_principal(
         .workspace_root = workspace_root,
         .cwd = cwd,
         .transport_role = principal.transport_role,
-        .sandbox_backend = principal.sandbox_backend,
         .backend = principal.backend,
         .lifetime = principal.lifetime,
     };
@@ -278,7 +300,6 @@ fn dupe_owner_catalog_principal(
         .durable_session_id = durable_session_id,
         .workspace_root = try alloc.dupe(u8, principal.workspace_root),
         .transport_role = principal.transport_role,
-        .sandbox_backend = principal.sandbox_backend,
     };
 }
 
@@ -431,7 +452,6 @@ fn test_preparation() AuthorityPreparation {
         .workspace_root = "/workspace",
         .cwd = "/workspace/project",
         .transport_role = .interactive,
-        .sandbox_backend = .none,
         .backend = .native,
         .actor = .agent,
         .controls = .full(),
