@@ -1,18 +1,18 @@
-## About this fork
+## Why this fork
 
-This is **keejkrej/fx**, a fork of [vercel-labs/fx](https://github.com/vercel-labs/fx) (the public `fx` project from Vercel).
+Codex and Grok Build already have OAuth. This fork is the missing terminal UX on [vercel-labs/fx](https://github.com/vercel-labs/fx).
 
-Upstream fx is built around Vercel AI Gateway. This line is not. The agent talks to a normal OpenAI-compatible Chat Completions API: any server that speaks `POST /v1/chat/completions`, local or hosted.
+Keep upstream sign-in: `fx login grok`, `fx login codex`. This line does not reimplement OAuth.
 
-What this fork is for:
+**No Gateway.** Point fx at any OpenAI-compatible `/v1/chat/completions` server, or keep those logins. No Vercel account, no AI Gateway billing.
 
-- **Drop the Gateway requirement.** Point fx at a base URL and API key. No Vercel account, no AI Gateway billing, no `fx login` just to run the agent.
-- **Use a normal OpenAI-compatible endpoint.** `fx setup` (or `FX_OPENAI_BASE_URL` and `FX_OPENAI_API_KEY`) is the primary path. Model names come from that server.
-- **Add features on top.** Embedded Lua 5.4 for commands, keymaps, and hooks (`/lua`), plus a read-only `/view`er. `lua/diffview` is a working plugin: `/diffview` opens an in-TUI review (file list, side-by-side or unified hunks, add/remove color) inside fx, not a separate terminal. Press `c` on a hunk, type a note, and Enter injects that comment (path, line range, quoted lines, and the note) into the main agent input box as context. Clipboard **image-buffer** paste (Ctrl+V or `/paste`) writes screenshot bytes from the clipboard to a temp PNG under `/tmp` and attaches that file as `[Image N]` on Linux (wl-paste / xclip) and Windows, not just macOS. A grim/hyprshot/Win+Shift+S copy is enough; you do not save a PNG yourself. There is no separate vision channel.
+**Lua, demoed by an in-TUI diff view.** `/diffview` is Lumen-like and embedded: file list, hunks, side-by-side. Comment a hunk (`c`) and the note lands in the agent input box as context, ready to send.
 
-Install and upgrade from [this repo's GitHub Releases](https://github.com/keejkrej/fx/releases), not the official `curl | bash` from fx.sh.
+**Screenshot paste that works.** Copy pixels on Omarchy, Hyprland, Windows, or Linux. Ctrl+V writes PNG bytes to a temp file and attaches `[Image N]` like a normal image. You do not copy a PNG from disk first. That is the gap in Grok Build.
 
-The rest of this README is upstream's. For this fork, start with `fx setup`, not `fx login`.
+Install from [this repo's GitHub Releases](https://github.com/keejkrej/fx/releases), not `curl | bash` from fx.sh.
+
+The rest of this README is upstream's.
 
 ```
  ⠀⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀
