@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { REPO_ROOT } from "../evals/eval-helpers";
@@ -92,6 +92,14 @@ function copyClipboardText(text: string): boolean {
   return false;
 }
 
+function x11AuthorityPath(): string | undefined {
+  if (process.env.XAUTHORITY && existsSync(process.env.XAUTHORITY)) {
+    return process.env.XAUTHORITY;
+  }
+  const fallback = join(process.env.HOME ?? "", ".Xauthority");
+  return existsSync(fallback) ? fallback : undefined;
+}
+
 async function launchFx(): Promise<{ terminal: TmuxSession; stderrPath: string }> {
   const root = mkdtempSync(join(tmpdir(), "fx-clipboard-image-"));
   const home = join(root, "home");
@@ -106,6 +114,9 @@ async function launchFx(): Promise<{ terminal: TmuxSession; stderrPath: string }
     stderrPath,
     env: {
       HOME: home,
+      DISPLAY: process.env.DISPLAY,
+      WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY,
+      XAUTHORITY: x11AuthorityPath(),
       AI_GATEWAY_API_KEY: undefined,
       FX_AUTO_UPGRADE: "0",
       FX_DISABLE_KEYCHAIN: "1",
