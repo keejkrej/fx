@@ -249,7 +249,7 @@ main() {
   info "Installed ${install_dir}/${fx_name}"
   printf '\nRun:\n  fx\n'
   if [[ ":${PATH}:" != *":${install_dir}:"* ]]; then
-    printf 'If the command is not found, open a new shell or:\n  export PATH="%s:%s"\n' "$install_dir" '$PATH'
+    printf "If the command is not found, open a new shell or:\n  export PATH=\"%s:\$PATH\"\n" "$install_dir"
   fi
 }
 
