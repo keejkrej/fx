@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { REPO_ROOT } from "../evals/eval-helpers";
-import { composerContains, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { composerContains, TmuxSession, tmuxAvailable, isComposerLine } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
 const ONE_BY_ONE_PNG = Buffer.from(
@@ -174,7 +174,7 @@ describe.skipIf(!tmuxAvailable())("tui: click [Image N] opens the system viewer"
 
       const composerRow = pane
         .split("\n")
-        .findIndex((line) => line.includes("[Image 1]") && /❯|>/.test(line)) + 1;
+        .findIndex((line) => isComposerLine(line) && line.includes("[Image 1]")) + 1;
       expect(composerRow).toBeGreaterThan(0);
       const click = `\x1b[<0;4;${composerRow}M`;
       await terminal.sendHexBytes(
