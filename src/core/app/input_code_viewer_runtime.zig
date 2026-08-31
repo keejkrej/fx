@@ -37,6 +37,7 @@ const ViewerKey = union(enum) {
     toggle_layout,
     toggle_file_list,
     comment,
+    cycle,
     confirm,
     cancel,
     prompt_byte: u8,
@@ -72,6 +73,14 @@ pub fn Runtime(comptime App: type) type {
                         const body_rows = code_viewer_layout.regions(owned_app.shell.layout.rows).body_rows;
                         switch (owned_key) {
                             .quit, .interrupt => {
+                                try app_code_viewer_runtime.Runtime(App).close(owned_app);
+                                return;
+                            },
+                            .cycle => {
+                                if (comptime @hasField(App, "scripting")) {
+                                    const app_lua_runtime = @import("app_lua_runtime.zig");
+                                    if (try app_lua_runtime.Runtime(App).cycleView(owned_app)) return;
+                                }
                                 try app_code_viewer_runtime.Runtime(App).close(owned_app);
                                 return;
                             },
@@ -151,7 +160,8 @@ fn keyForByte(mode: app_code_viewer_runtime.Mode, byte: u8) ?ViewerKey {
     }
     return switch (byte) {
         ctrl_c => .interrupt,
-        'q', 'Q', ctrl_t => .quit,
+        'q', 'Q' => .quit,
+        ctrl_t => .cycle,
         ctrl_l => .redraw,
         ctrl_x => .subagent_manager,
         'j' => .{ .move = 1 },

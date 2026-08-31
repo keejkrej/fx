@@ -109,7 +109,8 @@ describe.skipIf(SKIP)("tui: Lua init.lua", () => {
       await session.waitForComposer(10_000);
       await session.sendText("/lua");
       const status = await session.waitForText("/diffview", 5_000);
-      expect(status).toContain("Ctrl-T toggles agent and diff");
+      expect(status).toContain("Ctrl-T cycles agent / diff / code");
+      expect(status).toContain("/codeview");
       await session.sendHexBytes(["14"]);
       const pane = await session.waitForText("DIFFVIEW_DEMO_OLD", 5_000);
       expect(pane).toContain("lua/diffview/demo.lua");
@@ -117,7 +118,7 @@ describe.skipIf(SKIP)("tui: Lua init.lua", () => {
       expect(pane).toContain("README.md");
       expect(pane).toContain("unified");
       expect(pane).not.toMatch(/\s+side\s+/);
-      expect(pane).toContain("ctrl-t agent");
+      expect(pane).toContain("ctrl-t cycle");
       expect(pane).toContain("h/l file");
       expect(pane).toContain("{/} hunk");
       expect(pane).toContain("q quit");
@@ -125,12 +126,19 @@ describe.skipIf(SKIP)("tui: Lua init.lua", () => {
       const next = await session.waitForText("DIFFVIEW_FILE_README", 5_000);
       expect(next).toMatch(/2\/3/);
       await session.sendHexBytes(["14"]);
+      const code = await session.waitForText("CODEVIEW_DEMO", 5_000);
+      expect(code).toContain("CODEVIEW_DEMO_LINE");
+      expect(code).toContain("lua/codeview/demo.lua");
+      expect(code).toContain("ctrl-t cycle");
+      expect(code).not.toContain("DIFFVIEW_DEMO_OLD");
+      await session.sendHexBytes(["14"]);
       const after = await session.waitForComposer(10_000);
       expect(hasEmptyComposer(after)).toBe(true);
       expect(after).not.toContain("DIFFVIEW_DEMO_OLD");
+      expect(after).not.toContain("CODEVIEW_DEMO_LINE");
       await session.sendHexBytes(["14"]);
       const again = await session.waitForText("DIFFVIEW_DEMO_OLD", 5_000);
-      expect(again).toContain("ctrl-t agent");
+      expect(again).toContain("ctrl-t cycle");
       await session.sendKeys("q");
       const closed = await session.waitForComposer(10_000);
       expect(hasEmptyComposer(closed)).toBe(true);
@@ -141,7 +149,7 @@ describe.skipIf(SKIP)("tui: Lua init.lua", () => {
   );
 
   test(
-    "/diffview comment injects a hunk note; Ctrl-T returns to the agent input",
+    "/diffview comment injects a hunk note; q returns to the agent input",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-lua-diffview-comment-"));
       const home = join(root, "home");
@@ -172,10 +180,10 @@ describe.skipIf(SKIP)("tui: Lua init.lua", () => {
       await session.sendLiteralText("DIFFVIEW_COMMENT_NOTE");
       await session.sendKeys("Enter");
       const stillDiff = await session.waitForText("DIFFVIEW_DEMO_OLD", 5_000);
-      expect(stillDiff).toContain("ctrl-t agent");
+      expect(stillDiff).toContain("ctrl-t cycle");
       expect(stillDiff).toContain("q quit");
       expect(composerContains(stillDiff, "DIFFVIEW_COMMENT_NOTE")).toBe(false);
-      await session.sendHexBytes(["14"]);
+      await session.sendKeys("q");
       const pane = await session.waitForText("DIFFVIEW_COMMENT_NOTE", 10_000);
       expect(pane).toContain("Diff comment on lua/diffview/demo.lua");
       expect(pane).toContain("```diff");

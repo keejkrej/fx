@@ -1,6 +1,6 @@
--- Workspace Lua plugins. Two shipped demos of the plugin API:
--- `lua/diffview` (Ctrl-T toggles full-screen unified diff; comments-to-input)
--- and `lua/clipboard_paste` (Linux/Windows screenshot buffer paste via
--- fx.paste.hook; macOS clipboard images stay first-class in core).
-require("diffview")
+-- Workspace Lua plugins. `lua/views` is the full-screen view pack:
+-- `lua/diffview` and `lua/codeview` each register with `fx.view.register`.
+-- Ctrl-T cycles agent / diff / code. `lua/clipboard_paste` fills Linux/Windows
+-- screenshot buffer paste; macOS clipboard images stay first-class in core.
+require("views")
 require("clipboard_paste")

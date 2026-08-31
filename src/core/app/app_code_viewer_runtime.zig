@@ -953,6 +953,9 @@ pub fn Runtime(comptime App: type) type {
                     app_lsp_runtime.Runtime(App).didOpen(app, path, source);
                 }
                 try enterScreen(app);
+                if (comptime @hasField(App, "scripting")) {
+                    app.scripting.activateView("code");
+                }
                 return;
             }
             try writeViewNotice(app, .@"error", "The code viewer is unavailable in this runtime.");
@@ -986,6 +989,9 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 };
                 try enterScreen(app);
+                if (comptime @hasField(App, "scripting")) {
+                    app.scripting.activateView("diff");
+                }
                 return;
             }
             try writeViewNotice(app, .@"error", "The code viewer is unavailable in this runtime.");
@@ -1004,6 +1010,9 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
                 app.code_viewer.clear();
+            }
+            if (comptime @hasField(App, "scripting")) {
+                app.scripting.clearActiveView();
             }
         }
 

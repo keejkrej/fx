@@ -72,6 +72,15 @@ pub fn Runtime(comptime App: type) type {
             return handled;
         }
 
+        pub fn cycleView(app: *App) !bool {
+            if (comptime !scripting.enabled) return false;
+            if (!app.scripting.hasViews()) return false;
+            app.scripting.bindHost(host(app));
+            const result = app.scripting.cycleView();
+            try flushNotices(app);
+            return result != .none;
+        }
+
         pub fn dispatchPaste(app: *App, source: []const u8, text: ?[]const u8) bool {
             if (comptime !scripting.enabled) return false;
             app.scripting.bindHost(host(app));
@@ -120,6 +129,7 @@ pub fn Runtime(comptime App: type) type {
                 .allow_process = allowProcess,
                 .start_lsp = startLsp,
                 .stop_lsp = stopLsp,
+                .close_view = closeView,
             };
         }
 
@@ -327,6 +337,14 @@ pub fn Runtime(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(raw));
             if (comptime !@hasField(App, "permission_engine")) return false;
             return app.permission_engine.mode == .yolo;
+        }
+
+        fn closeView(raw: *anyopaque) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(raw));
+            if (comptime @hasField(App, "code_viewer")) {
+                const app_code_viewer_runtime = @import("app_code_viewer_runtime.zig");
+                try app_code_viewer_runtime.Runtime(App).close(app);
+            }
         }
 
         fn startLsp(raw: *anyopaque, spec: scripting.LspStartSpec) anyerror!void {

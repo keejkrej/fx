@@ -484,11 +484,11 @@ fn composeHint(alloc: Allocator, input: PaintInput) !std.ArrayList(u8) {
     const text = switch (input.mode) {
         .browse => if (input.kind == .diff)
             if (input.file_list.len > 1)
-                "ctrl-t agent  q quit  {/} hunk  h/l file  tab files  c comment"
+                "ctrl-t cycle  q quit  {/} hunk  h/l file  tab files  c comment"
             else
-                "ctrl-t agent  q quit  {/} hunk  c comment  / search"
+                "ctrl-t cycle  q quit  {/} hunk  c comment  / search"
         else
-            "q quit  / search  : line  n/N next  d def  j/k scroll",
+            "ctrl-t cycle  q quit  / search  : line  n/N next  d def",
         .search => "enter find  n/N next  esc clear",
         .goto_line => "enter jump  esc cancel",
         .comment => "enter inject to input  esc cancel",
@@ -823,7 +823,7 @@ test "diff review paints a file list beside the hunks" {
     var hint: std.ArrayList(u8) = .empty;
     defer hint.deinit(alloc);
     try grid.rowTextTrimmed(10, &hint);
-    try std.testing.expect(std.mem.find(u8, hint.items, "ctrl-t agent") != null);
+    try std.testing.expect(std.mem.find(u8, hint.items, "ctrl-t cycle") != null);
     try std.testing.expect(std.mem.find(u8, hint.items, "h/l file") != null);
     try std.testing.expect(std.mem.find(u8, hint.items, "{/} hunk") != null);
     try std.testing.expect(std.mem.find(u8, hint.items, "c comment") != null);

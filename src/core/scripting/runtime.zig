@@ -41,6 +41,8 @@ pub const DiffReview = struct {
     side_by_side: bool = true,
 };
 
+pub const ViewCycleResult = enum { none, opened, closed };
+
 pub const Host = struct {
     ctx: *anyopaque = undefined,
     notify: *const fn (ctx: *anyopaque, message: []const u8, tone: types.NoticeTone) void = silentNotify,
@@ -63,6 +65,7 @@ pub const Host = struct {
     allow_process: *const fn (ctx: *anyopaque) bool = denyProcess,
     start_lsp: *const fn (ctx: *anyopaque, spec: LspStartSpec) anyerror!void = rejectLsp,
     stop_lsp: *const fn (ctx: *anyopaque, name: []const u8) anyerror!void = rejectLspStop,
+    close_view: *const fn (ctx: *anyopaque) anyerror!void = ignoreCloseView,
 };
 
 const RegisteredCommand = struct {
@@ -85,6 +88,11 @@ const RegisteredPasteHook = struct {
     lua_ref: c_int,
 };
 
+const RegisteredView = struct {
+    name: []u8,
+    lua_ref: c_int,
+};
+
 pub const Runtime = struct {
     alloc: Allocator = std.heap.page_allocator,
     host: Host = .{},
@@ -99,6 +107,8 @@ pub const Runtime = struct {
     keymaps: std.ArrayList(RegisteredKeymap) = .empty,
     lua_hooks: std.ArrayList(RegisteredHook) = .empty,
     paste_hooks: std.ArrayList(RegisteredPasteHook) = .empty,
+    views: std.ArrayList(RegisteredView) = .empty,
+    active_view: ?usize = null,
     notices: std.ArrayList(Notice) = .empty,
     hook_text: std.ArrayList(u8) = .empty,
 
@@ -200,6 +210,16 @@ pub const Runtime = struct {
                 }
             }
         }
+        try out.writer.writeAll("\nViews:");
+        if (self.views.items.len == 0) {
+            try out.writer.writeAll("\n  (none)");
+        } else {
+            for (self.views.items) |view| {
+                try out.writer.writeAll("\n  ");
+                try out.writer.writeAll(view.name);
+            }
+            try out.writer.writeAll("\n  Ctrl-T cycles agent and registered views");
+        }
         return out.toOwnedSlice();
     }
 
@@ -254,6 +274,35 @@ pub const Runtime = struct {
             lua.pop(L, 1);
         }
         return true;
+    }
+
+    pub fn hasViews(self: *const Runtime) bool {
+        return self.views.items.len > 0;
+    }
+
+    pub fn cycleView(self: *Runtime) ViewCycleResult {
+        if (comptime !enabled) return .none;
+        self.lock();
+        const result = self.cycleViewLocked();
+        self.unlock();
+        if (result == .closed) {
+            self.host.close_view(self.host.ctx) catch {};
+        }
+        return result;
+    }
+
+    pub fn showView(self: *Runtime, name: []const u8) bool {
+        if (comptime !enabled) return false;
+        const index = self.findViewIndex(name) orelse return false;
+        return self.invokeViewLocked(index);
+    }
+
+    pub fn activateView(self: *Runtime, name: []const u8) void {
+        if (self.findViewIndex(name)) |index| self.active_view = index;
+    }
+
+    pub fn clearActiveView(self: *Runtime) void {
+        self.active_view = null;
     }
 
     pub fn dispatchPaste(self: *Runtime, source: []const u8, text: ?[]const u8) bool {
@@ -363,6 +412,9 @@ pub const Runtime = struct {
         self.keymaps.clearRetainingCapacity();
         self.lua_hooks.clearRetainingCapacity();
         self.paste_hooks.clearRetainingCapacity();
+        for (self.views.items) |view| self.alloc.free(view.name);
+        self.views.clearRetainingCapacity();
+        self.active_view = null;
         if (self.combined_specs.len > 0) {
             self.alloc.free(self.combined_specs);
             self.combined_specs = &.{};
@@ -376,6 +428,7 @@ pub const Runtime = struct {
         self.keymaps.deinit(self.alloc);
         self.lua_hooks.deinit(self.alloc);
         self.paste_hooks.deinit(self.alloc);
+        self.views.deinit(self.alloc);
         self.hook_text.deinit(self.alloc);
         self.freeNotices(self.takeNotices());
         self.notices.deinit(self.alloc);
@@ -452,6 +505,42 @@ pub const Runtime = struct {
             if (self.keymaps.items[i].byte == byte) return &self.keymaps.items[i];
         }
         return null;
+    }
+
+    fn findViewIndex(self: *const Runtime, name: []const u8) ?usize {
+        for (self.views.items, 0..) |view, i| {
+            if (std.mem.eql(u8, view.name, name)) return i;
+        }
+        return null;
+    }
+
+    fn cycleViewLocked(self: *Runtime) ViewCycleResult {
+        if (comptime !enabled) return .none;
+        if (self.views.items.len == 0) return .none;
+        const next: usize = if (self.active_view) |i| i + 1 else 0;
+        if (next >= self.views.items.len) {
+            self.active_view = null;
+            return .closed;
+        }
+        if (!self.invokeViewLocked(next)) return .none;
+        return .opened;
+    }
+
+    fn invokeViewLocked(self: *Runtime, index: usize) bool {
+        if (comptime !enabled) return false;
+        if (index >= self.views.items.len) return false;
+        const L = self.state orelse return false;
+        if (!lua.checkstack(L, 2)) return false;
+        self.active_view = index;
+        _ = lua.lua_rawgeti(L, lua.REGISTRYINDEX, self.views.items[index].lua_ref);
+        if (lua.pcall(L, 0, 0, 0) != lua.OK) {
+            const err = lua.tostring(L, -1) orelse "Lua view failed";
+            self.addNotice(.@"error", "{s}", .{err}) catch {};
+            lua.pop(L, 1);
+            self.active_view = null;
+            return false;
+        }
+        return true;
     }
 
     fn addNotice(self: *Runtime, tone: types.NoticeTone, comptime fmt: []const u8, args: anytype) !void {
@@ -576,6 +665,12 @@ pub const Runtime = struct {
         lua.lua_setfield(L, -2, "open");
         lua.pushcfunction(L, apiViewDiff);
         lua.lua_setfield(L, -2, "diff");
+        lua.pushcfunction(L, apiViewRegister);
+        lua.lua_setfield(L, -2, "register");
+        lua.pushcfunction(L, apiViewShow);
+        lua.lua_setfield(L, -2, "show");
+        lua.pushcfunction(L, apiViewCycle);
+        lua.lua_setfield(L, -2, "cycle");
         lua.lua_setfield(L, -2, "view");
 
         lua.newtable(L);
@@ -714,6 +809,7 @@ fn rejectLsp(_: *anyopaque, _: LspStartSpec) anyerror!void {
 fn rejectLspStop(_: *anyopaque, _: []const u8) anyerror!void {
     return error.LspUnavailable;
 }
+fn ignoreCloseView(_: *anyopaque) anyerror!void {}
 
 fn sandboxedDenied(L: ?*lua.State) callconv(.c) c_int {
     if (comptime !enabled) return 0;
@@ -960,6 +1056,7 @@ fn apiViewOpen(L: ?*lua.State) callconv(.c) c_int {
     rt.host.open_view(rt.host.ctx, path, line) catch |err| {
         return lua.raise(L, @errorName(err));
     };
+    rt.activateView("code");
     return 0;
 }
 
@@ -977,6 +1074,7 @@ fn apiViewDiff(L: ?*lua.State) callconv(.c) c_int {
     rt.host.open_diff(rt.host.ctx, path, old_text, new_text, line) catch |err| {
         return lua.raise(L, @errorName(err));
     };
+    rt.activateView("diff");
     return 0;
 }
 
@@ -1060,6 +1158,51 @@ fn apiViewDiffReview(L: ?*lua.State, rt: *Runtime) c_int {
     }) catch |err| {
         return lua.raise(L, @errorName(err));
     };
+    rt.activateView("diff");
+    return 0;
+}
+
+fn apiViewRegister(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    lua.luaL_checktype(L, 1, lua.TSTRING);
+    lua.luaL_checktype(L, 2, lua.TFUNCTION);
+    const name = lua.tostring(L, 1) orelse return lua.raise(L, "view name required");
+    if (!validViewName(name)) return lua.raise(L, "invalid view name");
+    lua.lua_pushvalue(L, 2);
+    const ref = lua.luaL_ref(L, lua.REGISTRYINDEX);
+    if (rt.findViewIndex(name)) |index| {
+        lua.luaL_unref(L, lua.REGISTRYINDEX, rt.views.items[index].lua_ref);
+        rt.views.items[index].lua_ref = ref;
+        return 0;
+    }
+    const copied = rt.alloc.dupe(u8, name) catch {
+        lua.luaL_unref(L, lua.REGISTRYINDEX, ref);
+        return lua.raise(L, "OutOfMemory");
+    };
+    rt.views.append(rt.alloc, .{ .name = copied, .lua_ref = ref }) catch {
+        rt.alloc.free(copied);
+        lua.luaL_unref(L, lua.REGISTRYINDEX, ref);
+        return lua.raise(L, "OutOfMemory");
+    };
+    return 0;
+}
+
+fn apiViewShow(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    lua.luaL_checktype(L, 1, lua.TSTRING);
+    const name = lua.tostring(L, 1) orelse return lua.raise(L, "view name required");
+    if (!rt.showView(name)) return lua.raise(L, "unknown view");
+    return 0;
+}
+
+fn apiViewCycle(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    if (rt.cycleViewLocked() == .closed) {
+        rt.host.close_view(rt.host.ctx) catch {};
+    }
     return 0;
 }
 
@@ -1298,6 +1441,16 @@ fn normalizeCommandName(alloc: Allocator, name: []const u8) ![]u8 {
     slash[0] = '/';
     @memcpy(slash[1..], trimmed);
     return slash;
+}
+
+fn validViewName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 32) return false;
+    for (name, 0..) |byte, i| {
+        const ok = std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-';
+        if (!ok) return false;
+        if (i == 0 and !std.ascii.isAlphabetic(byte)) return false;
+    }
+    return true;
 }
 
 fn parseKeymapLhs(lhs: []const u8) ?u8 {
@@ -1781,6 +1934,76 @@ test "fx.keymap Ctrl-T opens a unified review" {
     try std.testing.expect(!ctx.side_by_side);
     try std.testing.expectEqualStrings("demo.lua", ctx.path.items);
     try std.testing.expect(!runtime.dispatchKeymap(19));
+}
+
+test "fx.view.register cycles agent and named full-screen views" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.view.register("diff", function()
+        \\  fx.view.diff({
+        \\    files = { { path = "a.lua", old = "old", new = "new" } },
+        \\    layout = "unified",
+        \\  })
+        \\end)
+        \\fx.view.register("code", function()
+        \\  fx.view.open("demo.lua")
+        \\end)
+        \\
+    );
+
+    const Ctx = struct {
+        last: std.ArrayList(u8) = .empty,
+        closed: usize = 0,
+        alloc: Allocator,
+        fn review(raw: *anyopaque, spec: DiffReview) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.last.clearRetainingCapacity();
+            try ctx.last.appendSlice(ctx.alloc, "diff:");
+            if (spec.files.len >= 1) try ctx.last.appendSlice(ctx.alloc, spec.files[0].path);
+        }
+        fn open(raw: *anyopaque, path: []const u8, _: ?u32) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.last.clearRetainingCapacity();
+            try ctx.last.appendSlice(ctx.alloc, "code:");
+            try ctx.last.appendSlice(ctx.alloc, path);
+        }
+        fn close(raw: *anyopaque) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.closed += 1;
+            ctx.last.clearRetainingCapacity();
+            try ctx.last.appendSlice(ctx.alloc, "agent");
+        }
+    };
+    var ctx = Ctx{ .alloc = alloc };
+    defer ctx.last.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .open_review = Ctx.review,
+        .open_view = Ctx.open,
+        .close_view = Ctx.close,
+    });
+    runtime.loadInit(null, workspace);
+    try std.testing.expect(runtime.hasViews());
+    try std.testing.expectEqual(ViewCycleResult.opened, runtime.cycleView());
+    try std.testing.expectEqualStrings("diff:a.lua", ctx.last.items);
+    try std.testing.expectEqual(ViewCycleResult.opened, runtime.cycleView());
+    try std.testing.expectEqualStrings("code:demo.lua", ctx.last.items);
+    try std.testing.expectEqual(ViewCycleResult.closed, runtime.cycleView());
+    try std.testing.expectEqual(@as(usize, 1), ctx.closed);
+    try std.testing.expectEqualStrings("agent", ctx.last.items);
+    try std.testing.expectEqual(ViewCycleResult.opened, runtime.cycleView());
+    try std.testing.expectEqualStrings("diff:a.lua", ctx.last.items);
 }
 
 test "workspace lua plugin can require and register a command" {
