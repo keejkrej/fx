@@ -113,8 +113,40 @@ const terminal_direct_runtime = @import("core/terminal/direct_runtime.zig");
 const app_terminal_runtime = @import("core/app/app_terminal_runtime.zig");
 const app_terminal_takeover_runtime = @import("core/app/app_terminal_takeover_runtime.zig");
 const terminal_host = @import("core/terminal/host.zig");
-const terminal_native_session = @import("core/terminal/native_session.zig");
-const terminal_tmux_session = @import("core/terminal/tmux_session.zig");
+const terminal_native_session = if (terminal_host.isSupported())
+    @import("core/terminal/native_session.zig")
+else
+    struct {
+        pub fn isControlModeRaw(_: []const [*:0]const u8) bool {
+            return false;
+        }
+        pub fn isLauncherModeRaw(_: []const [*:0]const u8) bool {
+            return false;
+        }
+        pub fn runControlMarker(_: []const [*:0]const u8) !void {
+            return error.TerminalHostUnsupported;
+        }
+        pub fn runLauncher(_: std.mem.Allocator) !void {
+            return error.TerminalHostUnsupported;
+        }
+    };
+const terminal_tmux_session = if (terminal_host.isSupported())
+    @import("core/terminal/tmux_session.zig")
+else
+    struct {
+        pub fn isCaptureModeRaw(_: []const [*:0]const u8) bool {
+            return false;
+        }
+        pub fn isLauncherModeRaw(_: []const [*:0]const u8) bool {
+            return false;
+        }
+        pub fn runCapture(_: []const [*:0]const u8) !void {
+            return error.TerminalHostUnsupported;
+        }
+        pub fn runLauncher(_: std.mem.Allocator, _: anytype, _: []const [*:0]const u8) !void {
+            return error.TerminalHostUnsupported;
+        }
+    };
 const session_runtime = @import("core/session/session.zig");
 const session_codec = @import("core/session/session_codec.zig");
 const session_child_store = @import("core/session/session_child_store.zig");
@@ -3206,10 +3238,18 @@ fn rawArgs(c_argc: c_int, c_argv: [*][*:0]c_char) []const [*:0]const u8 {
 }
 
 fn argsFromRaw(raw_args: []const [*:0]const u8) std.process.Args {
+    if (comptime builtin.os.tag == .windows) {
+        _ = @TypeOf(raw_args);
+        return .{ .vector = &[_]u16{} };
+    }
     return .{ .vector = raw_args };
 }
 
 fn environBlockFromRaw(raw_env: RawEnviron) std.process.Environ.Block {
+    if (comptime builtin.os.tag == .windows) {
+        _ = @TypeOf(raw_env);
+        return .global;
+    }
     var count: usize = 0;
     while (raw_env[count] != null) : (count += 1) {}
     return .{ .slice = raw_env[0..count :null] };
@@ -3627,7 +3667,7 @@ fn handleSigWinchWeb() callconv(.c) void {
     resize_interlock.noteResizeSignal();
 }
 
-const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm)
+const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm or builtin.os.tag == .windows)
     handleSigWinchWeb
 else
     handleSigWinchNative;

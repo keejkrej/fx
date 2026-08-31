@@ -26,7 +26,7 @@ const max_launcher_config_bytes: usize = contracts.max_command_bytes * 6 +
 const max_lifecycle_bytes: usize = 8 * 5;
 const control_nonce_len: usize = 32;
 const marker_frame_len: usize = control_nonce_len + 1;
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_file_permissions = io_mod.private_file_permissions;
 const poll_ns: u64 = 5 * std.time.ns_per_ms;
 const cleanup_settle_deadline_ms: i64 = 500;
 const capture_accept_deadline_ms: i64 = 2_000;
@@ -1178,7 +1178,7 @@ pub fn runCapture(raw_args: []const [*:0]const u8) !void {
     try writeAll(stream.socket.handle, backend_identity);
     var buffer: [64 * 1024]u8 = undefined;
     while (true) {
-        const count = try std.posix.read(std.posix.STDIN_FILENO, &buffer);
+        const count = try io_mod.readFd(io_mod.stdinFd(), &buffer);
         if (count == 0) return;
         try writeAll(stream.socket.handle, buffer[0..count]);
     }
@@ -1187,7 +1187,7 @@ pub fn runCapture(raw_args: []const [*:0]const u8) !void {
 fn waitForCaptureStop() !void {
     var buffer: [256]u8 = undefined;
     while (true) {
-        const count = try std.posix.read(std.posix.STDIN_FILENO, &buffer);
+        const count = try io_mod.readFd(io_mod.stdinFd(), &buffer);
         if (count == 0) return;
     }
 }
@@ -1722,7 +1722,7 @@ fn privateSocketExists(socket: []const u8) !bool {
         else => return err,
     };
     if (stat.kind != .unix_domain_socket or
-        stat.permissions.toMode() & 0o777 != 0o600)
+        !io_mod.matchesUnixMode(stat.permissions, 0o600))
     {
         return error.PrivateTmuxEndpointRequired;
     }
@@ -2198,9 +2198,9 @@ fn acceptBeforeDeadline(
     deadline: PeerDeadline,
     cancelled: ?*const std.atomic.Value(bool),
 ) !std.Io.net.Stream {
-    var poll_fds = [_]std.posix.pollfd{.{
+    var poll_fds = [_]io_mod.PollFd{.{
         .fd = server.socket.handle,
-        .events = std.posix.POLL.IN,
+        .events = io_mod.POLL.IN,
         .revents = 0,
     }};
     while (true) {
@@ -2209,11 +2209,11 @@ fn acceptBeforeDeadline(
         }
         const remaining_ms = try deadline.remaining();
         poll_fds[0].revents = 0;
-        if (try std.posix.poll(
+        if (try io_mod.poll(
             &poll_fds,
             @intCast(@min(remaining_ms, deadline_poll_ms)),
         ) == 0) continue;
-        if ((poll_fds[0].revents & std.posix.POLL.IN) == 0) {
+        if ((poll_fds[0].revents & io_mod.POLL.IN) == 0) {
             return error.TmuxPeerUnavailable;
         }
         return server.accept(io_mod.getIo()) catch |err| switch (err) {

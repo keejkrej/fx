@@ -309,7 +309,7 @@ pub const Reader = struct {
                 &.{destination},
             ) catch return 0;
         }
-        return std.posix.read(std.posix.STDIN_FILENO, destination) catch return 0;
+        return io_mod.readFd(io_mod.stdinFd(), destination) catch return 0;
     }
 
     fn readFromSource(self: *Reader) usize {

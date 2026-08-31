@@ -14,7 +14,15 @@ Keep upstream sign-in: `fx login grok`, `fx login codex`. This line does not rei
 - **Screenshot buffer paste (Linux/Windows).** macOS already pastes clipboard images in upstream fx. This plugin fills the gap: screenshot-copy on Omarchy, Hyprland, or Windows puts image bytes on the clipboard; the paste hook writes them to tmp and attaches `[Image N]`. Text passes through. Grok Build makes you copy a PNG from disk first.
 - **Click `[Image N]` to open.** Click the chip in the composer (or a visible transcript badge). fx launches the snapshot with the system viewer (`open` / `xdg-open` / `start`). OSC 8 `file://` links stay in place for terminals that honor them.
 
-Install from [this repo's GitHub Releases](https://github.com/keejkrej/fx/releases), not `curl | bash` from fx.sh.
+Install from this repo's GitHub Releases, not `fx.sh`:
+
+```bash
+curl -fsSL https://github.com/keejkrej/fx/releases/latest/download/install | bash
+```
+
+```powershell
+irm https://github.com/keejkrej/fx/releases/latest/download/install.ps1 | iex
+```
 
 The rest of this README is upstream's.
 
@@ -24,7 +32,7 @@ The rest of this README is upstream's.
  ⠀⠀⠀⣠⣶⣿⣿⣷⣶⡶⣶⣶⣆⠀⠀⠀⣴⣶⣶⠆
  ⠀⠀⠀⠉⢹⣿⣿⠉⠉⠀⠘⢿⣿⣧⣀⣾⣿⡿⠃⠀             Tiny, open, embeddable, native coding agent.
  ⠀⠀⠀⠀⣼⣿⡏⠀⠀⠀⠀⠀⠻⣿⣿⣿⠟⠀⠀⠀
- ⠀⠀⠀⢀⣿⣿⠃⠀⠀⠀⠀⢠⣦⠘⢿⣿⣷⡀⠀⠀             curl -fsSL https://fx.sh/setup.sh | bash
+ ⠀⠀⠀⢀⣿⣿⠃⠀⠀⠀⠀⢠⣦⠘⢿⣿⣷⡀⠀⠀             curl -fsSL https://github.com/keejkrej/fx/releases/latest/download/install | bash
  ⠀⠀⠀⣸⣿⡟⠀⠀⠀⠀⣰⣿⣿⠗⠀⠻⣿⣿⣄⠀
  ⠀⠀⠀⣿⣿⠇⠀⠀⠀⠾⠿⠿⠋⠀⠀⠀⠘⠿⠿⠦             ⚠ Status: Experimental. Use at your own risk.
   ⠀⣸⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -41,9 +49,19 @@ It's open source (Apache-2.0), model-agnostic, and suitable for both local and c
 
 ## Install
 
+Unix and macOS:
+
 ```bash
-curl -fsSL https://fx.sh/setup.sh | bash
+curl -fsSL https://github.com/keejkrej/fx/releases/latest/download/install | bash
 ```
+
+Windows (PowerShell):
+
+```powershell
+irm https://github.com/keejkrej/fx/releases/latest/download/install.ps1 | iex
+```
+
+That installs `fx` to `~/.fx/bin` (Unix) or `%USERPROFILE%\.fx\bin` (Windows) and adds that directory to PATH. Override the destination with `FX_INSTALL_DIR`. Pin a tag with `FX_VERSION=0.0.7`.
 
 ## Run fx
 
@@ -181,7 +199,7 @@ Read the [fx documentation](https://fx.sh/docs).
 Building fx requires [Zig 0.16.0+](https://ziglang.org/download/):
 
 ```bash
-git clone https://github.com/vercel-labs/fx.git
+git clone https://github.com/keejkrej/fx.git
 cd fx
 zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/fx

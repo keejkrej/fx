@@ -65,7 +65,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
-    addLuaLibrary(exe.root_module);
+    addLuaLibrary(exe.root_module, target);
 
     b.installArtifact(exe);
 
@@ -309,8 +309,20 @@ pub fn build(b: *std.Build) void {
     }
 }
 
-fn addLuaLibrary(mod: *std.Build.Module) void {
+fn addLuaLibrary(mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     const b = mod.owner;
+    const lua_flags: []const []const u8 = switch (target.result.os.tag) {
+        .windows => &.{
+            "-std=gnu99",
+            "-DLUA_USE_WINDOWS",
+            "-fno-stack-protector",
+        },
+        else => &.{
+            "-std=gnu99",
+            "-DLUA_USE_POSIX",
+            "-fno-stack-protector",
+        },
+    };
     mod.addIncludePath(b.path("third_party/lua"));
     mod.addCSourceFiles(.{
         .root = b.path("third_party/lua"),
@@ -348,11 +360,7 @@ fn addLuaLibrary(mod: *std.Build.Module) void {
             "lvm.c",
             "lzio.c",
         },
-        .flags = &.{
-            "-std=gnu99",
-            "-DLUA_USE_POSIX",
-            "-fno-stack-protector",
-        },
+        .flags = lua_flags,
     });
 }
 

@@ -53,9 +53,9 @@ pub fn waitForConnection(
     listener: *std.Io.net.Server,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !void {
-    var fds = [_]std.posix.pollfd{.{
+    var fds = [_]io_mod.PollFd{.{
         .fd = listener.socket.handle,
-        .events = std.posix.POLL.IN,
+        .events = io_mod.POLL.IN,
         .revents = 0,
     }};
     var remaining_ms = callback_timeout_ms;
@@ -63,9 +63,9 @@ pub fn waitForConnection(
         try checkCancellation(cancel_flag);
         fds[0].revents = 0;
         const wait_ms = @min(remaining_ms, callback_poll_ms);
-        const ready = try std.posix.poll(&fds, wait_ms);
+        const ready = try io_mod.poll(&fds, wait_ms);
         if (ready > 0) {
-            if ((fds[0].revents & std.posix.POLL.IN) == 0) {
+            if ((fds[0].revents & io_mod.POLL.IN) == 0) {
                 return error.AuthorizationCallbackTimedOut;
             }
             try checkCancellation(cancel_flag);
@@ -199,11 +199,16 @@ fn checkCancellation(cancel_flag: ?*const std.atomic.Value(bool)) !void {
 }
 
 fn setSocketTimeouts(socket: std.posix.socket_t, seconds: i64) void {
-    if (comptime host_target.is_wasm) return;
-    const timeout = std.posix.timeval{ .sec = seconds, .usec = 0 };
-    const bytes = std.mem.asBytes(&timeout);
-    std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch {};
-    std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch {};
+    if (comptime host_target.is_wasm or builtin.os.tag == .windows) {
+        _ = @TypeOf(socket);
+        _ = @TypeOf(seconds);
+        return;
+    } else {
+        const timeout = std.posix.timeval{ .sec = seconds, .usec = 0 };
+        const bytes = std.mem.asBytes(&timeout);
+        std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch {};
+        std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch {};
+    }
 }
 
 test "callback parser reads code state and issuer" {

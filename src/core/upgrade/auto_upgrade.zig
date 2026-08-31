@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const helpers = @import("upgrade_helpers.zig");
 const update_target = @import("update_target.zig");
@@ -207,7 +208,10 @@ pub const AutoUpgrade = struct {
         var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
         defer client.deinit();
 
-        const tmp_base: []const u8 = io_mod.getenv("TMPDIR") orelse "/tmp";
+        const tmp_base: []const u8 = io_mod.getenv("TMPDIR") orelse
+            io_mod.getenv("TEMP") orelse
+            io_mod.getenv("TMP") orelse
+            if (comptime builtin.os.tag == .windows) "." else "/tmp";
         var rand_buf: [8]u8 = undefined;
         io_mod.getIo().random(&rand_buf);
         const rand_hex = std.fmt.bytesToHex(rand_buf, .lower);
@@ -217,28 +221,28 @@ pub const AutoUpgrade = struct {
 
         std.Io.Dir.createDirAbsolute(io_mod.getIo(), tmp_dir, .default_dir) catch return error.ExtractionFailed;
 
-        const archive_path = std.fmt.allocPrint(alloc, "{s}/fx.tar.gz", .{tmp_dir}) catch return error.AllocFailed;
+        const archive_path = std.fmt.allocPrint(alloc, "{s}/fx.{s}", .{ tmp_dir, helpers.archive_ext }) catch return error.AllocFailed;
         defer alloc.free(archive_path);
 
-        const archive_url = std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz", .{ helpers.github_download_base, target.artifactRef(), helpers.platform }) catch return error.AllocFailed;
+        const archive_url = std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.{s}", .{ helpers.github_download_base, target.artifactRef(), helpers.platform, helpers.archive_ext }) catch return error.AllocFailed;
         defer alloc.free(archive_url);
 
         helpers.downloadFileStreaming(&client, archive_url, archive_path) catch return error.DownloadFailed;
 
         if (self.should_stop.load(.acquire)) return error.Cancelled;
 
-        const checksum_url = std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz.sha256", .{ helpers.github_download_base, target.artifactRef(), helpers.platform }) catch return error.AllocFailed;
+        const checksum_url = std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.{s}.sha256", .{ helpers.github_download_base, target.artifactRef(), helpers.platform, helpers.archive_ext }) catch return error.AllocFailed;
         defer alloc.free(checksum_url);
 
         helpers.verifyChecksum(&client, archive_path, checksum_url) catch return error.ChecksumFailed;
 
         if (self.should_stop.load(.acquire)) return error.Cancelled;
 
-        helpers.extractTarGz(alloc, archive_path, tmp_dir) catch return error.ExtractionFailed;
+        helpers.extractArchive(alloc, archive_path, tmp_dir) catch return error.ExtractionFailed;
 
         if (self.should_stop.load(.acquire)) return error.Cancelled;
 
-        const extracted_bin = std.fmt.allocPrint(alloc, "{s}/fx", .{tmp_dir}) catch return error.AllocFailed;
+        const extracted_bin = std.fmt.allocPrint(alloc, "{s}/{s}", .{ tmp_dir, helpers.extracted_binary_name }) catch return error.AllocFailed;
         defer alloc.free(extracted_bin);
 
         var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;

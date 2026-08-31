@@ -37,10 +37,13 @@ Cut a fork release whose GitHub assets `fx upgrade` can install.
 4. Enable Actions on this fork if `gh run list --repo keejkrej/fx --limit 1` is empty. Then push `main`.
 5. Wait for **CI** and **Release** on that exact commit. Release is success only when tag `v<version>` exists, the GitHub Release exists, and these assets are present:
    - `latest.txt` whose body is `v<version>`
+   - `install` and `install.ps1`
    - `fx-linux-x86_64.tar.gz` and `.sha256`
    - `fx-linux-aarch64.tar.gz` and `.sha256`
    - `fx-macos-x86_64.tar.gz` and `.sha256`
    - `fx-macos-aarch64.tar.gz` and `.sha256`
+   - `fx-windows-x86_64.zip` and `.sha256`
+   - `fx-windows-aarch64.zip` and `.sha256`
 6. Ignore a failed **Publish to CDN** step when `BLOB_READ_WRITE_TOKEN` is unset. That is official-CDN publishing. Do not treat it as the upgrade source.
 
 Done when `curl -fsSL https://github.com/keejkrej/fx/releases/latest/download/latest.txt` prints `v<version>` and one platform archive URL under `/releases/download/v<version>/` returns 200.

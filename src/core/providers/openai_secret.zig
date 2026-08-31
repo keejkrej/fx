@@ -101,7 +101,7 @@ fn loadFromDir(alloc: Allocator, backend_dir: *std.Io.Dir) !?[]u8 {
         debug_trace.logf("openai_secret", "load failed step=stat err={s}", .{@errorName(err)});
         return error.StoredKeyUnreadable;
     };
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
+    if (stat.kind != .file or io_mod.isGroupOrWorldAccessible(stat.permissions)) {
         return error.StoredKeyInsecure;
     }
 
@@ -167,7 +167,7 @@ test "openai secret file round-trips at mode 0600" {
 
     try storeInDir(std.testing.allocator, &backend_dir, "sk-test-openai");
     const stat = try tmp.dir.statFile(std.testing.io, profile_paths.api_key_file_name, .{});
-    try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(u32, 0o600), io_mod.posixMode(stat.permissions) & 0o777);
 
     const loaded = (try loadFromDir(std.testing.allocator, &backend_dir.dir)) orelse
         return error.TestUnexpectedMissingStoredKey;
@@ -186,7 +186,7 @@ test "openai secret file refusal stays distinguishable from absence" {
     try std.testing.expect((try loadFromDir(std.testing.allocator, &backend_dir.dir)) == null);
     try storeInDir(std.testing.allocator, &backend_dir, "sk-secret");
     var file = try tmp.dir.openFile(std.testing.io, profile_paths.api_key_file_name, .{ .mode = .read_write });
-    try file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(0o644));
+    try file.setPermissions(std.testing.io, io_mod.permissionsFromUnixMode(0o644));
     file.close(std.testing.io);
     try std.testing.expectError(error.StoredKeyInsecure, loadFromDir(std.testing.allocator, &backend_dir.dir));
 }

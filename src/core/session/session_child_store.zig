@@ -3,8 +3,8 @@ const config_runtime = @import("../config/config_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
-const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_dir_permissions = io_mod.private_dir_permissions;
+const private_file_permissions = io_mod.private_file_permissions;
 
 pub const subagent_relationship_index_file = "relationship-index.bin";
 
@@ -1182,7 +1182,7 @@ fn validateName(name: []const u8) !void {
 fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.SessionPathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o700) {
+    if (!io_mod.matchesUnixMode(stat.permissions, 0o700)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1197,7 +1197,7 @@ fn verifyPrivateOpenedStat(
 ) !void {
     io_mod.verifyOpenedRegularFile(stat, mode) catch
         return error.SessionPathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o600) {
+    if (!io_mod.matchesUnixMode(stat.permissions, 0o600)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1206,7 +1206,7 @@ fn verifyPrivateStat(stat: std.Io.File.Stat) !void {
     if (stat.kind != .file or stat.nlink != 1) {
         return error.SessionPathUnsafe;
     }
-    if (stat.permissions.toMode() & 0o777 != 0o600) {
+    if (!io_mod.matchesUnixMode(stat.permissions, 0o600)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1283,7 +1283,7 @@ fn openTestSession(
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     const display_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
     errdefer alloc.free(display_path);
@@ -1395,7 +1395,7 @@ test "managed child capability rejects invalid names and unsafe routes" {
     try session.dir.createDir(
         io_mod.getIo(),
         "tool-results/wrong-kind",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     try std.testing.expectError(
         error.SessionPathUnsafe,
@@ -1423,11 +1423,11 @@ test "managed child capability rejects invalid names and unsafe routes" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "outside",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     var wrong_kind = try session.dir.createFile(io_mod.getIo(), "artifacts", .{
         .truncate = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = io_mod.permissionsFromUnixMode(0o600),
     });
     wrong_kind.close(io_mod.getIo());
     try std.testing.expectError(
@@ -1508,7 +1508,7 @@ test "retained route handle contains pathname swaps" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "outside",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     try session.dir.rename(
         "tool-results",
@@ -1637,7 +1637,7 @@ test "subagent control capability rejects a symlinked route" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "outside",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     try session.dir.symLink(
         io_mod.getIo(),
@@ -1701,9 +1701,9 @@ test "terminal capabilities are private route restricted and reject symlinks" {
         "terminal/state/record.json",
         .{ .follow_symlinks = false },
     );
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), terminal_stat.permissions.toMode() & 0o777);
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), state_stat.permissions.toMode() & 0o777);
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), record_stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), io_mod.posixMode(terminal_stat.permissions) & 0o777);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), io_mod.posixMode(state_stat.permissions) & 0o777);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), io_mod.posixMode(record_stat.permissions) & 0o777);
 
     try session.dir.rename(
         "terminal",
@@ -1714,7 +1714,7 @@ test "terminal capabilities are private route restricted and reject symlinks" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "outside-terminal",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     try session.dir.symLink(
         io_mod.getIo(),
