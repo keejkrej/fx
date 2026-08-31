@@ -1447,7 +1447,7 @@ test "credential store is private atomic and supports restart deletion" {
     defer root.close(std.testing.io);
     const root_stat = try root.stat(std.testing.io);
     try std.testing.expectEqual(
-        @as(u32, 0o700),
+        @as(io_mod.posix_mode_t, 0o700),
         io_mod.posixMode(root_stat.permissions) & 0o777,
     );
     var credentials_dir = try root.openDir(
@@ -1458,7 +1458,7 @@ test "credential store is private atomic and supports restart deletion" {
     defer credentials_dir.close(std.testing.io);
     const dir_stat = try credentials_dir.stat(std.testing.io);
     try std.testing.expectEqual(
-        @as(u32, 0o700),
+        @as(io_mod.posix_mode_t, 0o700),
         io_mod.posixMode(dir_stat.permissions) & 0o777,
     );
     const file_stat = try credentials_dir.statFile(
@@ -1467,7 +1467,7 @@ test "credential store is private atomic and supports restart deletion" {
         .{},
     );
     try std.testing.expectEqual(
-        @as(u32, 0o600),
+        @as(io_mod.posix_mode_t, 0o600),
         io_mod.posixMode(file_stat.permissions) & 0o777,
     );
 

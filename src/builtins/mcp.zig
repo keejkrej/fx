@@ -1268,7 +1268,7 @@ test "saving MCP config replaces the file durably" {
     try std.testing.expect(std.mem.find(u8, written, "stale") == null);
 
     const stat = try fx_dir.statFile(io_mod.getIo(), "mcp.json", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o600), io_mod.posixMode(stat.permissions) & 0o777);
+    try std.testing.expectEqual(@as(io_mod.posix_mode_t, 0o600), io_mod.posixMode(stat.permissions) & 0o777);
 
     var it = fx_dir.iterate();
     var entries: usize = 0;
@@ -1870,9 +1870,9 @@ test "adding an MCP server creates the profile directory privately" {
     try expectLine(result, "Saved MCP server 'fs'.", true);
 
     const dir_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o700), io_mod.posixMode(dir_stat.permissions) & 0o777);
+    try std.testing.expectEqual(@as(io_mod.posix_mode_t, 0o700), io_mod.posixMode(dir_stat.permissions) & 0o777);
     const file_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx/mcp.json", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o600), io_mod.posixMode(file_stat.permissions) & 0o777);
+    try std.testing.expectEqual(@as(io_mod.posix_mode_t, 0o600), io_mod.posixMode(file_stat.permissions) & 0o777);
 }
 
 test "built-in MCP command preserves usage and missing-home notices" {

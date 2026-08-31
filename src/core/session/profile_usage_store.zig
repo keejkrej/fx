@@ -1374,7 +1374,7 @@ test "profile usage store repairs an existing profile directory to private mode"
     );
 
     const stat = try profile.stat(io_mod.getIo());
-    try std.testing.expectEqual(@as(u32, 0o700), io_mod.posixMode(stat.permissions) & 0o777);
+    try std.testing.expectEqual(@as(io_mod.posix_mode_t, 0o700), io_mod.posixMode(stat.permissions) & 0o777);
 }
 
 test "profile usage reads reject an unsafe profile directory without repairing it" {
@@ -1421,7 +1421,7 @@ test "profile usage reads reject an unsafe profile directory without repairing i
     );
 
     const stat = try profile.stat(io_mod.getIo());
-    try std.testing.expectEqual(@as(u32, 0o755), io_mod.posixMode(stat.permissions) & 0o777);
+    try std.testing.expectEqual(@as(io_mod.posix_mode_t, 0o755), io_mod.posixMode(stat.permissions) & 0o777);
 }
 
 test "profile usage store decodes a large ledger with stable id indexing" {

@@ -167,7 +167,7 @@ test "openai secret file round-trips at mode 0600" {
 
     try storeInDir(std.testing.allocator, &backend_dir, "sk-test-openai");
     const stat = try tmp.dir.statFile(std.testing.io, profile_paths.api_key_file_name, .{});
-    try std.testing.expectEqual(@as(u32, 0o600), io_mod.posixMode(stat.permissions) & 0o777);
+    try std.testing.expectEqual(@as(io_mod.posix_mode_t, 0o600), io_mod.posixMode(stat.permissions) & 0o777);
 
     const loaded = (try loadFromDir(std.testing.allocator, &backend_dir.dir)) orelse
         return error.TestUnexpectedMissingStoredKey;

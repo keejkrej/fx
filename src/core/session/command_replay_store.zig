@@ -1439,7 +1439,7 @@ test "command replay capture spills without losing callback order" {
         .{ .follow_symlinks = false },
     );
     try std.testing.expectEqual(
-        @as(u32, 0o600),
+        @as(io_mod.posix_mode_t, 0o600),
         io_mod.posixMode(replay_stat.permissions) & 0o777,
     );
     var reader = try Reader.open(alloc, &capability, descriptor);

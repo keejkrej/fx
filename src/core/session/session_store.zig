@@ -7704,7 +7704,7 @@ test "same-workspace append defers latest cache contention and marks cache dirty
     defer token.close(io_mod.getIo());
     const token_stat = try token.stat(io_mod.getIo());
     try std.testing.expectEqual(std.Io.File.Kind.file, token_stat.kind);
-    try std.testing.expectEqual(@as(u32, 0o600), io_mod.posixMode(token_stat.permissions) & 0o777);
+    try std.testing.expectEqual(@as(io_mod.posix_mode_t, 0o600), io_mod.posixMode(token_stat.permissions) & 0o777);
     const token_bytes = try io_mod.readFileToEnd(
         alloc,
         &token,
@@ -12553,7 +12553,7 @@ test "missing home is empty for reads and bootstrapped privately for writes" {
     defer home_dir.close(io_mod.getIo());
     const home_stat = try home_dir.stat(io_mod.getIo());
     try std.testing.expectEqual(std.Io.File.Kind.directory, home_stat.kind);
-    try std.testing.expectEqual(@as(u32, 0o700), io_mod.posixMode(home_stat.permissions) & 0o777);
+    try std.testing.expectEqual(@as(io_mod.posix_mode_t, 0o700), io_mod.posixMode(home_stat.permissions) & 0o777);
     const sessions_path = try std.fs.path.join(alloc, &.{ missing_home, ".fx", "sessions" });
     defer alloc.free(sessions_path);
     try std.Io.Dir.accessAbsolute(io_mod.getIo(), sessions_path, .{});
@@ -12647,7 +12647,7 @@ test "first write creates only the private session layout" {
     defer durable_dir.close(io_mod.getIo());
     const durable_stat = try durable_dir.stat(io_mod.getIo());
     try std.testing.expectEqual(
-        @as(u64, 0o700),
+        @as(io_mod.posix_mode_t, 0o700),
         io_mod.posixMode(durable_stat.permissions) & 0o777,
     );
     var durable_iter = durable_dir.iterate();
@@ -12664,7 +12664,7 @@ test "first write creates only the private session layout" {
     defer sessions_dir.close(io_mod.getIo());
     const sessions_stat = try sessions_dir.stat(io_mod.getIo());
     try std.testing.expectEqual(
-        @as(u64, 0o700),
+        @as(io_mod.posix_mode_t, 0o700),
         io_mod.posixMode(sessions_stat.permissions) & 0o777,
     );
     var sessions_iter = sessions_dir.iterate();

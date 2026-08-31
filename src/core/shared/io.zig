@@ -80,8 +80,10 @@ pub fn permissionsFromUnixMode(mode: u32) std.Io.File.Permissions {
     return if (mode & 0o111 != 0) .default_dir else .default_file;
 }
 
-pub fn posixMode(permissions: std.Io.File.Permissions) u32 {
-    if (comptime has_posix_file_mode) return @intCast(permissions.toMode());
+pub const posix_mode_t = if (has_posix_file_mode) std.posix.mode_t else u32;
+
+pub fn posixMode(permissions: std.Io.File.Permissions) posix_mode_t {
+    if (comptime has_posix_file_mode) return permissions.toMode();
     return 0o600;
 }
 
