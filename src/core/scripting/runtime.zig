@@ -1734,6 +1734,55 @@ test "fx.view.diff review table calls the host with every file" {
     try std.testing.expectEqualStrings("b.md", ctx.second_path.items);
 }
 
+test "fx.keymap Ctrl-T opens a unified review" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.keymap("<C-t>", function()
+        \\  fx.view.diff({
+        \\    files = { { path = "demo.lua", old = "old", new = "new" } },
+        \\    layout = "unified",
+        \\  })
+        \\end)
+        \\
+    );
+
+    const Ctx = struct {
+        count: usize = 0,
+        side_by_side: bool = true,
+        path: std.ArrayList(u8) = .empty,
+        alloc: Allocator,
+        fn review(raw: *anyopaque, spec: DiffReview) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.count = spec.files.len;
+            ctx.side_by_side = spec.side_by_side;
+            if (spec.files.len >= 1) try ctx.path.appendSlice(ctx.alloc, spec.files[0].path);
+        }
+    };
+    var ctx = Ctx{ .alloc = alloc };
+    defer ctx.path.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .open_review = Ctx.review,
+    });
+    runtime.loadInit(null, workspace);
+    try std.testing.expect(runtime.dispatchKeymap(20));
+    try std.testing.expectEqual(@as(usize, 1), ctx.count);
+    try std.testing.expect(!ctx.side_by_side);
+    try std.testing.expectEqualStrings("demo.lua", ctx.path.items);
+    try std.testing.expect(!runtime.dispatchKeymap(19));
+}
+
 test "workspace lua plugin can require and register a command" {
     if (comptime !enabled) return error.SkipZigTest;
     const alloc = std.testing.allocator;

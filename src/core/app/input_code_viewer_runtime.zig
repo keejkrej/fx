@@ -9,6 +9,7 @@ const ctrl_c: u8 = 3;
 const ctrl_l: u8 = 12;
 const ctrl_n: u8 = 14;
 const ctrl_p: u8 = 16;
+const ctrl_t: u8 = 20;
 const ctrl_u: u8 = 21;
 const ctrl_d: u8 = 4;
 const ctrl_x: u8 = 24;
@@ -78,9 +79,9 @@ pub fn Runtime(comptime App: type) type {
                             .confirm => {
                                 if (owned_app.code_viewer.mode == .comment) {
                                     try submitDiffComment(App, owned_app);
-                                    return;
+                                } else {
+                                    owned_app.code_viewer.confirmPrompt();
                                 }
-                                owned_app.code_viewer.confirmPrompt();
                             },
                             .comment => owned_app.code_viewer.beginComment(),
                             .prompt_byte => |byte| try owned_app.code_viewer.appendPromptByte(byte),
@@ -134,7 +135,7 @@ fn submitDiffComment(comptime App: type, app: *App) !void {
         defer app.alloc.free(merged);
         try app.input_runtime.textReplacementState().replace(app.alloc, merged);
     }
-    try app_code_viewer_runtime.Runtime(App).close(app);
+    app.code_viewer.cancelPrompt();
 }
 
 fn keyForByte(mode: app_code_viewer_runtime.Mode, byte: u8) ?ViewerKey {
@@ -150,7 +151,7 @@ fn keyForByte(mode: app_code_viewer_runtime.Mode, byte: u8) ?ViewerKey {
     }
     return switch (byte) {
         ctrl_c => .interrupt,
-        'q', 'Q' => .quit,
+        'q', 'Q', ctrl_t => .quit,
         ctrl_l => .redraw,
         ctrl_x => .subagent_manager,
         'j' => .{ .move = 1 },

@@ -1,12 +1,18 @@
--- In-TUI diff review plugin. This is the Lua plugin-system demo: it registers
--- `/diffview`, then opens fx's existing code-viewer owner (not a child
--- terminal) on a multi-file review. Side-by-side, a file list, hunk jumps,
--- and add/remove highlighting are the Lumen-shaped bits. The key interaction
--- is review comments: `c` (or `i`) on a hunk types a note, Enter closes the
--- viewer, and the quoted hunk plus note land in the main agent input box.
--- No separate chat; comments are agent context, ready to send.
+-- In-TUI diff review plugin. This is the Lua plugin-system demo.
+--
+-- Toggle: Ctrl-T (`<C-t>`) switches between the full agent view and this
+-- full-screen unified review. The same key, or `q`, returns to the agent.
+-- `/diffview` opens the same review. The plugin takes over the entire TUI
+-- through fx's code-viewer owner; it does not split the terminal into
+-- agent and diff panes, and it does not open a side-by-side old|new layout.
+--
+-- Comments: `c` (or `i`) on a hunk types a note. Enter injects the quoted
+-- hunk plus note into the agent input and stays in the diff. Toggle back
+-- with Ctrl-T; the composer already has that context, ready to send.
 
 local M = {}
+
+local TOGGLE = "<C-t>"
 
 local FILES = {
   {
@@ -59,14 +65,15 @@ See `/diffview` and DIFFVIEW_FILE_README.
 function M.open()
   fx.view.diff({
     files = FILES,
-    layout = "side",
+    layout = "unified",
   })
 end
 
 function M.setup()
   fx.command("diffview", M.open, {
-    desc = "Open the in-TUI Lua diff-view demo; c comments a hunk into the agent input",
+    desc = "Open the full-screen Lua diff-view demo; Ctrl-T toggles agent and diff",
   })
+  fx.keymap(TOGGLE, M.open)
 end
 
 M.setup()
