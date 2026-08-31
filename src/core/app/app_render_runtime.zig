@@ -52,6 +52,7 @@ const shimmer_runtime = @import("../../ui/transcript/shimmer_runtime.zig");
 const ui_subagents = @import("../../ui/subagent/controller.zig");
 const ui_terminal = @import("../../ui/terminal/terminal.zig");
 const vt_emulator = @import("../terminal/engine.zig");
+const image_chip_click = @import("../images/image_chip_click.zig");
 const transcript_painter = @import("../../ui/transcript/painter.zig");
 const command_output_runtime = @import("../../ui/transcript/command_output_runtime.zig");
 const resume_projection = @import("../../ui/transcript/resume_projection.zig");
@@ -59,6 +60,25 @@ const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
 const assistant_pacer = @import("../../ui/assistant/pacer.zig");
 const user_message_card = @import("../../ui/assistant/user_message_card.zig");
+
+fn syncImageChipMouseTracking(comptime App: type, app: *App) !void {
+    if (comptime !@hasField(App, "terminal")) return;
+    if (comptime !@hasField(App, "metrics")) return;
+    const pending_len: usize = if (comptime @hasField(App, "pending_images"))
+        app.pending_images.items.len
+    else
+        0;
+    const grid = if (comptime @hasField(@TypeOf(app.shell), "shadow_vt"))
+        app.shell.shadow_vt
+    else
+        null;
+    try app_lifecycle.syncInlineMouseTracking(
+        &app.terminal,
+        &app.shell,
+        &app.metrics,
+        image_chip_click.mouseTrackingWanted(pending_len, grid),
+    );
+}
 
 fn set_transcript_assistant_tail_writable(
     runtime: *transcript_runtime.TranscriptRuntime,
@@ -2427,6 +2447,9 @@ pub fn Runtime(comptime App: type) type {
                         viewport.rows_from_bottom,
                     );
                 }
+            }
+            if (result.is_committed() and !render_reconciliation.alternate_screen_owns_rendering) {
+                try syncImageChipMouseTracking(App, app);
             }
             return .{
                 .shadow_state = result.state(),

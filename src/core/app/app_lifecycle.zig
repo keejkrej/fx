@@ -1015,6 +1015,9 @@ fn enterAlternateScreen(
     // Keep the flag set if the write fails so shutdown still attempts a restore.
     terminal.alternate_screen_owner = owner;
     terminal.alternate_frame_layout = .{};
+    // Alternate owners manage 1000h themselves. Forget inline tracking so
+    // leave + sync can re-arm after the restore sequence sends 1000l.
+    terminal.inline_mouse_tracking_active = false;
     try writeLifecycleTerminalBytes(shell, metrics, alternate_screen_enter);
 }
 
@@ -1062,6 +1065,33 @@ fn setAlternateScreenMouseTracking(
         ui_terminal.alternate_mouse_tracking_leave_sequence,
     );
     terminal.alternate_mouse_tracking_active = false;
+}
+
+/// Arm or restore SGR click tracking on the inline TUI. Interactive mode
+/// does not put 1000h in the enable sequence (native scrollback stays with
+/// the terminal). Image chips opt in only while they are on screen.
+pub fn syncInlineMouseTracking(
+    terminal: *TerminalState,
+    shell: *TranscriptRuntime,
+    metrics: *Metrics,
+    wanted: bool,
+) !void {
+    if (terminal.alternate_screen_owner != .none) {
+        terminal.inline_mouse_tracking_active = false;
+        return;
+    }
+    if (terminal.inline_mouse_tracking_active == wanted) return;
+    if (wanted) {
+        terminal.inline_mouse_tracking_active = true;
+        try writeLifecycleTerminalBytes(shell, metrics, alternate_mouse_tracking_enter);
+        return;
+    }
+    try writeLifecycleTerminalBytes(
+        shell,
+        metrics,
+        ui_terminal.alternate_mouse_tracking_leave_sequence,
+    );
+    terminal.inline_mouse_tracking_active = false;
 }
 
 fn emitShutdownCleanupAndResume(shell: *TranscriptRuntime, metrics: *Metrics) void {
@@ -2452,4 +2482,52 @@ test "failed terminal takeover leave and manager handoff keep physical ownership
         ),
     );
     try std.testing.expect(handoff_terminal.terminalSessionScreenActive());
+}
+
+test "inline image chip mouse tracking arms and restores without alternate screen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_path = "inline-image-mouse.out";
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
+    var shell = TranscriptRuntime{
+        .stdout_file = out_file,
+        .layout = .{
+            .rows = 4,
+            .cols = 16,
+            .content_bottom = 1,
+            .divider_top_row = 1,
+            .input_row = 2,
+            .divider_bottom_row = 3,
+            .hint_row = 4,
+        },
+    };
+    defer shell.deinit(alloc);
+    try shell.enableShadowVt(alloc);
+
+    var metrics = Metrics{};
+    var terminal = TerminalState{};
+    try syncInlineMouseTracking(&terminal, &shell, &metrics, false);
+    try syncInlineMouseTracking(&terminal, &shell, &metrics, true);
+    try syncInlineMouseTracking(&terminal, &shell, &metrics, true);
+    try std.testing.expect(terminal.inline_mouse_tracking_active);
+    try syncInlineMouseTracking(&terminal, &shell, &metrics, false);
+    try std.testing.expect(!terminal.inline_mouse_tracking_active);
+
+    terminal.alternate_screen_owner = .file_approval;
+    terminal.inline_mouse_tracking_active = true;
+    try syncInlineMouseTracking(&terminal, &shell, &metrics, true);
+    try std.testing.expect(!terminal.inline_mouse_tracking_active);
+    shell.stdout_file.close(io_mod.getIo());
+
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
+    defer read_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 256);
+    defer alloc.free(bytes);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1000h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1006h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1000l"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1006l"));
 }

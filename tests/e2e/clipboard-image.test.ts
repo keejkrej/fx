@@ -128,6 +128,69 @@ async function launchFx(): Promise<{ terminal: TmuxSession; stderrPath: string }
 
 const SKIP = !linuxImageClipboardWorks();
 
+describe.skipIf(!tmuxAvailable())("tui: click [Image N] opens the system viewer", () => {
+  test(
+    "attaching an image emits OSC 8, arms mouse tracking, and survives a chip click",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-image-chip-click-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "session.fxtape");
+      const imagePath = join(workspace, "chip.png");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(imagePath, ONE_BY_ONE_PNG);
+      writeFileSync(stderrPath, "");
+      tempDirs.push(root);
+
+      const terminal = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_PERMISSION_MODE: undefined,
+          FX_RECORD: tapePath,
+          FX_SKIP_ONBOARDING: "1",
+          VERCEL_OIDC_TOKEN: undefined,
+        },
+      });
+      session = terminal;
+      await terminal.waitForComposer(10_000);
+      await terminal.sendText(`/image ${imagePath}`);
+      const pane = await terminal.waitForPane(
+        (text) => composerContains(text, "[Image 1]"),
+        8_000,
+      );
+      expect(composerContains(pane, "[Image 1]")).toBe(true);
+
+      const tape = readFileSync(tapePath);
+      expect(tape.includes(Buffer.from("\x1b]8;;file://"))).toBe(true);
+      expect(tape.includes(Buffer.from("[Image 1]"))).toBe(true);
+      expect(tape.includes(Buffer.from("\x1b[?1000h\x1b[?1006h"))).toBe(true);
+
+      const composerRow = pane
+        .split("\n")
+        .findIndex((line) => line.includes("[Image 1]") && /❯|>/.test(line)) + 1;
+      expect(composerRow).toBeGreaterThan(0);
+      const click = `\x1b[<0;4;${composerRow}M`;
+      await terminal.sendHexBytes(
+        Array.from(Buffer.from(click), (byte) => byte.toString(16).padStart(2, "0")),
+      );
+      await terminal.waitForPane(
+        (text) => composerContains(text, "[Image 1]"),
+        3_000,
+      );
+      expect(terminal.paneStatus()).toEqual({ dead: false, status: null });
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+});
+
 describe.skipIf(SKIP)("tui: Lua clipboard screenshot paste plugin", () => {
   test(
     "Ctrl+V attaches screenshot PNG bytes as [Image 1]",

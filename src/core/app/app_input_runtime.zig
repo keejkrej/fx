@@ -26,7 +26,9 @@ const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const image_attachments = @import("../images/image_attachments.zig");
+const image_chip_click = @import("../images/image_chip_click.zig");
 const image_commands = @import("../images/image_commands.zig");
+const file_opener = @import("../hosts/file_opener.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_cache_runtime = @import("model_cache_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
@@ -47,6 +49,7 @@ const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const upgrade_helpers = @import("../upgrade/upgrade_helpers.zig");
 const test_ui_input = @import("../../ui/input/runtime.zig");
 const visual_layout = @import("../../ui/input/visual_layout.zig");
+const vt_emulator = @import("../terminal/engine.zig");
 const approval_ui = @import("../../ui/footer/approval_ui.zig");
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
@@ -1211,8 +1214,10 @@ pub fn Runtime(comptime App: type) type {
                 .page_up,
                 .page_down,
                 .mouse_wheel,
-                .mouse_pointer,
                 => {},
+                .mouse_pointer => |pointer| {
+                    _ = routeImageChipPointer(app, pointer);
+                },
                 .clear_line => {
                     dismissActiveMenusThenRedraw(app);
                     if (comptime @hasField(App, "queued_prompt_review")) {
@@ -1253,6 +1258,59 @@ pub fn Runtime(comptime App: type) type {
                 .ignore => {},
             }
             return .done;
+        }
+
+        fn routeImageChipPointer(app: *App, pointer: input_action.MousePointer) bool {
+            if (pointer.kind != .press or pointer.shift) return false;
+
+            if (comptime @hasField(@TypeOf(app.shell), "shadow_vt")) {
+                if (app.shell.shadow_vt) |grid| {
+                    if (image_chip_click.fileUrlAtCell(grid.*, pointer.row, pointer.column)) |url| {
+                        openClickedFileUrl(app, url);
+                        return true;
+                    }
+                }
+            }
+
+            if (composerImagePathAtPointer(app, pointer)) |path| {
+                openClickedImagePath(app, path);
+                return true;
+            }
+            return false;
+        }
+
+        fn composerImagePathAtPointer(app: *App, pointer: input_action.MousePointer) ?[]const u8 {
+            if (comptime !@hasField(App, "pending_images")) return null;
+            if (comptime !@hasField(@TypeOf(app.shell), "footer_viewport")) return null;
+            if (!app.shell.footer_viewport.has_frame) return null;
+            const prefix_cells: u16 = @intCast(visual_layout.inputPrefix(0).cell_width);
+            const position = app.shell.footer_viewport.geometry.inputPointerPosition(
+                pointer.row,
+                pointer.column,
+                prefix_cells,
+            ) orelse return null;
+            return image_chip_click.composerImageOpenPath(.{
+                .input = app.input_runtime.edit_state.input.items,
+                .cursor = app.input_runtime.edit_state.cursor,
+                .terminal_cols = app.shell.layout.cols,
+                .images = app.pending_images.items,
+                .image_tokens = app.input_runtime.entities.image_tokens.items,
+            }, position.row_index, position.content_column);
+        }
+
+        fn openClickedFileUrl(app: *App, url: []const u8) void {
+            const decoded = image_chip_click.decodeFileUrlPath(app.alloc, url) catch return;
+            const path = decoded orelse return;
+            defer app.alloc.free(path);
+            openClickedImagePath(app, path);
+        }
+
+        fn openClickedImagePath(app: *App, path: []const u8) void {
+            if (comptime @hasDecl(App, "openImagePath")) {
+                _ = app.openImagePath(app.alloc, path);
+                return;
+            }
+            _ = file_opener.openPath(app.alloc, path);
         }
 
         fn routePickerControlByte(app: *App, byte: u8) !bool {
@@ -3419,6 +3477,8 @@ const RoutingFakeApp = struct {
     upgrade_denied_count: usize = 0,
     suspend_count: usize = 0,
     workspace_access: app_workspace_runtime.Access = .{},
+    opened_image_path: std.ArrayList(u8) = .empty,
+    opened_image_count: usize = 0,
 
     pub fn slashRegistry(_: *const RoutingFakeApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
@@ -3426,6 +3486,13 @@ const RoutingFakeApp = struct {
 
     pub fn urlOpener(_: *const RoutingFakeApp) host.UrlOpener {
         return .{ .open_fn = routingOpenUrl };
+    }
+
+    pub fn openImagePath(self: *RoutingFakeApp, _: std.mem.Allocator, path: []const u8) bool {
+        self.opened_image_path.clearRetainingCapacity();
+        self.opened_image_path.appendSlice(self.alloc, path) catch return false;
+        self.opened_image_count += 1;
+        return true;
     }
 
     fn init(alloc: std.mem.Allocator) !RoutingFakeApp {
@@ -3468,6 +3535,7 @@ const RoutingFakeApp = struct {
         self.permission_engine.deinit(self.alloc);
         self.model_cache.deinit();
         self.workspace_access.deinit(self.alloc);
+        self.opened_image_path.deinit(self.alloc);
         if (self.last_command) |command| self.alloc.free(command);
     }
 
@@ -7936,6 +8004,73 @@ fn feedRoutingBytesWithLimit(app: *RoutingFakeApp, bytes: []const u8, max_input_
         app,
         paste_framing.InputLimits.single(max_input_len),
     );
+}
+
+test "mouse press on an OSC 8 image chip opens the file path" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    var grid = try vt_emulator.Grid.init(alloc, 40, 8);
+    defer grid.deinit();
+    app.shell.shadow_vt = &grid;
+    defer app.shell.shadow_vt = null;
+
+    var badge: std.Io.Writer.Allocating = .init(alloc);
+    defer badge.deinit();
+    try image_attachments.writeImageBadge(&badge.writer, 2, "/tmp/pic.png");
+    try grid.feed("\x1b[4;6H");
+    try grid.feed(badge.written());
+
+    try feedRoutingBytes(&app, "\x1b[<0;6;4M");
+    try std.testing.expectEqual(@as(usize, 1), app.opened_image_count);
+    try std.testing.expectEqualStrings("/tmp/pic.png", app.opened_image_path.items);
+
+    try feedRoutingBytes(&app, "\x1b[<0;1;1M");
+    try std.testing.expectEqual(@as(usize, 1), app.opened_image_count);
+
+    try feedRoutingBytes(&app, "\x1b[<4;6;4M");
+    try std.testing.expectEqual(@as(usize, 1), app.opened_image_count);
+}
+
+test "mouse press on a composer image token opens the snapshot path" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    const snapshot = "/tmp/fx-image-snapshots/clip.png";
+    const source_path = "/tmp/original.png";
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "[Image #3]");
+    try app.input_runtime.entities.image_tokens.append(alloc, .{
+        .span = .{ .raw_start = 0, .raw_end = "[Image #3]".len },
+        .id = 3,
+    });
+    try app.pending_images.append(alloc, .{
+        .id = 3,
+        .path = try alloc.dupe(u8, source_path),
+        .media_type = try alloc.dupe(u8, "image/png"),
+        .snapshot_path = try alloc.dupe(u8, snapshot),
+    });
+    defer {
+        for (app.pending_images.items) |image| types.freeImageAttachment(alloc, image);
+        app.pending_images.clearRetainingCapacity();
+        app.input_runtime.entities.image_tokens.clearRetainingCapacity();
+    }
+
+    app.shell.footer_viewport.has_frame = true;
+    app.shell.footer_viewport.geometry = .{
+        .top = 20,
+        .top_divider = 21,
+        .input_base = 22,
+        .input_first = 22,
+        .input_window_first = 0,
+        .bottom_divider = 23,
+        .hint = 24,
+    };
+
+    try feedRoutingBytes(&app, "\x1b[<0;4;22M");
+    try std.testing.expectEqual(@as(usize, 1), app.opened_image_count);
+    try std.testing.expectEqualStrings(snapshot, app.opened_image_path.items);
 }
 
 fn primeComposerHistoryForTest(comptime App: type, app: *App, draft: []const u8) !void {

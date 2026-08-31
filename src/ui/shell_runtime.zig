@@ -71,6 +71,11 @@ pub const TerminalState = struct {
     alternate_screen_owner: AlternateScreenOwner = .none,
     alternate_frame_layout: frame_layout.CommittedLayoutSnapshot = .{},
     alternate_mouse_tracking_active: bool = false,
+    /// SGR mouse tracking armed on the inline (non-alternate) grid so
+    /// `[Image N]` chips can receive clicks. Separate from alternate-screen
+    /// tracking so interactive mode can keep native scrollback until a chip
+    /// is actually on screen.
+    inline_mouse_tracking_active: bool = false,
     signal_handler_installed: bool = false,
     old_winch_action: ?std.posix.Sigaction = null,
 

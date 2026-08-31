@@ -137,6 +137,7 @@ const gateway_client = @import("gateway/client.zig");
 const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
 const js_host_model_catalog = @import("gateway/js_host_model_catalog.zig");
 const url_opener = @import("core/hosts/url_opener.zig");
+const file_opener = @import("core/hosts/file_opener.zig");
 const event_loop = @import("ui/event_loop.zig");
 const wasm_terminal = if (host_target.is_wasm) @import("ui/terminal/wasm_terminal.zig") else struct {};
 const footer_runtime = @import("ui/footer/runtime.zig");
@@ -451,6 +452,10 @@ const App = struct {
             js_host_url_opener.opener
         else
             host.unavailable_url_opener;
+    }
+
+    pub fn openImagePath(_: *const Self, alloc: std.mem.Allocator, path: []const u8) bool {
+        return file_opener.openPath(alloc, path);
     }
 
     pub fn creditsProvider(self: *const Self) gateway_provider.CreditsProvider {
