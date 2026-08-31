@@ -104,6 +104,32 @@ pub fn migrateLegacyLocked(
     options: ResumeOptions,
     lifecycle: *?session_log.CommitLifecycle,
 ) !LoadedWritableSession {
+    var loaded: LoadedWritableSession = undefined;
+    try migrateLegacyLockedInto(
+        &loaded,
+        ctx,
+        alloc,
+        writable,
+        workspace_root,
+        preference_source,
+        options,
+        lifecycle,
+    );
+    return loaded;
+}
+
+// Keep fallible construction behind a noinline out-parameter boundary so
+// error returns do not materialize the full LoadedWritableSession payload.
+noinline fn migrateLegacyLockedInto(
+    out: *LoadedWritableSession,
+    ctx: StoreContext,
+    alloc: Allocator,
+    writable: *session_log.WritableSessionDir,
+    workspace_root: []const u8,
+    preference_source: MigrationPreferenceSource,
+    options: ResumeOptions,
+    lifecycle: *?session_log.CommitLifecycle,
+) !void {
     try assertMigratable(
         alloc,
         writable,
@@ -216,7 +242,7 @@ pub fn migrateLegacyLocked(
     lifecycle.* = null;
     writable.* = undefined;
     _ = result.publishCommitLifecycle(alloc);
-    return result;
+    out.* = result;
 }
 
 /// Asserts the session may be migrated: takes the commit lock, requires no
@@ -1030,7 +1056,7 @@ fn loadMigrationPreferences(
     return .{
         .model = try alloc.dupe(
             u8,
-            detailed.settings.model orelse "anthropic/claude-opus-4.7",
+            detailed.settings.models.get(.gateway) orelse "anthropic/claude-opus-4.7",
         ),
         .effort = detailed.settings.effort orelse .auto,
         .fast_mode = detailed.settings.fast_mode orelse false,

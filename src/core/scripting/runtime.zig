@@ -29,6 +29,20 @@ pub const LspStartSpec = struct {
     root: []const u8,
 };
 
+pub const DiffFile = struct {
+    path: []const u8,
+    old_text: []const u8,
+    new_text: []const u8,
+};
+
+pub const DiffReview = struct {
+    files: []const DiffFile,
+    line: ?u32 = null,
+    side_by_side: bool = true,
+};
+
+pub const ViewCycleResult = enum { none, opened, closed };
+
 pub const Host = struct {
     ctx: *anyopaque = undefined,
     notify: *const fn (ctx: *anyopaque, message: []const u8, tone: types.NoticeTone) void = silentNotify,
@@ -37,9 +51,21 @@ pub const Host = struct {
     get_opt: *const fn (ctx: *anyopaque, alloc: Allocator, key: []const u8) anyerror!?[]u8 = missingOpt,
     set_opt: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void = rejectOpt,
     open_view: *const fn (ctx: *anyopaque, path: []const u8, line: ?u32) anyerror!void = rejectView,
+    open_diff: *const fn (
+        ctx: *anyopaque,
+        path: []const u8,
+        old_text: []const u8,
+        new_text: []const u8,
+        line: ?u32,
+    ) anyerror!void = rejectDiff,
+    open_review: *const fn (ctx: *anyopaque, review: DiffReview) anyerror!void = rejectReview,
+    append_input: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void = rejectInput,
+    clipboard_image_path: *const fn (ctx: *anyopaque, alloc: Allocator) anyerror!?[]u8 = missingClipboardImage,
+    attach_image: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void = rejectImage,
     allow_process: *const fn (ctx: *anyopaque) bool = denyProcess,
     start_lsp: *const fn (ctx: *anyopaque, spec: LspStartSpec) anyerror!void = rejectLsp,
     stop_lsp: *const fn (ctx: *anyopaque, name: []const u8) anyerror!void = rejectLspStop,
+    close_view: *const fn (ctx: *anyopaque) anyerror!void = ignoreCloseView,
 };
 
 const RegisteredCommand = struct {
@@ -58,6 +84,15 @@ const RegisteredHook = struct {
     lua_ref: c_int,
 };
 
+const RegisteredPasteHook = struct {
+    lua_ref: c_int,
+};
+
+const RegisteredView = struct {
+    name: []u8,
+    lua_ref: c_int,
+};
+
 pub const Runtime = struct {
     alloc: Allocator = std.heap.page_allocator,
     host: Host = .{},
@@ -71,6 +106,9 @@ pub const Runtime = struct {
     commands: std.ArrayList(RegisteredCommand) = .empty,
     keymaps: std.ArrayList(RegisteredKeymap) = .empty,
     lua_hooks: std.ArrayList(RegisteredHook) = .empty,
+    paste_hooks: std.ArrayList(RegisteredPasteHook) = .empty,
+    views: std.ArrayList(RegisteredView) = .empty,
+    active_view: ?usize = null,
     notices: std.ArrayList(Notice) = .empty,
     hook_text: std.ArrayList(u8) = .empty,
 
@@ -172,6 +210,16 @@ pub const Runtime = struct {
                 }
             }
         }
+        try out.writer.writeAll("\nViews:");
+        if (self.views.items.len == 0) {
+            try out.writer.writeAll("\n  (none)");
+        } else {
+            for (self.views.items) |view| {
+                try out.writer.writeAll("\n  ");
+                try out.writer.writeAll(view.name);
+            }
+            try out.writer.writeAll("\n  Ctrl-T cycles agent and registered views");
+        }
         return out.toOwnedSlice();
     }
 
@@ -226,6 +274,70 @@ pub const Runtime = struct {
             lua.pop(L, 1);
         }
         return true;
+    }
+
+    pub fn hasViews(self: *const Runtime) bool {
+        return self.views.items.len > 0;
+    }
+
+    pub fn cycleView(self: *Runtime) ViewCycleResult {
+        if (comptime !enabled) return .none;
+        self.lock();
+        const result = self.cycleViewLocked();
+        self.unlock();
+        if (result == .closed) {
+            self.host.close_view(self.host.ctx) catch {};
+        }
+        return result;
+    }
+
+    pub fn showView(self: *Runtime, name: []const u8) bool {
+        if (comptime !enabled) return false;
+        const index = self.findViewIndex(name) orelse return false;
+        return self.invokeViewLocked(index);
+    }
+
+    pub fn activateView(self: *Runtime, name: []const u8) void {
+        if (self.findViewIndex(name)) |index| self.active_view = index;
+    }
+
+    pub fn clearActiveView(self: *Runtime) void {
+        self.active_view = null;
+    }
+
+    pub fn dispatchPaste(self: *Runtime, source: []const u8, text: ?[]const u8) bool {
+        if (comptime !enabled) return false;
+        if (self.paste_hooks.items.len == 0) return false;
+        const L = self.state orelse return false;
+        self.lock();
+        defer self.unlock();
+        var consumed = false;
+        for (self.paste_hooks.items) |hook| {
+            if (!lua.checkstack(L, 4)) {
+                self.addNotice(.@"error", "Lua stack overflow while running a paste hook.", .{}) catch {};
+                continue;
+            }
+            _ = lua.lua_rawgeti(L, lua.REGISTRYINDEX, hook.lua_ref);
+            lua.newtable(L);
+            lua.pushslice(L, source);
+            lua.lua_setfield(L, -2, "source");
+            lua.pushslice(L, @tagName(builtin.os.tag));
+            lua.lua_setfield(L, -2, "os");
+            if (text) |value| {
+                lua.pushslice(L, value);
+                lua.lua_setfield(L, -2, "text");
+            }
+            if (lua.pcall(L, 1, 1, 0) != lua.OK) {
+                const err = lua.tostring(L, -1) orelse "Lua paste hook failed";
+                self.addNotice(.@"error", "{s}", .{err}) catch {};
+                lua.pop(L, 1);
+                continue;
+            }
+            if (lua.lua_toboolean(L, -1) != 0) consumed = true;
+            lua.pop(L, 1);
+            if (consumed) break;
+        }
+        return consumed;
     }
 
     pub fn registerLifecycleHooks(self: *Runtime, lifecycle: *hooks.Runtime) !void {
@@ -299,6 +411,10 @@ pub const Runtime = struct {
         self.commands.clearRetainingCapacity();
         self.keymaps.clearRetainingCapacity();
         self.lua_hooks.clearRetainingCapacity();
+        self.paste_hooks.clearRetainingCapacity();
+        for (self.views.items) |view| self.alloc.free(view.name);
+        self.views.clearRetainingCapacity();
+        self.active_view = null;
         if (self.combined_specs.len > 0) {
             self.alloc.free(self.combined_specs);
             self.combined_specs = &.{};
@@ -311,6 +427,8 @@ pub const Runtime = struct {
         self.commands.deinit(self.alloc);
         self.keymaps.deinit(self.alloc);
         self.lua_hooks.deinit(self.alloc);
+        self.paste_hooks.deinit(self.alloc);
+        self.views.deinit(self.alloc);
         self.hook_text.deinit(self.alloc);
         self.freeNotices(self.takeNotices());
         self.notices.deinit(self.alloc);
@@ -387,6 +505,42 @@ pub const Runtime = struct {
             if (self.keymaps.items[i].byte == byte) return &self.keymaps.items[i];
         }
         return null;
+    }
+
+    fn findViewIndex(self: *const Runtime, name: []const u8) ?usize {
+        for (self.views.items, 0..) |view, i| {
+            if (std.mem.eql(u8, view.name, name)) return i;
+        }
+        return null;
+    }
+
+    fn cycleViewLocked(self: *Runtime) ViewCycleResult {
+        if (comptime !enabled) return .none;
+        if (self.views.items.len == 0) return .none;
+        const next: usize = if (self.active_view) |i| i + 1 else 0;
+        if (next >= self.views.items.len) {
+            self.active_view = null;
+            return .closed;
+        }
+        if (!self.invokeViewLocked(next)) return .none;
+        return .opened;
+    }
+
+    fn invokeViewLocked(self: *Runtime, index: usize) bool {
+        if (comptime !enabled) return false;
+        if (index >= self.views.items.len) return false;
+        const L = self.state orelse return false;
+        if (!lua.checkstack(L, 2)) return false;
+        self.active_view = index;
+        _ = lua.lua_rawgeti(L, lua.REGISTRYINDEX, self.views.items[index].lua_ref);
+        if (lua.pcall(L, 0, 0, 0) != lua.OK) {
+            const err = lua.tostring(L, -1) orelse "Lua view failed";
+            self.addNotice(.@"error", "{s}", .{err}) catch {};
+            lua.pop(L, 1);
+            self.active_view = null;
+            return false;
+        }
+        return true;
     }
 
     fn addNotice(self: *Runtime, tone: types.NoticeTone, comptime fmt: []const u8, args: anytype) !void {
@@ -474,6 +628,8 @@ pub const Runtime = struct {
             try appendPackageEntry(&out.writer, &first, self.workspace_root, ".fx/lua/?.lua");
             try appendPackageEntry(&out.writer, &first, self.workspace_root, ".fx/lua/?/init.lua");
             try appendPackageEntry(&out.writer, &first, self.workspace_root, ".fx/?/init.lua");
+            try appendPackageEntry(&out.writer, &first, self.workspace_root, "lua/?.lua");
+            try appendPackageEntry(&out.writer, &first, self.workspace_root, "lua/?/init.lua");
         }
         return out.toOwnedSlice();
     }
@@ -507,7 +663,35 @@ pub const Runtime = struct {
         lua.newtable(L);
         lua.pushcfunction(L, apiViewOpen);
         lua.lua_setfield(L, -2, "open");
+        lua.pushcfunction(L, apiViewDiff);
+        lua.lua_setfield(L, -2, "diff");
+        lua.pushcfunction(L, apiViewRegister);
+        lua.lua_setfield(L, -2, "register");
+        lua.pushcfunction(L, apiViewShow);
+        lua.lua_setfield(L, -2, "show");
+        lua.pushcfunction(L, apiViewCycle);
+        lua.lua_setfield(L, -2, "cycle");
         lua.lua_setfield(L, -2, "view");
+
+        lua.newtable(L);
+        lua.pushcfunction(L, apiInputAppend);
+        lua.lua_setfield(L, -2, "append");
+        lua.lua_setfield(L, -2, "input");
+
+        lua.newtable(L);
+        lua.pushcfunction(L, apiPasteHook);
+        lua.lua_setfield(L, -2, "hook");
+        lua.lua_setfield(L, -2, "paste");
+
+        lua.newtable(L);
+        lua.pushcfunction(L, apiClipboardImagePath);
+        lua.lua_setfield(L, -2, "image_path");
+        lua.lua_setfield(L, -2, "clipboard");
+
+        lua.newtable(L);
+        lua.pushcfunction(L, apiImageAttach);
+        lua.lua_setfield(L, -2, "attach");
+        lua.lua_setfield(L, -2, "image");
 
         lua.newtable(L);
         lua.pushcfunction(L, apiLspStart);
@@ -542,6 +726,7 @@ pub const Runtime = struct {
         }
         if (self.workspace_root.len > 0) {
             if (underJoin(self.alloc, self.workspace_root, ".fx", path)) return true;
+            if (underJoin(self.alloc, self.workspace_root, "lua", path)) return true;
         }
         return false;
     }
@@ -603,12 +788,28 @@ fn rejectOpt(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
 fn rejectView(_: *anyopaque, _: []const u8, _: ?u32) anyerror!void {
     return error.Unsupported;
 }
+fn rejectDiff(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8, _: ?u32) anyerror!void {
+    return error.Unsupported;
+}
+fn rejectReview(_: *anyopaque, _: DiffReview) anyerror!void {
+    return error.Unsupported;
+}
+fn rejectInput(_: *anyopaque, _: []const u8) anyerror!void {
+    return error.Unsupported;
+}
+fn missingClipboardImage(_: *anyopaque, _: Allocator) anyerror!?[]u8 {
+    return null;
+}
+fn rejectImage(_: *anyopaque, _: []const u8) anyerror!void {
+    return error.Unsupported;
+}
 fn rejectLsp(_: *anyopaque, _: LspStartSpec) anyerror!void {
     return error.LspUnavailable;
 }
 fn rejectLspStop(_: *anyopaque, _: []const u8) anyerror!void {
     return error.LspUnavailable;
 }
+fn ignoreCloseView(_: *anyopaque) anyerror!void {}
 
 fn sandboxedDenied(L: ?*lua.State) callconv(.c) c_int {
     if (comptime !enabled) return 0;
@@ -836,26 +1037,237 @@ fn apiOptNewindex(L: ?*lua.State) callconv(.c) c_int {
     return 0;
 }
 
+fn optionalLineArg(L: ?*lua.State, idx: c_int) ?u32 {
+    if (lua.lua_gettop(L) < idx or !lua.istable(L, idx)) return null;
+    _ = lua.lua_getfield(L, idx, "line");
+    defer lua.pop(L, 1);
+    if (lua.lua_type(L, -1) != lua.TNUMBER) return null;
+    const value = lua.tointeger(L, -1);
+    if (value > 0 and value <= std.math.maxInt(u32)) return @intCast(value);
+    return null;
+}
+
 fn apiViewOpen(L: ?*lua.State) callconv(.c) c_int {
     if (comptime !enabled) return 0;
     const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
     lua.luaL_checktype(L, 1, lua.TSTRING);
     const path = lua.tostring(L, 1) orelse return lua.raise(L, "path required");
-    var line: ?u32 = null;
-    if (lua.lua_gettop(L) >= 2 and lua.istable(L, 2)) {
-        _ = lua.lua_getfield(L, 2, "line");
-        if (lua.lua_type(L, -1) == lua.TNUMBER) {
-            const value = lua.tointeger(L, -1);
-            if (value > 0 and value <= std.math.maxInt(u32)) {
-                line = @intCast(value);
-            }
-        }
-        lua.pop(L, 1);
-    }
+    const line = optionalLineArg(L, 2);
     rt.host.open_view(rt.host.ctx, path, line) catch |err| {
         return lua.raise(L, @errorName(err));
     };
+    rt.activateView("code");
     return 0;
+}
+
+fn apiViewDiff(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    if (lua.istable(L, 1)) return apiViewDiffReview(L, rt);
+    lua.luaL_checktype(L, 1, lua.TSTRING);
+    lua.luaL_checktype(L, 2, lua.TSTRING);
+    lua.luaL_checktype(L, 3, lua.TSTRING);
+    const path = lua.tostring(L, 1) orelse return lua.raise(L, "path required");
+    const old_text = lua.tostring(L, 2) orelse return lua.raise(L, "old text required");
+    const new_text = lua.tostring(L, 3) orelse return lua.raise(L, "new text required");
+    const line = optionalLineArg(L, 4);
+    rt.host.open_diff(rt.host.ctx, path, old_text, new_text, line) catch |err| {
+        return lua.raise(L, @errorName(err));
+    };
+    rt.activateView("diff");
+    return 0;
+}
+
+fn apiViewDiffReview(L: ?*lua.State, rt: *Runtime) c_int {
+    _ = lua.lua_getfield(L, 1, "files");
+    if (!lua.istable(L, -1)) {
+        lua.pop(L, 1);
+        return lua.raise(L, "files required");
+    }
+    const files_idx = lua.lua_absindex(L, -1);
+    var files: std.ArrayList(DiffFile) = .empty;
+    defer files.deinit(rt.alloc);
+    var owned: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned.items) |item| rt.alloc.free(item);
+        owned.deinit(rt.alloc);
+    }
+
+    var i: lua.Integer = 1;
+    while (true) : (i += 1) {
+        _ = lua.lua_rawgeti(L, files_idx, i);
+        if (lua.isnoneornil(L, -1)) {
+            lua.pop(L, 1);
+            break;
+        }
+        if (!lua.istable(L, -1)) {
+            lua.pop(L, 1);
+            return lua.raise(L, "file entry must be a table");
+        }
+        const path = dupField(L, rt, -1, "path") catch {
+            lua.pop(L, 1);
+            return lua.raise(L, "file path required");
+        };
+        owned.append(rt.alloc, path) catch {
+            rt.alloc.free(path);
+            lua.pop(L, 1);
+            return lua.raise(L, "OutOfMemory");
+        };
+        const old_text = dupFieldOrEmpty(L, rt, -1, "old") catch {
+            lua.pop(L, 1);
+            return lua.raise(L, "OutOfMemory");
+        };
+        owned.append(rt.alloc, old_text) catch {
+            rt.alloc.free(old_text);
+            lua.pop(L, 1);
+            return lua.raise(L, "OutOfMemory");
+        };
+        const new_text = dupFieldOrEmpty(L, rt, -1, "new") catch {
+            lua.pop(L, 1);
+            return lua.raise(L, "OutOfMemory");
+        };
+        owned.append(rt.alloc, new_text) catch {
+            rt.alloc.free(new_text);
+            lua.pop(L, 1);
+            return lua.raise(L, "OutOfMemory");
+        };
+        files.append(rt.alloc, .{
+            .path = path,
+            .old_text = old_text,
+            .new_text = new_text,
+        }) catch {
+            lua.pop(L, 1);
+            return lua.raise(L, "OutOfMemory");
+        };
+        lua.pop(L, 1);
+    }
+    lua.pop(L, 1);
+    if (files.items.len == 0) return lua.raise(L, "files required");
+
+    var side_by_side = true;
+    _ = lua.lua_getfield(L, 1, "layout");
+    if (lua.tostring(L, -1)) |layout_name| {
+        if (std.mem.eql(u8, layout_name, "unified")) side_by_side = false;
+    }
+    lua.pop(L, 1);
+
+    rt.host.open_review(rt.host.ctx, .{
+        .files = files.items,
+        .line = optionalLineArg(L, 1),
+        .side_by_side = side_by_side,
+    }) catch |err| {
+        return lua.raise(L, @errorName(err));
+    };
+    rt.activateView("diff");
+    return 0;
+}
+
+fn apiViewRegister(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    lua.luaL_checktype(L, 1, lua.TSTRING);
+    lua.luaL_checktype(L, 2, lua.TFUNCTION);
+    const name = lua.tostring(L, 1) orelse return lua.raise(L, "view name required");
+    if (!validViewName(name)) return lua.raise(L, "invalid view name");
+    lua.lua_pushvalue(L, 2);
+    const ref = lua.luaL_ref(L, lua.REGISTRYINDEX);
+    if (rt.findViewIndex(name)) |index| {
+        lua.luaL_unref(L, lua.REGISTRYINDEX, rt.views.items[index].lua_ref);
+        rt.views.items[index].lua_ref = ref;
+        return 0;
+    }
+    const copied = rt.alloc.dupe(u8, name) catch {
+        lua.luaL_unref(L, lua.REGISTRYINDEX, ref);
+        return lua.raise(L, "OutOfMemory");
+    };
+    rt.views.append(rt.alloc, .{ .name = copied, .lua_ref = ref }) catch {
+        rt.alloc.free(copied);
+        lua.luaL_unref(L, lua.REGISTRYINDEX, ref);
+        return lua.raise(L, "OutOfMemory");
+    };
+    return 0;
+}
+
+fn apiViewShow(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    lua.luaL_checktype(L, 1, lua.TSTRING);
+    const name = lua.tostring(L, 1) orelse return lua.raise(L, "view name required");
+    if (!rt.showView(name)) return lua.raise(L, "unknown view");
+    return 0;
+}
+
+fn apiViewCycle(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    if (rt.cycleViewLocked() == .closed) {
+        rt.host.close_view(rt.host.ctx) catch {};
+    }
+    return 0;
+}
+
+fn apiInputAppend(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    lua.luaL_checktype(L, 1, lua.TSTRING);
+    const text = lua.tostring(L, 1) orelse return lua.raise(L, "text required");
+    rt.host.append_input(rt.host.ctx, text) catch |err| {
+        return lua.raise(L, @errorName(err));
+    };
+    return 0;
+}
+
+fn apiPasteHook(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    lua.luaL_checktype(L, 1, lua.TFUNCTION);
+    lua.lua_pushvalue(L, 1);
+    const ref = lua.luaL_ref(L, lua.REGISTRYINDEX);
+    rt.paste_hooks.append(rt.alloc, .{ .lua_ref = ref }) catch {
+        lua.luaL_unref(L, lua.REGISTRYINDEX, ref);
+        return lua.raise(L, "OutOfMemory");
+    };
+    return 0;
+}
+
+fn apiClipboardImagePath(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    const path = rt.host.clipboard_image_path(rt.host.ctx, rt.alloc) catch |err| {
+        return lua.raise(L, @errorName(err));
+    } orelse {
+        lua.lua_pushnil(L);
+        return 1;
+    };
+    defer rt.alloc.free(path);
+    lua.pushslice(L, path);
+    return 1;
+}
+
+fn apiImageAttach(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    lua.luaL_checktype(L, 1, lua.TSTRING);
+    const path = lua.tostring(L, 1) orelse return lua.raise(L, "path required");
+    rt.host.attach_image(rt.host.ctx, path) catch |err| {
+        return lua.raise(L, @errorName(err));
+    };
+    return 0;
+}
+
+fn dupField(L: ?*lua.State, rt: *Runtime, idx: c_int, key: [*:0]const u8) error{ Missing, OutOfMemory }![]u8 {
+    _ = lua.lua_getfield(L, idx, key);
+    defer lua.pop(L, 1);
+    const text = lua.tostring(L, -1) orelse return error.Missing;
+    if (text.len == 0) return error.Missing;
+    return rt.alloc.dupe(u8, text);
+}
+
+fn dupFieldOrEmpty(L: ?*lua.State, rt: *Runtime, idx: c_int, key: [*:0]const u8) error{OutOfMemory}![]u8 {
+    _ = lua.lua_getfield(L, idx, key);
+    defer lua.pop(L, 1);
+    const text = lua.tostring(L, -1) orelse "";
+    return rt.alloc.dupe(u8, text);
 }
 
 fn apiWorkspaceIndex(L: ?*lua.State) callconv(.c) c_int {
@@ -1029,6 +1441,16 @@ fn normalizeCommandName(alloc: Allocator, name: []const u8) ![]u8 {
     slash[0] = '/';
     @memcpy(slash[1..], trimmed);
     return slash;
+}
+
+fn validViewName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 32) return false;
+    for (name, 0..) |byte, i| {
+        const ok = std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-';
+        if (!ok) return false;
+        if (i == 0 and !std.ascii.isAlphabetic(byte)) return false;
+    }
+    return true;
 }
 
 fn parseKeymapLhs(lhs: []const u8) ?u8 {
@@ -1354,6 +1776,335 @@ test "fx.view.open calls the host with an optional line" {
     try std.testing.expectEqual(@as(?u32, 12), ctx.line);
 }
 
+test "fx.view.diff calls the host with old and new text" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.command("showdiff", function()
+        \\  fx.view.diff("demo.lua", "keep\nold\n", "keep\nnew\n", { line = 2 })
+        \\end)
+        \\
+    );
+
+    const Ctx = struct {
+        path: std.ArrayList(u8) = .empty,
+        old_text: std.ArrayList(u8) = .empty,
+        new_text: std.ArrayList(u8) = .empty,
+        line: ?u32 = null,
+        alloc: Allocator,
+        fn diff(
+            raw: *anyopaque,
+            path: []const u8,
+            old_text: []const u8,
+            new_text: []const u8,
+            line: ?u32,
+        ) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            try ctx.path.appendSlice(ctx.alloc, path);
+            try ctx.old_text.appendSlice(ctx.alloc, old_text);
+            try ctx.new_text.appendSlice(ctx.alloc, new_text);
+            ctx.line = line;
+        }
+    };
+    var ctx = Ctx{ .alloc = alloc };
+    defer ctx.path.deinit(alloc);
+    defer ctx.old_text.deinit(alloc);
+    defer ctx.new_text.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .open_diff = Ctx.diff,
+    });
+    runtime.loadInit(null, workspace);
+    runtime.invokeCommand("/showdiff", "");
+    try std.testing.expectEqualStrings("demo.lua", ctx.path.items);
+    try std.testing.expectEqualStrings("keep\nold\n", ctx.old_text.items);
+    try std.testing.expectEqualStrings("keep\nnew\n", ctx.new_text.items);
+    try std.testing.expectEqual(@as(?u32, 2), ctx.line);
+}
+
+test "fx.view.diff review table calls the host with every file" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.command("showreview", function()
+        \\  fx.view.diff({
+        \\    files = {
+        \\      { path = "a.lua", old = "old-a", new = "new-a" },
+        \\      { path = "b.md", old = "old-b", new = "new-b" },
+        \\    },
+        \\    layout = "side",
+        \\  })
+        \\end)
+        \\
+    );
+
+    const Ctx = struct {
+        count: usize = 0,
+        first_path: std.ArrayList(u8) = .empty,
+        second_path: std.ArrayList(u8) = .empty,
+        side_by_side: bool = false,
+        alloc: Allocator,
+        fn review(raw: *anyopaque, spec: DiffReview) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.count = spec.files.len;
+            ctx.side_by_side = spec.side_by_side;
+            if (spec.files.len >= 1) try ctx.first_path.appendSlice(ctx.alloc, spec.files[0].path);
+            if (spec.files.len >= 2) try ctx.second_path.appendSlice(ctx.alloc, spec.files[1].path);
+        }
+    };
+    var ctx = Ctx{ .alloc = alloc };
+    defer ctx.first_path.deinit(alloc);
+    defer ctx.second_path.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .open_review = Ctx.review,
+    });
+    runtime.loadInit(null, workspace);
+    runtime.invokeCommand("/showreview", "");
+    try std.testing.expectEqual(@as(usize, 2), ctx.count);
+    try std.testing.expect(ctx.side_by_side);
+    try std.testing.expectEqualStrings("a.lua", ctx.first_path.items);
+    try std.testing.expectEqualStrings("b.md", ctx.second_path.items);
+}
+
+test "fx.keymap Ctrl-T opens a unified review" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.keymap("<C-t>", function()
+        \\  fx.view.diff({
+        \\    files = { { path = "demo.lua", old = "old", new = "new" } },
+        \\    layout = "unified",
+        \\  })
+        \\end)
+        \\
+    );
+
+    const Ctx = struct {
+        count: usize = 0,
+        side_by_side: bool = true,
+        path: std.ArrayList(u8) = .empty,
+        alloc: Allocator,
+        fn review(raw: *anyopaque, spec: DiffReview) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.count = spec.files.len;
+            ctx.side_by_side = spec.side_by_side;
+            if (spec.files.len >= 1) try ctx.path.appendSlice(ctx.alloc, spec.files[0].path);
+        }
+    };
+    var ctx = Ctx{ .alloc = alloc };
+    defer ctx.path.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .open_review = Ctx.review,
+    });
+    runtime.loadInit(null, workspace);
+    try std.testing.expect(runtime.dispatchKeymap(20));
+    try std.testing.expectEqual(@as(usize, 1), ctx.count);
+    try std.testing.expect(!ctx.side_by_side);
+    try std.testing.expectEqualStrings("demo.lua", ctx.path.items);
+    try std.testing.expect(!runtime.dispatchKeymap(19));
+}
+
+test "fx.view.register cycles agent and named full-screen views" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.view.register("diff", function()
+        \\  fx.view.diff({
+        \\    files = { { path = "a.lua", old = "old", new = "new" } },
+        \\    layout = "unified",
+        \\  })
+        \\end)
+        \\fx.view.register("code", function()
+        \\  fx.view.open("demo.lua")
+        \\end)
+        \\
+    );
+
+    const Ctx = struct {
+        last: std.ArrayList(u8) = .empty,
+        closed: usize = 0,
+        alloc: Allocator,
+        fn review(raw: *anyopaque, spec: DiffReview) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.last.clearRetainingCapacity();
+            try ctx.last.appendSlice(ctx.alloc, "diff:");
+            if (spec.files.len >= 1) try ctx.last.appendSlice(ctx.alloc, spec.files[0].path);
+        }
+        fn open(raw: *anyopaque, path: []const u8, _: ?u32) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.last.clearRetainingCapacity();
+            try ctx.last.appendSlice(ctx.alloc, "code:");
+            try ctx.last.appendSlice(ctx.alloc, path);
+        }
+        fn close(raw: *anyopaque) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.closed += 1;
+            ctx.last.clearRetainingCapacity();
+            try ctx.last.appendSlice(ctx.alloc, "agent");
+        }
+    };
+    var ctx = Ctx{ .alloc = alloc };
+    defer ctx.last.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .open_review = Ctx.review,
+        .open_view = Ctx.open,
+        .close_view = Ctx.close,
+    });
+    runtime.loadInit(null, workspace);
+    try std.testing.expect(runtime.hasViews());
+    try std.testing.expectEqual(ViewCycleResult.opened, runtime.cycleView());
+    try std.testing.expectEqualStrings("diff:a.lua", ctx.last.items);
+    try std.testing.expectEqual(ViewCycleResult.opened, runtime.cycleView());
+    try std.testing.expectEqualStrings("code:demo.lua", ctx.last.items);
+    try std.testing.expectEqual(ViewCycleResult.closed, runtime.cycleView());
+    try std.testing.expectEqual(@as(usize, 1), ctx.closed);
+    try std.testing.expectEqualStrings("agent", ctx.last.items);
+    try std.testing.expectEqual(ViewCycleResult.opened, runtime.cycleView());
+    try std.testing.expectEqualStrings("diff:a.lua", ctx.last.items);
+}
+
+test "workspace lua plugin can require and register a command" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "lua/diffview");
+    var plugin = try tmp.dir.createFile(io_mod.getIo(), "lua/diffview/init.lua", .{});
+    try plugin.writeStreamingAll(io_mod.getIo(),
+        \\fx.command("diffview", function(payload)
+        \\  fx.view.diff("demo.lua", "old", "new")
+        \\end, { desc = "Lua plugin diff-view demo" })
+        \\return true
+        \\
+    );
+    plugin.close(io_mod.getIo());
+    var init_file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer init_file.close(io_mod.getIo());
+    try init_file.writeStreamingAll(io_mod.getIo(), "require(\"diffview\")\n");
+
+    const Ctx = struct {
+        path: std.ArrayList(u8) = .empty,
+        old_text: std.ArrayList(u8) = .empty,
+        new_text: std.ArrayList(u8) = .empty,
+        alloc: Allocator,
+        fn diff(
+            raw: *anyopaque,
+            path: []const u8,
+            old_text: []const u8,
+            new_text: []const u8,
+            _: ?u32,
+        ) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            try ctx.path.appendSlice(ctx.alloc, path);
+            try ctx.old_text.appendSlice(ctx.alloc, old_text);
+            try ctx.new_text.appendSlice(ctx.alloc, new_text);
+        }
+    };
+    var ctx = Ctx{ .alloc = alloc };
+    defer ctx.path.deinit(alloc);
+    defer ctx.old_text.deinit(alloc);
+    defer ctx.new_text.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .open_diff = Ctx.diff,
+    });
+    runtime.loadInit(null, workspace);
+    try std.testing.expectEqual(@as(usize, 0), runtime.notices.items.len);
+    try std.testing.expect(runtime.hasCommand("/diffview"));
+    runtime.invokeCommand("/diffview", "");
+    try std.testing.expectEqualStrings("demo.lua", ctx.path.items);
+    try std.testing.expectEqualStrings("old", ctx.old_text.items);
+    try std.testing.expectEqualStrings("new", ctx.new_text.items);
+}
+
+test "fx.input.append calls the host with composer text" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.command("say", function()
+        \\  fx.input.append("hello from lua")
+        \\end)
+        \\
+    );
+
+    const Ctx = struct {
+        text: std.ArrayList(u8) = .empty,
+        alloc: Allocator,
+        fn append(raw: *anyopaque, text: []const u8) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            try ctx.text.appendSlice(ctx.alloc, text);
+        }
+    };
+    var ctx = Ctx{ .alloc = alloc };
+    defer ctx.text.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .append_input = Ctx.append,
+    });
+    runtime.loadInit(null, workspace);
+    runtime.invokeCommand("/say", "");
+    try std.testing.expectEqualStrings("hello from lua", ctx.text.items);
+}
+
 test "fx.lsp.start passes name cmd and workspace root to the host" {
     if (comptime !enabled) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -1432,4 +2183,160 @@ test "fx.lsp.start is a notice when the host denies process spawn" {
     runtime.loadInit(null, workspace);
     try std.testing.expect(runtime.notices.items.len >= 1);
     try std.testing.expect(std.mem.find(u8, runtime.notices.items[0].body, "not permitted") != null);
+}
+
+test "fx.paste.hook intercepts clipboard paste and attaches an image path" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.paste.hook(function(event)
+        \\  if event.source == "clipboard" then
+        \\    local path = fx.clipboard.image_path()
+        \\    if path then
+        \\      fx.image.attach(path)
+        \\      return true
+        \\    end
+        \\    return false
+        \\  end
+        \\  if event.text and event.text:match("%.png$") then
+        \\    fx.image.attach(event.text)
+        \\    return true
+        \\  end
+        \\  return false
+        \\end)
+        \\
+    );
+
+    const Ctx = struct {
+        clipboard_path: []const u8,
+        attached: std.ArrayList(u8) = .empty,
+        alloc: Allocator,
+        fn clipboardPath(raw: *anyopaque, host_alloc: Allocator) anyerror!?[]u8 {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            return try host_alloc.dupe(u8, ctx.clipboard_path);
+        }
+        fn attach(raw: *anyopaque, path: []const u8) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.attached.clearRetainingCapacity();
+            try ctx.attached.appendSlice(ctx.alloc, path);
+        }
+    };
+    var ctx = Ctx{ .clipboard_path = "/tmp/fx-image-snapshots-test/clipboard.png", .alloc = alloc };
+    defer ctx.attached.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .clipboard_image_path = Ctx.clipboardPath,
+        .attach_image = Ctx.attach,
+    });
+    runtime.loadInit(null, workspace);
+    try std.testing.expectEqual(@as(usize, 0), runtime.notices.items.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.paste_hooks.items.len);
+
+    try std.testing.expect(runtime.dispatchPaste("clipboard", null));
+    try std.testing.expectEqualStrings(ctx.clipboard_path, ctx.attached.items);
+
+    ctx.attached.clearRetainingCapacity();
+    try std.testing.expect(!runtime.dispatchPaste("insert", "hello from a text paste"));
+    try std.testing.expectEqual(@as(usize, 0), ctx.attached.items.len);
+
+    try std.testing.expect(runtime.dispatchPaste("insert", "/tmp/shot.png"));
+    try std.testing.expectEqualStrings("/tmp/shot.png", ctx.attached.items);
+}
+
+test "fx.paste.hook defers macos clipboard paste to core" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.paste.hook(function(event)
+        \\  if event.os == "macos" then
+        \\    return false
+        \\  end
+        \\  if event.source == "clipboard" then
+        \\    local path = fx.clipboard.image_path()
+        \\    if path then
+        \\      fx.image.attach(path)
+        \\      return true
+        \\    end
+        \\  end
+        \\  return false
+        \\end)
+        \\
+    );
+
+    const Ctx = struct {
+        clipboard_path: []const u8,
+        attached: std.ArrayList(u8) = .empty,
+        alloc: Allocator,
+        fn clipboardPath(raw: *anyopaque, host_alloc: Allocator) anyerror!?[]u8 {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            return try host_alloc.dupe(u8, ctx.clipboard_path);
+        }
+        fn attach(raw: *anyopaque, path: []const u8) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.attached.clearRetainingCapacity();
+            try ctx.attached.appendSlice(ctx.alloc, path);
+        }
+    };
+    var ctx = Ctx{ .clipboard_path = "/tmp/fx-image-snapshots-test/clipboard.png", .alloc = alloc };
+    defer ctx.attached.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .clipboard_image_path = Ctx.clipboardPath,
+        .attach_image = Ctx.attach,
+    });
+    runtime.loadInit(null, workspace);
+    try std.testing.expectEqual(@as(usize, 0), runtime.notices.items.len);
+    const consumed = runtime.dispatchPaste("clipboard", null);
+    if (builtin.os.tag == .macos) {
+        try std.testing.expect(!consumed);
+        try std.testing.expectEqual(@as(usize, 0), ctx.attached.items.len);
+    } else {
+        try std.testing.expect(consumed);
+        try std.testing.expectEqualStrings(ctx.clipboard_path, ctx.attached.items);
+    }
+}
+
+test "fx.paste.hook pass-through leaves the paste unconsumed" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.paste.hook(function(event)
+        \\  return false
+        \\end)
+        \\
+    );
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.loadInit(null, workspace);
+    try std.testing.expectEqual(@as(usize, 1), runtime.paste_hooks.items.len);
+    try std.testing.expect(!runtime.dispatchPaste("clipboard", null));
+    try std.testing.expect(!runtime.dispatchPaste("insert", "plain text"));
 }

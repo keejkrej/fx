@@ -5,22 +5,22 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const acp_runner = @import("../cli/acp_runner.zig");
 const cli_surface = @import("../cli/cli_surface.zig");
-const devbox_executor = @import("../execution/devbox_executor.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
-const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
+const mcp_command_provider = @import("../mcp/command_provider.zig");
+const mcp_health = @import("../mcp/health.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -46,6 +46,7 @@ pub const Config = struct {
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
     gateway_provider: gateway_provider.Provider,
+    provider_set: provider_set.Set,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
@@ -64,10 +65,14 @@ pub const Config = struct {
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
+    inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
+        mcp_health.inspectLocalConfigUnavailable,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
+        mcp_command_provider.addProfileServerUnavailable,
+    remove_mcp_profile_server: mcp_command_provider.RemoveProfileServerFn =
+        mcp_command_provider.removeProfileServerUnavailable,
     acp_runner: acp_runner.Runner,
-    devbox_provider: ?devbox_executor.Provider = null,
-    permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
 };
 
 pub fn run(comptime App: type, alloc: Allocator, args: []const [:0]const u8, cfg: Config) !void {
@@ -235,7 +240,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 return .{ .exit = 1 };
             },
             error.SessionBusy => {
-                writeStderr(deps, "fx: another Fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n");
+                writeStderr(deps, "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n");
                 return .{ .exit = 1 };
             },
             error.SessionLockUnsupported => {
@@ -258,10 +263,6 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             },
             error.UnsupportedSessionSchema => {
                 writeStderr(deps, "fx: saved session uses an unsupported version and cannot be resumed by this fx build.\n");
-                return .{ .exit = 1 };
-            },
-            error.RetiredSandboxValue, error.UnsupportedSandboxValue => {
-                tryWriteErrorMessage(deps, err);
                 return .{ .exit = 1 };
             },
             else => {
@@ -393,6 +394,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
         .gateway_provider = cfg.gateway_provider,
+        .provider_set = cfg.provider_set,
         .background_process_provider = cfg.background_process_provider,
         .url_opener = cfg.url_opener,
         .secret_store = cfg.secret_store,
@@ -410,10 +412,11 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .mode_registry = cfg.mode_registry,
         .tool_set = cfg.tool_set,
         .inspect_mcp_profile_config = cfg.inspect_mcp_profile_config,
+        .inspect_mcp_local_config = cfg.inspect_mcp_local_config,
         .load_mcp_runtime = cfg.load_mcp_runtime,
+        .add_mcp_profile_server = cfg.add_mcp_profile_server,
+        .remove_mcp_profile_server = cfg.remove_mcp_profile_server,
         .acp_runner = cfg.acp_runner,
-        .devbox_provider = cfg.devbox_provider,
-        .permission_reviewer_provider = cfg.permission_reviewer_provider,
     };
 }
 
@@ -468,11 +471,7 @@ fn writeStderr(deps: RunDeps, text: []const u8) void {
 
 fn tryWriteErrorMessage(deps: RunDeps, err: anyerror) void {
     writeStderr(deps, "fx: ");
-    if (sandbox.configErrorMessage(err)) |message| {
-        writeStderr(deps, message);
-    } else {
-        writeStderr(deps, @errorName(err));
-    }
+    writeStderr(deps, @errorName(err));
     writeStderr(deps, "\n");
 }
 
@@ -492,19 +491,7 @@ const test_entry_context_registry = context_contract.Registry{ .default_provider
     .append_transient_fn = appendNoopTransientContextForTest,
 } };
 
-fn unavailableDevboxForTest(
-    _: ?*anyopaque,
-    _: Allocator,
-    _: []const u8,
-    _: []const u8,
-    _: devbox_executor.Control,
-) devbox_executor.ProviderError!devbox_executor.VercelOutcome {
-    return .unavailable;
-}
-
-const test_devbox_provider = devbox_executor.Provider{ .execute_fn = unavailableDevboxForTest };
-
-fn noMcpRuntimeForTest(_: Allocator, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+fn noMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
     return null;
 }
 
@@ -528,6 +515,7 @@ fn testConfig() Config {
         .gateway_retry_count = 2,
         .gateway_chat_url = "https://gateway/chat",
         .gateway_provider = test_builtin_gateway.provider,
+        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
         .url_opener = host.unavailable_url_opener,
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "system" },
@@ -545,7 +533,6 @@ fn testConfig() Config {
         .inspect_mcp_profile_config = noMcpConfigInspectionForTest,
         .load_mcp_runtime = noMcpRuntimeForTest,
         .acp_runner = .{ .run_fn = unexpectedAcpRunForTest },
-        .devbox_provider = test_devbox_provider,
         .tool_set = .{
             .registry = .{ .tools = &.{} },
             .order = &.{"entry_test_tool"},
@@ -816,9 +803,9 @@ test "app entry returns after handled CLI success without initializing app" {
     try std.testing.expectEqualStrings("entry_test_tool", capture.seen_config.?.tool_set.order[0]);
     try std.testing.expectEqualStrings("skills", capture.seen_config.?.skill_root_policy.workspace_roots[0].path);
     try std.testing.expect(capture.seen_config.?.gateway_provider.chat_url.resolve_fn == test_builtin_gateway.chat_url_provider.resolve_fn);
-    try std.testing.expect(capture.seen_config.?.gateway_provider.cli_model_catalog.fetch_fn == test_builtin_gateway.cli_model_catalog_provider.fetch_fn);
-    try std.testing.expect(capture.seen_config.?.gateway_provider.web_search.execute_fn == test_builtin_gateway.default_web_search_provider.execute_fn);
-    try std.testing.expect(capture.seen_config.?.gateway_provider.model_catalog.fetch_fn == test_builtin_gateway.model_catalog_provider.fetch_fn);
+    try std.testing.expect(capture.seen_config.?.provider_set.gateway.cli_model_catalog.?.fetch_fn == test_builtin_gateway.cli_model_catalog_provider.fetch_fn);
+    try std.testing.expect(capture.seen_config.?.provider_set.gateway.fx_search.?.execute_fn == test_builtin_gateway.default_web_search_provider.execute_fn);
+    try std.testing.expect(capture.seen_config.?.provider_set.gateway.model_catalog.?.fetch_fn == test_builtin_gateway.model_catalog_provider.fetch_fn);
     try std.testing.expect(
         capture.seen_config.?.background_process_provider.spawn_prepared_fn ==
             cfg.background_process_provider.spawn_prepared_fn,
@@ -829,7 +816,6 @@ test "app entry returns after handled CLI success without initializing app" {
     try std.testing.expect(capture.seen_config.?.secret_store.load_fn == cfg.secret_store.load_fn);
     try std.testing.expect(capture.seen_config.?.inspect_mcp_profile_config == noMcpConfigInspectionForTest);
     try std.testing.expect(capture.seen_config.?.load_mcp_runtime == noMcpRuntimeForTest);
-    try std.testing.expect(capture.seen_config.?.devbox_provider.?.execute_fn == unavailableDevboxForTest);
     try std.testing.expectEqual(@as(usize, 0), test_event_count);
 }
 
@@ -1195,7 +1181,7 @@ test "app entry maps unavailable session state to one expected startup failure" 
     }{
         .{
             .init_error = error.SessionBusy,
-            .message = "fx: another Fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
+            .message = "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
         },
         .{
             .init_error = error.SessionLockUnsupported,

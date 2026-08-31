@@ -94,7 +94,7 @@ pub const PermissionTargetKind = enum {
 
 pub const web_search_permission = "web_search";
 pub const web_fetch_permission = "web_fetch";
-pub const yolo_warning_text = "YOLO enabled: permissions and sandboxing disabled";
+pub const yolo_warning_text = "YOLO enabled: fx permission checks disabled";
 
 pub fn isWebSearchToolName(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, web_search_permission);
@@ -180,18 +180,6 @@ pub fn permissionTargetForCall(
         return webFetchDomainTargetForUrl(arena, try tool_args.requiredStringArg(args, "url"));
     }
 
-    if (std.mem.eql(u8, call.name, "rename_file")) {
-        const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
-        const old_path = try tool_args.requiredStringArg(args, "old_path");
-        return resolveFileToolPath(arena, workspace_root, call.name, old_path, .existing);
-    }
-
-    if (std.mem.eql(u8, call.name, "copy_file")) {
-        const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
-        const source = try tool_args.requiredStringArg(args, "source");
-        return resolveFileToolPath(arena, workspace_root, call.name, source, .existing);
-    }
-
     const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
 
     return switch (target_kind) {
@@ -244,7 +232,7 @@ fn resolveCommandCwdFromArgs(
     workspace_root: []const u8,
     args: std.json.ObjectMap,
 ) ![]const u8 {
-    const cwd_input = tool_args.optionalStringArg(args, "cwd") orelse ".";
+    const cwd_input = tool_args.nullablePlaceholderStringArg(args, "cwd") orelse ".";
     if (std.mem.eql(u8, cwd_input, ".")) return arena.dupe(u8, workspace_root);
     return pathing.resolveWorkspaceOrExternalPath(arena, workspace_root, cwd_input);
 }
@@ -254,7 +242,7 @@ fn resolveCommandCwdFromArgsInScope(
     scope: workspace_access.AccessScope,
     args: std.json.ObjectMap,
 ) ![]const u8 {
-    const cwd_input = tool_args.optionalStringArg(args, "cwd") orelse ".";
+    const cwd_input = tool_args.nullablePlaceholderStringArg(args, "cwd") orelse ".";
     if (std.mem.eql(u8, cwd_input, ".")) return arena.dupe(u8, scope.primary_directory);
     return pathing.resolveWorkspaceOrExternalPath(arena, scope.primary_directory, cwd_input);
 }
@@ -301,41 +289,6 @@ pub fn permissionTargetsForCall(
         }
     }
 
-    if (std.mem.eql(u8, call.name, "rename_file")) {
-        const args = try tool_args.parseToolArgsObject(scratch, call.arguments_json);
-        const old_path = try tool_args.requiredStringArg(args, "old_path");
-        const new_path = try tool_args.requiredStringArg(args, "new_path");
-        const source = try resolveFileToolPath(scratch, workspace_root, call.name, old_path, .existing);
-        const destination = try resolveFileToolPath(scratch, workspace_root, call.name, new_path, .create);
-        return ownedPermissionCallTargets(alloc, &.{
-            .{ .role = "source", .path = source },
-            .{ .role = "destination", .path = destination },
-        });
-    }
-
-    if (std.mem.eql(u8, call.name, "copy_file")) {
-        const args = try tool_args.parseToolArgsObject(scratch, call.arguments_json);
-        const source_arg = try tool_args.requiredStringArg(args, "source");
-        const destination_arg = try tool_args.requiredStringArg(args, "destination");
-        const source = try resolveFileToolPath(scratch, workspace_root, call.name, source_arg, .existing);
-        const destination = try resolveFileToolPath(scratch, workspace_root, call.name, destination_arg, .create);
-        return ownedPermissionCallTargets(alloc, &.{
-            .{ .role = "source", .path = source },
-            .{ .role = "destination", .path = destination },
-        });
-    }
-
-    if (std.mem.eql(u8, call.name, "create_folder")) {
-        const args = try tool_args.parseToolArgsObject(scratch, call.arguments_json);
-        const path_arg = try tool_args.requiredStringArg(args, "path");
-        const target = try resolveFileToolPath(scratch, workspace_root, call.name, path_arg, .create);
-        const parent = std.fs.path.dirname(target) orelse target;
-        return ownedPermissionCallTargets(alloc, &.{
-            .{ .role = "target", .path = target },
-            .{ .role = "parent", .path = parent },
-        });
-    }
-
     const target = try permissionTargetForCall(scratch, workspace_root, call, target_kind);
     return ownedPermissionCallTargets(alloc, &.{.{ .role = "target", .path = target }});
 }
@@ -346,7 +299,7 @@ pub fn permissionTargetsForCallInScope(
     call: types.ToolCall,
     target_kind: PermissionTargetKind,
 ) !PermissionCallTargets {
-    if (target_kind != .command_cwd and !std.mem.eql(u8, call.name, "semantic_search")) {
+    if (target_kind != .command_cwd) {
         return permissionTargetsForCall(alloc, scope.primary_directory, call, target_kind);
     }
     const target = try permissionTargetForCallInScope(alloc, scope, call, target_kind);
@@ -360,14 +313,6 @@ pub fn permissionTargetForCallInScope(
     call: types.ToolCall,
     target_kind: PermissionTargetKind,
 ) ![]const u8 {
-    if (std.mem.eql(u8, call.name, "semantic_search")) {
-        const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
-        const path_arg = tool_args.optionalStringArg(args, "path") orelse ".";
-        return if (std.mem.eql(u8, path_arg, "."))
-            arena.dupe(u8, scope.primary_directory)
-        else
-            scope.resolvePath(arena, path_arg, .existing);
-    }
     if (target_kind != .command_cwd) {
         return permissionTargetForCall(arena, scope.primary_directory, call, target_kind);
     }
@@ -1117,17 +1062,10 @@ pub fn resolveFileToolPath(
 
 const external_path_tools = [_][]const u8{
     "read_file",
-    "list_files",
     "glob_files",
     "grep_files",
-    "open_file",
-    "file_info",
     "write_file",
     "edit_file",
-    "delete_file",
-    "create_folder",
-    "copy_file",
-    "rename_file",
 };
 
 pub fn allowsExternalPath(tool_name: []const u8) bool {
@@ -1140,17 +1078,10 @@ pub fn allowsExternalPath(tool_name: []const u8) bool {
 test "allowsExternalPath preserves the exact eligible tool set" {
     const expected = [_][]const u8{
         "read_file",
-        "list_files",
         "glob_files",
         "grep_files",
-        "open_file",
-        "file_info",
         "write_file",
         "edit_file",
-        "delete_file",
-        "create_folder",
-        "copy_file",
-        "rename_file",
     };
 
     try std.testing.expectEqual(expected.len, external_path_tools.len);
@@ -1158,25 +1089,16 @@ test "allowsExternalPath preserves the exact eligible tool set" {
         try std.testing.expectEqualStrings(expected_name, actual_name);
         try std.testing.expect(allowsExternalPath(expected_name));
     }
-    try std.testing.expect(!allowsExternalPath("semantic_search"));
     try std.testing.expect(!allowsExternalPath("run_command"));
     try std.testing.expect(!allowsExternalPath("missing_tool"));
 }
 
 pub fn isFilesystemMutationTool(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, "write_file") or
-        std.mem.eql(u8, tool_name, "edit_file") or
-        std.mem.eql(u8, tool_name, "delete_file") or
-        std.mem.eql(u8, tool_name, "create_folder") or
-        std.mem.eql(u8, tool_name, "copy_file") or
-        std.mem.eql(u8, tool_name, "rename_file");
+        std.mem.eql(u8, tool_name, "edit_file");
 }
 
-pub fn displayTargetForPolicy(alloc: std.mem.Allocator, workspace_root: []const u8, tool_name: []const u8, target_path: []const u8, target_kind: PermissionTargetKind) ![]u8 {
-    if (std.mem.eql(u8, tool_name, "copy_file") or std.mem.eql(u8, tool_name, "rename_file")) {
-        return displayPathTarget(alloc, workspace_root, target_path);
-    }
-
+pub fn displayTargetForPolicy(alloc: std.mem.Allocator, workspace_root: []const u8, target_path: []const u8, target_kind: PermissionTargetKind) ![]u8 {
     return switch (target_kind) {
         .command_cwd => displayCommandTarget(alloc, workspace_root, target_path),
         .path_existing, .path_optional_existing, .path_create_parent, .path_existing_parent => displayPathTarget(alloc, workspace_root, target_path),
@@ -1247,7 +1169,7 @@ pub fn sessionGrantAllowed(grants: []const types.PermissionGrant, tool_name: []c
 
     for (grants) |grant| {
         if (!permissionPatternMatchesTool(grant.tool_name, permission, tool_name)) continue;
-        if (std.mem.eql(u8, permission, "bash") or std.mem.eql(u8, permission, "sandbox")) {
+        if (std.mem.eql(u8, permission, "bash")) {
             if (!std.mem.eql(u8, grant.target_path, pattern)) continue;
         } else if (!permissionPatternMatchesTarget(grant.target_path, pattern)) continue;
         return true;
@@ -1257,12 +1179,7 @@ pub fn sessionGrantAllowed(grants: []const types.PermissionGrant, tool_name: []c
 
 const path_always_permissions = [_][]const u8{
     "edit",
-    "create_folder",
-    "open_file",
-    "rename_file",
-    "copy_file",
     "read",
-    "list",
     "glob",
     "grep",
 };
@@ -1279,11 +1196,10 @@ pub fn suggestedSessionGrants(alloc: std.mem.Allocator, workspace_root: []const 
         const command = patternForSessionGrantMatch(tool_name, target_path);
 
         try appendOwnedGrant(alloc, &grants, "bash", command);
-        try appendOwnedGrant(alloc, &grants, "sandbox", command);
         return grants.toOwnedSlice(alloc);
     }
 
-    if (shouldSuggestBroadPathGrants(tool_name, target_kind) and workspace_root.len > 0 and pathing.pathInside(workspace_root, target_path)) {
+    if (isPathBasedTool(target_kind) and workspace_root.len > 0 and pathing.pathInside(workspace_root, target_path)) {
         const workspace_pattern = try directoryTreePattern(alloc, workspace_root);
         defer alloc.free(workspace_pattern);
 
@@ -1293,7 +1209,7 @@ pub fn suggestedSessionGrants(alloc: std.mem.Allocator, workspace_root: []const 
         return grants.toOwnedSlice(alloc);
     }
 
-    if (shouldSuggestBroadPathGrants(tool_name, target_kind)) {
+    if (isPathBasedTool(target_kind)) {
         if (externalPathGrantRoot(alloc, workspace_root, target_path)) |external_root| {
             defer alloc.free(external_root);
             const external_pattern = try directoryTreePattern(alloc, external_root);
@@ -1496,7 +1412,6 @@ pub fn formatPermissionsStatus(
 pub fn permissionNameForTool(tool_name: []const u8) []const u8 {
     if (std.mem.eql(u8, tool_name, "read_file")) return "read";
     if (std.mem.eql(u8, tool_name, "write_file") or std.mem.eql(u8, tool_name, "edit_file")) return "edit";
-    if (std.mem.eql(u8, tool_name, "list_files")) return "list";
     if (std.mem.eql(u8, tool_name, "glob_files")) return "glob";
     if (std.mem.eql(u8, tool_name, "grep_files")) return "grep";
     if (std.mem.eql(u8, tool_name, "run_command")) return "bash";
@@ -1525,8 +1440,7 @@ pub fn permissionRulePatternForGrant(alloc: std.mem.Allocator, workspace_root: [
     }
 
     if (std.mem.eql(u8, permission, "url") or
-        std.mem.eql(u8, permission, "skill") or
-        std.mem.eql(u8, permission, "sandbox"))
+        std.mem.eql(u8, permission, "skill"))
     {
         return alloc.dupe(u8, pattern);
     }
@@ -1559,11 +1473,7 @@ fn patternForRuleMatch(alloc: std.mem.Allocator, workspace_root: []const u8, too
             target_path;
         return alloc.dupe(u8, command_environment.commandFromPermissionIdentity(identity));
     }
-    if (std.mem.eql(u8, permission, "sandbox")) {
-        return alloc.dupe(u8, command_environment.commandFromPermissionIdentity(target_path));
-    }
-
-    return displayTargetForPolicy(alloc, workspace_root, tool_name, target_path, target_kind);
+    return displayTargetForPolicy(alloc, workspace_root, target_path, target_kind);
 }
 
 pub fn patternForSessionGrantMatch(tool_name: []const u8, target_path: []const u8) []const u8 {
@@ -1582,14 +1492,6 @@ fn isPathBasedTool(target_kind: PermissionTargetKind) bool {
         .path_existing, .path_optional_existing, .path_create_parent, .path_existing_parent => true,
         else => false,
     };
-}
-
-fn shouldSuggestBroadPathGrants(tool_name: []const u8, target_kind: PermissionTargetKind) bool {
-    if (std.mem.eql(u8, tool_name, "delete_file")) return false;
-    if (std.mem.eql(u8, tool_name, "file_info")) return false;
-    if (std.mem.eql(u8, tool_name, "semantic_search")) return false;
-    if (std.mem.eql(u8, tool_name, "copy_file") or std.mem.eql(u8, tool_name, "rename_file")) return false;
-    return isPathBasedTool(target_kind);
 }
 
 fn externalPathGrantRoot(alloc: std.mem.Allocator, workspace_root: []const u8, target_path: []const u8) ?[]u8 {
@@ -1622,12 +1524,13 @@ fn evaluateRulesetForTool(rules: []const types.PermissionRule, permission: []con
     var matched: ?RuleDecision = null;
     for (rules) |rule| {
         if (!ruleMatchesPermission(rule.permission, permission, tool_name)) continue;
-        if (!permissionPatternMatchesTarget(rule.pattern, pattern)) continue;
-        matched = switch (rule.action) {
+        const action: RuleDecision = switch (rule.action) {
             .allow => .allow,
             .ask => .ask,
             .deny => .deny,
         };
+        if (!ruleTargetMatches(permission, action, rule.pattern, pattern)) continue;
+        matched = action;
     }
     return matched;
 }
@@ -1675,6 +1578,116 @@ fn permissionPatternMatchesTarget(pattern: []const u8, candidate: []const u8) bo
     return wildcardMatch(pattern, candidate);
 }
 
+fn ruleTargetMatches(permission: []const u8, action: RuleDecision, pattern: []const u8, candidate: []const u8) bool {
+    if (action != .allow or
+        !std.mem.eql(u8, permission, "bash"))
+    {
+        return permissionPatternMatchesTarget(pattern, candidate);
+    }
+
+    if (!containsWildcard(pattern)) return std.mem.eql(u8, pattern, candidate);
+    if (!isStaticCommand(pattern, true) or !isStaticCommand(candidate, false)) return false;
+    return staticCommandWildcardMatch(pattern, candidate);
+}
+
+fn containsWildcard(pattern: []const u8) bool {
+    return std.mem.findScalar(u8, pattern, '*') != null or
+        std.mem.findScalar(u8, pattern, '?') != null;
+}
+
+fn isStaticCommand(command: []const u8, allow_wildcards: bool) bool {
+    if (command.len == 0) return false;
+    if (firstWordIsAssignment(command)) return false;
+
+    var index: usize = 0;
+    var in_word = false;
+    while (index < command.len) {
+        const char = command[index];
+        if (char == ' ' or char == '\t') {
+            if (!in_word) return false;
+            while (index < command.len and (command[index] == ' ' or command[index] == '\t')) : (index += 1) {}
+            if (index == command.len) return false;
+            in_word = false;
+            continue;
+        }
+
+        if (char == '\'') {
+            const literal_start = index + 1;
+            const literal_end = std.mem.findScalarPos(u8, command, literal_start, '\'') orelse return false;
+            const literal = command[literal_start..literal_end];
+            if (!std.unicode.utf8ValidateSlice(literal)) return false;
+            if (std.mem.findScalar(u8, literal, 0) != null or
+                std.mem.findScalar(u8, literal, '\r') != null or
+                std.mem.findScalar(u8, literal, '\n') != null)
+            {
+                return false;
+            }
+            in_word = true;
+            index = literal_end + 1;
+            continue;
+        }
+
+        if (!isStaticUnquotedByte(char) and !(allow_wildcards and (char == '*' or char == '?'))) return false;
+        in_word = true;
+        index += 1;
+    }
+    return in_word;
+}
+
+fn firstWordIsAssignment(command: []const u8) bool {
+    const first_word_end = std.mem.findAny(u8, command, " \t") orelse command.len;
+    const first_word = command[0..first_word_end];
+    const equals = std.mem.findScalar(u8, first_word, '=') orelse return false;
+    const name = first_word[0..equals];
+    if (name.len == 0 or (!std.ascii.isAlphabetic(name[0]) and name[0] != '_')) return false;
+    for (name[1..]) |char| {
+        if (!std.ascii.isAlphanumeric(char) and char != '_') return false;
+    }
+    return true;
+}
+
+fn isStaticUnquotedByte(char: u8) bool {
+    return std.ascii.isAlphanumeric(char) or switch (char) {
+        '_', '.', '/', ',', ':', '+', '=', '%', '@', '-' => true,
+        else => false,
+    };
+}
+
+fn staticCommandWildcardMatch(pattern: []const u8, candidate: []const u8) bool {
+    var pattern_index: usize = 0;
+    var candidate_index: usize = 0;
+    var in_single_quote = false;
+    var star_index: ?usize = null;
+    var star_candidate_index: usize = 0;
+
+    while (candidate_index < candidate.len) {
+        if (pattern_index < pattern.len) {
+            const char = pattern[pattern_index];
+            if (!in_single_quote and char == '*') {
+                star_index = pattern_index;
+                pattern_index += 1;
+                star_candidate_index = candidate_index;
+                continue;
+            }
+            if ((!in_single_quote and char == '?') or char == candidate[candidate_index]) {
+                if (char == '\'') in_single_quote = !in_single_quote;
+                pattern_index += 1;
+                candidate_index += 1;
+                continue;
+            }
+        }
+
+        const star = star_index orelse return false;
+        star_candidate_index += 1;
+        candidate_index = star_candidate_index;
+        pattern_index = star + 1;
+        in_single_quote = false;
+    }
+
+    while (pattern_index < pattern.len and !in_single_quote and pattern[pattern_index] == '*') : (pattern_index += 1) {}
+    return pattern_index == pattern.len;
+}
+
 fn directoryTreePatternMatches(pattern: []const u8, candidate: []const u8) bool {
     if (!std.mem.endsWith(u8, pattern, "/**")) return false;
     if (std.mem.eql(u8, pattern, "/**")) return std.mem.startsWith(u8, candidate, "/");
@@ -1687,18 +1700,34 @@ fn directoryTreePatternMatches(pattern: []const u8, candidate: []const u8) bool 
 }
 
 fn wildcardMatch(pattern: []const u8, candidate: []const u8) bool {
-    if (pattern.len == 0) return candidate.len == 0;
-    if (pattern[0] == '*') {
-        if (wildcardMatch(pattern[1..], candidate)) return true;
-        if (candidate.len == 0) return false;
-        return wildcardMatch(pattern, candidate[1..]);
+    var pattern_index: usize = 0;
+    var candidate_index: usize = 0;
+    var star_index: ?usize = null;
+    var star_candidate_index: usize = 0;
+
+    while (candidate_index < candidate.len) {
+        if (pattern_index < pattern.len and
+            (pattern[pattern_index] == '?' or pattern[pattern_index] == candidate[candidate_index]))
+        {
+            pattern_index += 1;
+            candidate_index += 1;
+            continue;
+        }
+        if (pattern_index < pattern.len and pattern[pattern_index] == '*') {
+            star_index = pattern_index;
+            pattern_index += 1;
+            star_candidate_index = candidate_index;
+            continue;
+        }
+
+        const star = star_index orelse return false;
+        star_candidate_index += 1;
+        candidate_index = star_candidate_index;
+        pattern_index = star + 1;
     }
-    if (pattern[0] == '?') {
-        if (candidate.len == 0) return false;
-        return wildcardMatch(pattern[1..], candidate[1..]);
-    }
-    if (candidate.len == 0 or pattern[0] != candidate[0]) return false;
-    return wildcardMatch(pattern[1..], candidate[1..]);
+
+    while (pattern_index < pattern.len and pattern[pattern_index] == '*') : (pattern_index += 1) {}
+    return pattern_index == pattern.len;
 }
 
 fn isGlobalTargetPattern(pattern: []const u8) bool {
@@ -1966,13 +1995,10 @@ test "sessionGrantAllowed maps tool categories and matches command grants exactl
 test "session command grants treat wildcard bytes literally" {
     const grants = [_]types.PermissionGrant{
         .{ .tool_name = @constCast("bash"), .target_path = @constCast("printf '*?'") },
-        .{ .tool_name = @constCast("sandbox"), .target_path = @constCast("printf '*?'") },
     };
 
     try std.testing.expect(sessionGrantAllowed(&grants, "run_command", "/tmp/workspace::printf '*?'"));
     try std.testing.expect(!sessionGrantAllowed(&grants, "run_command", "/tmp/workspace::printf 'file?'"));
-    try std.testing.expect(sessionGrantAllowed(&grants, "sandbox", "printf '*?'"));
-    try std.testing.expect(!sessionGrantAllowed(&grants, "sandbox", "printf 'file?'"));
 }
 
 test "permissionTargetForCall preserves run_command cwd targets" {
@@ -2059,59 +2085,6 @@ test "web_search session grant authorizes subsequent query" {
     }, .none);
 
     try std.testing.expect(sessionGrantAllowed(&grants, "web_search", target));
-}
-
-test "permissionTargetsForCall includes copy and rename source and destination" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "workspace/src");
-    {
-        var file = try tmp.dir.createFile(std.testing.io, "workspace/src/source.txt", .{});
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, "source\n");
-    }
-
-    const workspace = try @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const source = try std.fs.path.join(alloc, &.{ workspace, "src/source.txt" });
-    defer alloc.free(source);
-    const copy_destination = try std.fs.path.join(alloc, &.{ workspace, "blocked/copied.txt" });
-    defer alloc.free(copy_destination);
-    const rename_destination = try std.fs.path.join(alloc, &.{ workspace, "renamed/source.txt" });
-    defer alloc.free(rename_destination);
-
-    const rename_call: types.ToolCall = .{
-        .id = "call_1",
-        .name = "rename_file",
-        .arguments_json = "{\"old_path\":\"src/source.txt\",\"new_path\":\"renamed/source.txt\"}",
-    };
-    const copy_call: types.ToolCall = .{
-        .id = "call_2",
-        .name = "copy_file",
-        .arguments_json = "{\"source\":\"src/source.txt\",\"destination\":\"blocked/copied.txt\"}",
-    };
-
-    var copy_targets = try permissionTargetsForCall(alloc, workspace, copy_call, .none);
-    defer copy_targets.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), copy_targets.items.len);
-    try std.testing.expectEqualStrings("source", copy_targets.items[0].role);
-    try std.testing.expectEqualStrings(source, copy_targets.items[0].path);
-    try std.testing.expectEqualStrings("destination", copy_targets.items[1].role);
-    try std.testing.expectEqualStrings(copy_destination, copy_targets.items[1].path);
-
-    var rename_targets = try permissionTargetsForCall(alloc, workspace, rename_call, .none);
-    defer rename_targets.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), rename_targets.items.len);
-    try std.testing.expectEqualStrings("source", rename_targets.items[0].role);
-    try std.testing.expectEqualStrings(source, rename_targets.items[0].path);
-    try std.testing.expectEqualStrings("destination", rename_targets.items[1].role);
-    try std.testing.expectEqualStrings(rename_destination, rename_targets.items[1].path);
-
-    var rules = try ownedRuleSet(alloc, "copy_file", "blocked/*", .deny);
-    defer rules.deinit(alloc);
-    try std.testing.expectEqual(.deny, try ruleDecisionFor(alloc, rules, workspace, "copy_file", copy_targets.items[1].path, .none));
 }
 
 test "permissionTargetsForCall exposes every canonical Vision path" {
@@ -2216,11 +2189,6 @@ test "permissionTargetForCall covers active target kinds" {
         expected: []const u8,
     }{
         .{
-            .call = .{ .id = "list", .name = "list_files", .arguments_json = "{}" },
-            .target_kind = .path_optional_existing,
-            .expected = workspace,
-        },
-        .{
             .call = .{ .id = "grep", .name = "grep_files", .arguments_json = "{\"pattern\":\"main\",\"path\":\"src\"}" },
             .target_kind = .path_optional_existing,
             .expected = src_dir,
@@ -2229,11 +2197,6 @@ test "permissionTargetForCall covers active target kinds" {
             .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"src/app.zig\"}" },
             .target_kind = .path_existing,
             .expected = app_file,
-        },
-        .{
-            .call = .{ .id = "mkdir", .name = "create_folder", .arguments_json = "{\"path\":\"src/generated\"}" },
-            .target_kind = .path_create_parent,
-            .expected = src_dir,
         },
         .{
             .call = .{ .id = "memory", .name = "memory", .arguments_json = "{\"action\":\"list\"}" },
@@ -2271,8 +2234,6 @@ test "permissionTargetForCall resolves external absolute file tool targets" {
     defer alloc.free(external_file);
     const external_new_file = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(external_file).?, "new.zig" });
     defer alloc.free(external_new_file);
-    const external_new_dir = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(external_file).?, "nested" });
-    defer alloc.free(external_new_dir);
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -2304,85 +2265,9 @@ test "permissionTargetForCall resolves external absolute file tool targets" {
         error.TypedFileMutationTargetRequired,
         permissionTargetForCall(arena, workspace, edit_call, .none),
     );
-
-    const delete_call: types.ToolCall = .{
-        .id = "delete",
-        .name = "delete_file",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{external_file}),
-    };
-    try std.testing.expectEqualStrings(external_file, try permissionTargetForCall(arena, workspace, delete_call, .path_existing));
-
-    const create_folder_call: types.ToolCall = .{
-        .id = "mkdir",
-        .name = "create_folder",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{external_new_dir}),
-    };
-    try std.testing.expectEqualStrings(std.fs.path.dirname(external_new_dir).?, try permissionTargetForCall(arena, workspace, create_folder_call, .path_create_parent));
-
-    const file_info_call: types.ToolCall = .{
-        .id = "info",
-        .name = "file_info",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{external_file}),
-    };
-    try std.testing.expectEqualStrings(external_file, try permissionTargetForCall(arena, workspace, file_info_call, .path_existing));
-
-    const open_call: types.ToolCall = .{
-        .id = "open",
-        .name = "open_file",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{external_file}),
-    };
-    try std.testing.expectEqualStrings(external_file, try permissionTargetForCall(arena, workspace, open_call, .path_existing));
 }
 
-test "permissionTargetsForCall resolves external copy and rename pairs" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "workspace");
-    try tmp.dir.createDirPath(std.testing.io, "external");
-    {
-        var file = try tmp.dir.createFile(std.testing.io, "external/source.txt", .{});
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, "source\n");
-    }
-
-    const workspace = try @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const external_source = try @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, "external/source.txt");
-    defer alloc.free(external_source);
-    const external_dir = std.fs.path.dirname(external_source).?;
-    const external_copy_dest = try std.fs.path.join(alloc, &.{ external_dir, "copied.txt" });
-    defer alloc.free(external_copy_dest);
-    const external_rename_dest = try std.fs.path.join(alloc, &.{ external_dir, "renamed.txt" });
-    defer alloc.free(external_rename_dest);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var copy_targets = try permissionTargetsForCall(alloc, workspace, .{
-        .id = "copy",
-        .name = "copy_file",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"source\":\"{s}\",\"destination\":\"{s}\"}}", .{ external_source, external_copy_dest }),
-    }, .none);
-    defer copy_targets.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), copy_targets.items.len);
-    try std.testing.expectEqualStrings(external_source, copy_targets.items[0].path);
-    try std.testing.expectEqualStrings(external_copy_dest, copy_targets.items[1].path);
-
-    var rename_targets = try permissionTargetsForCall(alloc, workspace, .{
-        .id = "rename",
-        .name = "rename_file",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"old_path\":\"{s}\",\"new_path\":\"{s}\"}}", .{ external_source, external_rename_dest }),
-    }, .none);
-    defer rename_targets.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), rename_targets.items.len);
-    try std.testing.expectEqualStrings(external_source, rename_targets.items[0].path);
-    try std.testing.expectEqualStrings(external_rename_dest, rename_targets.items[1].path);
-}
-
-test "command cwd accepts external paths without widening workspace-only search" {
+test "command cwd and grep accept explicit external paths" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2420,66 +2305,39 @@ test "command cwd accepts external paths without widening workspace-only search"
 
     const search_call = types.ToolCall{
         .id = "search",
-        .name = "semantic_search",
-        .arguments_json = try std.fmt.allocPrint(arena_state.allocator(), "{{\"query\":\"needle\",\"path\":\"{s}\"}}", .{shared}),
+        .name = "grep_files",
+        .arguments_json = try std.fmt.allocPrint(arena_state.allocator(), "{{\"pattern\":\"needle\",\"path\":\"{s}\"}}", .{shared}),
     };
     const search_target = try permissionTargetForCallInScope(arena_state.allocator(), active_scope, search_call, .path_optional_existing);
     try std.testing.expectEqualStrings(shared, search_target);
-    try std.testing.expectError(
-        error.PathOutsideWorkspace,
-        permissionTargetForCallInScope(arena_state.allocator(), removed_scope, search_call, .path_optional_existing),
-    );
-}
-
-test "copy and rename session grants stay exact for role-specific targets" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "external");
-    {
-        var file = try tmp.dir.createFile(io_mod.getIo(), "external/source.txt", .{ .truncate = true });
-        defer file.close(io_mod.getIo());
-        try file.writeStreamingAll(io_mod.getIo(), "source\n");
-    }
-
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const source = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external/source.txt");
-    defer alloc.free(source);
-
-    const grants = try suggestedSessionGrants(alloc, workspace, "copy_file", source, .none);
-    defer types.freePermissionGrantSlice(alloc, grants);
-
-    try std.testing.expectEqual(@as(usize, 1), grants.len);
-    try std.testing.expectEqualStrings("copy_file", grants[0].tool_name);
-    try std.testing.expectEqualStrings(source, grants[0].target_path);
+    const external_search_target = try permissionTargetForCallInScope(arena_state.allocator(), removed_scope, search_call, .path_optional_existing);
+    try std.testing.expectEqualStrings(shared, external_search_target);
 }
 
 test "displayTargetForPolicy renders workspace-relative paths and command cwd" {
     const alloc = std.testing.allocator;
 
-    const root_path = try displayTargetForPolicy(alloc, "/tmp/workspace", "read_file", "/tmp/workspace", .path_existing);
+    const root_path = try displayTargetForPolicy(alloc, "/tmp/workspace", "/tmp/workspace", .path_existing);
     defer alloc.free(root_path);
     try std.testing.expectEqualStrings(".", root_path);
 
-    const nested_path = try displayTargetForPolicy(alloc, "/tmp/workspace", "write_file", "/tmp/workspace/src/app.zig", .path_create_parent);
+    const nested_path = try displayTargetForPolicy(alloc, "/tmp/workspace", "/tmp/workspace/src/app.zig", .path_create_parent);
     defer alloc.free(nested_path);
     try std.testing.expectEqualStrings("src/app.zig", nested_path);
 
-    const root_command = try displayTargetForPolicy(alloc, "/tmp/workspace", "run_command", "/tmp/workspace::zig build test", .command_cwd);
+    const root_command = try displayTargetForPolicy(alloc, "/tmp/workspace", "/tmp/workspace::zig build test", .command_cwd);
     defer alloc.free(root_command);
     try std.testing.expectEqualStrings(".::zig build test", root_command);
 
-    const nested_command = try displayTargetForPolicy(alloc, "/tmp/workspace", "run_command", "/tmp/workspace/packages/app::npm test", .command_cwd);
+    const nested_command = try displayTargetForPolicy(alloc, "/tmp/workspace", "/tmp/workspace/packages/app::npm test", .command_cwd);
     defer alloc.free(nested_command);
     try std.testing.expectEqualStrings("packages/app::npm test", nested_command);
 
-    const external_command = try displayTargetForPolicy(alloc, "/tmp/workspace", "run_command", "/tmp/other::npm test", .command_cwd);
+    const external_command = try displayTargetForPolicy(alloc, "/tmp/workspace", "/tmp/other::npm test", .command_cwd);
     defer alloc.free(external_command);
     try std.testing.expectEqualStrings("/tmp/other::npm test", external_command);
 
-    const unknown = try displayTargetForPolicy(alloc, "/tmp/workspace", "unknown_tool", "/tmp/workspace/src/app.zig", .none);
+    const unknown = try displayTargetForPolicy(alloc, "/tmp/workspace", "/tmp/workspace/src/app.zig", .none);
     defer alloc.free(unknown);
     try std.testing.expectEqualStrings("/tmp/workspace/src/app.zig", unknown);
 }
@@ -2499,6 +2357,94 @@ test "ruleDecisionForPermissionPattern matches direct inputs and fallback" {
     try std.testing.expectEqual(RuleDecision.ask, ruleDecisionForPermissionPattern(rules, "read", "README.md", .ask));
 }
 
+test "configured wildcard command allows only static command grammar" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("*"), .pattern = @constCast("printf *"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(rules, "bash", "printf safe", .none));
+    try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(rules, "bash", "printf 'safe value'", .none));
+    try std.testing.expectEqual(RuleDecision.none, ruleDecisionForPermissionPattern(rules, "bash", "printf safe && touch /tmp/fx-marker", .none));
+    try std.testing.expectEqual(RuleDecision.none, ruleDecisionForPermissionPattern(rules, "bash", "printf \"$(touch /tmp/fx-marker)\"", .none));
+}
+
+test "configured command rules require exact matching outside static grammar" {
+    var exact_rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("printf \"$(date)\""), .action = .allow },
+    };
+    const exact_rules: types.PermissionRuleSet = .{ .rules = &exact_rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(exact_rules, "bash", "printf \"$(date)\"", .none));
+    try std.testing.expectEqual(RuleDecision.none, ruleDecisionForPermissionPattern(exact_rules, "bash", "printf \"$(touch /tmp/fx-marker)\"", .none));
+
+    var dynamic_pattern_rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("printf \"*\""), .action = .allow },
+    };
+    try std.testing.expectEqual(
+        RuleDecision.none,
+        ruleDecisionForPermissionPattern(.{ .rules = &dynamic_pattern_rules_buf }, "bash", "printf \"safe\"", .none),
+    );
+}
+
+test "configured command deny and ask retain generic wildcard matching" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("printf *"), .action = .deny },
+        .{ .permission = @constCast("custom"), .pattern = @constCast("printf *"), .action = .ask },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.deny, ruleDecisionForPermissionPattern(rules, "bash", "printf safe && touch /tmp/fx-marker", .none));
+    try std.testing.expectEqual(RuleDecision.ask, ruleDecisionForPermissionPattern(rules, "custom", "printf \"$(touch /tmp/fx-marker)\"", .none));
+}
+
+test "static command grammar is an explicit allowlist" {
+    for ([_][]const u8{
+        "git status --short",
+        "printf 'safe value'",
+        "printf ''",
+        "tool foo/bar:baz,+qux=value%@host",
+        "printf 'Grüße'",
+    }) |command| {
+        try std.testing.expect(isStaticCommand(command, false));
+    }
+
+    for ([_][]const u8{
+        "",
+        " leading",
+        "trailing ",
+        "FOO=bar command",
+        "FOO='bar' command",
+        "echo \"dynamic\"",
+        "echo $HOME",
+        "echo `pwd`",
+        "echo ~",
+        "echo [ab]",
+        "echo #comment",
+        "echo foo\\bar",
+        "echo one && echo two",
+        "echo one | cat",
+        "echo one > out",
+        "(echo one)",
+        "echo one\necho two",
+        "echo 'unterminated",
+    }) |command| {
+        try std.testing.expect(!isStaticCommand(command, false));
+    }
+
+    try std.testing.expect(isStaticCommand("git * --?", true));
+    try std.testing.expect(!isStaticCommand("git * --?", false));
+    try std.testing.expect(isStaticCommand("printf '*'", false));
+}
+
+test "generic wildcard matching remains total for maximum command-sized input" {
+    const candidate = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(candidate);
+    @memset(candidate, 'x');
+    try std.testing.expect(wildcardMatch("*", candidate));
+    try std.testing.expect(!wildcardMatch("?", candidate));
+}
+
 test "rulesDenyAllTargetsForPermission honors last matching overrides" {
     var later_allow_rules = [_]types.PermissionRule{
         .{ .permission = @constCast("edit"), .pattern = @constCast("*"), .action = .deny },
@@ -2516,6 +2462,20 @@ test "rulesDenyAllTargetsForPermission honors last matching overrides" {
         .{ .permission = @constCast("edit"), .pattern = @constCast("src/*"), .action = .deny },
     };
     try std.testing.expect(!rulesDenyAllTargetsForPermission(.{ .rules = &target_deny_rules }, "edit"));
+}
+
+test "command permission target treats a textual null cwd as absent" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const target = try permissionTargetForCall(arena, "/tmp/workspace", .{
+        .id = "terminal",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"ls\",\"cwd\":\" NULL \"}",
+    }, .command_cwd);
+
+    try std.testing.expectEqualStrings("/tmp/workspace::ls", target);
 }
 
 test "web_fetch permission target is canonical domain rather than full url" {
@@ -2580,7 +2540,7 @@ test "web_fetch grants do not authorize other tools" {
 
     try std.testing.expect(sessionGrantAllowed(&grants, "web_fetch", "domain:example.com"));
     try std.testing.expect(!sessionGrantAllowed(&grants, "web_fetch", "domain:example.org"));
-    try std.testing.expect(!sessionGrantAllowed(&grants, "open_file", "https://example.com/docs"));
+    try std.testing.expect(!sessionGrantAllowed(&grants, "read_file", "https://example.com/docs"));
     try std.testing.expect(!sessionGrantAllowed(&grants, "run_command", "https://example.com/docs"));
 }
 
@@ -2668,21 +2628,6 @@ test "configured command rules match explicit environments by command" {
         RuleDecision.allow,
         try ruleDecisionFor(alloc, rules, "/tmp/workspace", "run_command", target, .command_cwd),
     );
-
-    var sandbox_rules_buf = [_]types.PermissionRule{
-        .{ .permission = @constCast("sandbox"), .pattern = @constCast("zig *"), .action = .deny },
-    };
-    try std.testing.expectEqual(
-        RuleDecision.deny,
-        try ruleDecisionFor(
-            alloc,
-            .{ .rules = &sandbox_rules_buf },
-            "/tmp/workspace",
-            "sandbox",
-            identity,
-            .none,
-        ),
-    );
 }
 
 test "directory tree permission patterns match directory and descendants only" {
@@ -2702,9 +2647,8 @@ test "suggestedSessionGrants returns exact command suggestions with stripped cwd
     const grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "run_command", "/tmp/workspace::git status --short", .command_cwd);
     defer freeGrants(alloc, grants);
 
-    try std.testing.expectEqual(@as(usize, 2), grants.len);
+    try std.testing.expectEqual(@as(usize, 1), grants.len);
     try expectGrant(grants[0], "bash", "git status --short");
-    try expectGrant(grants[1], "sandbox", "git status --short");
 }
 
 test "suggestedSessionGrants returns exact broad workspace path suggestions" {
@@ -2745,27 +2689,6 @@ test "suggestedSessionGrants uses registered path metadata for provider tools" {
     defer freeGrants(alloc, unknown);
     try std.testing.expectEqual(@as(usize, 1), unknown.len);
     try expectGrant(unknown[0], "unknown_tool", "/tmp/workspace/src");
-}
-
-test "suggestedSessionGrants excludes narrow path tools from broad grants" {
-    const alloc = std.testing.allocator;
-
-    const cases = [_]struct {
-        tool_name: []const u8,
-        permission: []const u8,
-    }{
-        .{ .tool_name = "delete_file", .permission = "delete_file" },
-        .{ .tool_name = "file_info", .permission = "file_info" },
-        .{ .tool_name = "semantic_search", .permission = "semantic_search" },
-    };
-
-    for (cases) |case| {
-        const grants = try suggestedSessionGrants(alloc, "/tmp/workspace", case.tool_name, "/tmp/workspace/src/main.zig", .path_existing);
-        defer freeGrants(alloc, grants);
-
-        try std.testing.expectEqual(@as(usize, 1), grants.len);
-        try expectGrant(grants[0], case.permission, "/tmp/workspace/src/main.zig");
-    }
 }
 
 test "suggestedSessionGrants returns external directory tree read grant" {

@@ -14,6 +14,7 @@ const recoveryReleasePath = process.env.FX_MCP_RECOVERY_RELEASE_PATH;
 const initialToolName = process.env.FX_MCP_INITIAL_TOOL_NAME ?? "echo";
 const recoveredToolName = process.env.FX_MCP_RECOVERED_TOOL_NAME ?? initialToolName;
 const expectedElicitation = process.env.FX_MCP_EXPECT_ELICITATION ?? "none";
+const environmentCapturePath = process.env.FX_MCP_ENV_CAPTURE;
 const resourcesSubscribe = process.env.FX_MCP_RESOURCES_SUBSCRIBE !== "0";
 const resourceTtlMs = process.env.FX_MCP_RESOURCE_TTL_MS === undefined
   ? null
@@ -35,6 +36,15 @@ const stalledRequestIds = new Set();
 let buffer = Buffer.alloc(0);
 
 if (pidPath) writeFileSync(pidPath, String(process.pid));
+if (environmentCapturePath) {
+  writeFileSync(environmentCapturePath, JSON.stringify({
+    configured: process.env.FX_MCP_ENV_SENTINEL,
+    inherited: process.env.FX_MCP_INHERITED_SENTINEL,
+    path: process.env.PATH,
+    home: process.env.HOME,
+    httpsProxy: process.env.HTTPS_PROXY,
+  }));
+}
 if (stallRecovery) setInterval(() => {}, 1000);
 
 function send(message) {
@@ -158,6 +168,11 @@ function handle(message) {
       result: {
         resultType: "complete",
         supportedVersions: [protocolVersion],
+        _meta: {
+          "io.modelcontextprotocol/serverInfo": {
+            name: "modern-stdio-fixture",
+          },
+        },
         capabilities: {
           tools: mode === "subscription_cache" || mode === "crash_once_new_tool" || mode === "features"
             ? { listChanged: true }
@@ -238,6 +253,15 @@ function handle(message) {
                 properties: { text: { type: "string" } },
                 required: ["text"],
               },
+              ...(mode === "tool_failure"
+                ? {
+                    outputSchema: {
+                      type: "object",
+                      properties: { result: { type: "string" } },
+                      required: ["result"],
+                    },
+                  }
+                : {}),
             }],
         ttlMs: 60_000,
         cacheScope: "public",

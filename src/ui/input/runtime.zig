@@ -27,7 +27,6 @@ const terminal_action_decoder = @import("terminal_action_decoder.zig");
 
 const ImageBlocks = kill_ring.ImageBlocks;
 const InputRuntime = core_input_runtime.Runtime;
-const InputAppearance = core_input_runtime.InputAppearance;
 
 const Allocator = std.mem.Allocator;
 const InsertResult = composer_insertion.InsertResult;
@@ -346,6 +345,7 @@ fn subagentActionFromDecoded(action: input_action.Action) ?subagent_input.Action
         .toggle_full_transcript,
         .toggle_permission_mode,
         .open_all_sessions,
+        .steer_submit,
         .paste_start,
         .paste_end,
         .ignore,
@@ -529,7 +529,7 @@ test "terminal input carries typed question decisions and focused edits" {
     );
 }
 
-test "Fx terminal reply ownership survives takeover transition" {
+test "fx terminal reply ownership survives takeover transition" {
     const alloc = std.testing.allocator;
     var monitor = theme_monitor.Monitor{};
     monitor.start();
@@ -2306,6 +2306,15 @@ test "input escape parser separates plain up down from history arrows" {
 test "input escape parser recognizes unmodified kitty Escape" {
     try expectEscapeAction("[27u", .escape);
     try expectEscapeAction("[27;1u", .escape);
+    try expectEscapeAction("[27;1:1u", .escape);
+    try expectEscapeAction("[27;1:2u", .escape);
+    try expectEscapeAction("[27;1:3u", .ignore);
+    // Ghostty with Num Lock active sends modifier 128 (bit 7).
+    try expectEscapeAction("[27;129u", .escape);
+    try expectEscapeAction("[27;129:1u", .escape);
+    // Caps Lock (bit 6) should also be ignored.
+    try expectEscapeAction("[27;65u", .escape);
+    try expectEscapeAction("[27;65:1u", .escape);
 }
 
 test "input escape parser resolves unmodified kitty Backspace to a delete byte" {
@@ -4915,6 +4924,20 @@ test "input escape parser handles cmd+arrow as home/end" {
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, ';'));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '9'));
     try std.testing.expectEqual(@as(?InputEscapeAction, moveEscape(.draft_end, false)), consumeInputEscapeByte(&stage, &param, &param2, 'B'));
+    try std.testing.expectEqual(@as(u8, 0), stage);
+}
+
+test "input escape parser handles ctrl+enter as steering submit" {
+    // ESC[13;5u is Kitty's Ctrl+Enter encoding.
+    var stage: u8 = 1;
+    var param: u16 = 0;
+    var param2: u16 = 0;
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '['));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '1'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '3'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, ';'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '5'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, .steer_submit), consumeInputEscapeByte(&stage, &param, &param2, 'u'));
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 

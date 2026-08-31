@@ -3,7 +3,9 @@ const builtin = @import("builtin");
 const question_answer = @import("../agent/question_answer.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
+const tool_admission = @import("../agent/runtime/tool_admission.zig");
 const tool_presentation = @import("../agent/runtime/tool_presentation.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
@@ -12,6 +14,7 @@ const host_target = @import("../hosts/target.zig");
 const diff = @import("../output/diff.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -30,6 +33,7 @@ const result_store = @import("../session/result_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const captured_command = @import("../tooling/captured_command.zig");
+const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_log = @import("../session/session_log.zig");
 const session_resume_view = @import("../session/session_resume_view.zig");
@@ -335,16 +339,22 @@ pub const ResumeHandoff = struct {
 };
 
 pub const SessionPreferencePatch = struct {
+    provider: ?model_provider.ProviderId = null,
     model: ?[]const u8 = null,
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
 
-    fn userSettingsPatch(self: SessionPreferencePatch) config_runtime.UserSettingsPatch {
-        return .{
-            .model = self.model,
+    pub fn userSettingsPatch(self: SessionPreferencePatch) config_runtime.UserSettingsPatch {
+        var patch = config_runtime.UserSettingsPatch{
+            .provider = self.provider,
             .effort = self.effort,
             .fast_mode = self.fast_mode,
         };
+        if (self.model) |model| patch.model_preference = .{
+            .provider = self.provider orelse .gateway,
+            .model = model,
+        };
+        return patch;
     }
 };
 
@@ -368,6 +378,7 @@ pub const SessionPicker = struct {
     has_more: bool = false,
     loading_more: bool = false,
     summaries: std.ArrayList(session_store.SessionSummary) = .empty,
+    continuation: ?subagent_resume_admission.ActionableContinuation = null,
     selected: usize = 0,
     window_start: usize = 0,
     scope: SessionPickerScope = .current_workspace,
@@ -378,6 +389,7 @@ pub const SessionPicker = struct {
     pub fn deinit(self: *SessionPicker, alloc: Allocator) void {
         for (self.summaries.items) |*summary| summary.deinit(alloc);
         self.summaries.deinit(alloc);
+        if (self.continuation) |*continuation| continuation.deinit(alloc);
         self.* = .{};
     }
 
@@ -491,7 +503,7 @@ const SessionPickerPageCache = struct {
     active_id: ?[]u8 = null,
     limit: usize = 0,
     loaded_at_ns: i128 = 0,
-    page: session_store.ResumableSessionPage = .{},
+    page: subagent_resume_admission.ActionableSessionPage = .{},
 
     fn deinit(self: *SessionPickerPageCache) void {
         const alloc = std.heap.c_allocator;
@@ -515,19 +527,32 @@ const SessionPickerPageCache = struct {
 
     fn install(
         self: *SessionPickerPageCache,
-        source: *const session_store.ResumableSessionPage,
+        source: *const subagent_resume_admission.ActionableSessionPage,
         active_id: ?[]const u8,
         limit: usize,
         loaded_at_ns: i128,
     ) !void {
         const alloc = std.heap.c_allocator;
+        var owned_active_id = if (active_id) |id| try alloc.dupe(u8, id) else null;
+        errdefer if (owned_active_id) |id| alloc.free(id);
+        var owned_continuation: ?subagent_resume_admission.ActionableContinuation =
+            if (source.continuation) |continuation| .{
+                .updated_at_ms = continuation.updated_at_ms,
+                .id = try alloc.dupe(u8, continuation.id),
+            } else null;
+        errdefer if (owned_continuation) |*continuation| continuation.deinit(alloc);
         var replacement: SessionPickerPageCache = .{
             .ready = true,
-            .active_id = if (active_id) |id| try alloc.dupe(u8, id) else null,
+            .active_id = owned_active_id,
             .limit = limit,
             .loaded_at_ns = loaded_at_ns,
-            .page = .{ .has_more = source.has_more },
+            .page = .{
+                .has_more = source.has_more,
+                .continuation = owned_continuation,
+            },
         };
+        owned_active_id = null;
+        owned_continuation = null;
         errdefer replacement.deinit();
         for (source.summaries.items) |summary| {
             var copied = try session_summary_codec.cloneSessionSummary(alloc, summary);
@@ -559,7 +584,7 @@ fn sessionPickerCacheForScope(
 fn replaceSessionPickerPage(
     picker: *SessionPicker,
     alloc: Allocator,
-    source: *const session_store.ResumableSessionPage,
+    source: *const subagent_resume_admission.ActionableSessionPage,
 ) !void {
     var replacement: std.ArrayList(session_store.SessionSummary) = .empty;
     errdefer {
@@ -648,7 +673,7 @@ const SessionPickerLoad = struct {
         home_dir: []u8,
         workspace_root: []u8,
         request: PageRequest,
-        page: ?session_store.ResumableSessionPage = null,
+        page: ?subagent_resume_admission.ActionableSessionPage = null,
         failure: ?anyerror = null,
 
         fn deinit(self: *Task) void {
@@ -923,13 +948,18 @@ fn tryListResumableIndexPageForScope(
     active_id: ?[]const u8,
     continuation: ?session_store.ResumableSessionContinuation,
     limit: usize,
-) !?session_store.ResumableSessionPage {
-    var scoped = store;
-    scoped.resume_page_limit = limit;
-    return switch (scope) {
-        .current_workspace => try scoped.tryListResumableWorkspaceIndexPage(alloc, active_id, continuation),
-        .all_workspaces => try scoped.tryListResumableIndexPage(alloc, active_id, continuation),
-    };
+) !?subagent_resume_admission.ActionableSessionPage {
+    return subagent_resume_admission.tryListActionableIndexPage(
+        store,
+        alloc,
+        switch (scope) {
+            .current_workspace => .current_workspace,
+            .all_workspaces => .all_workspaces,
+        },
+        active_id,
+        continuation,
+        limit,
+    );
 }
 
 fn listResumablePageForScope(
@@ -939,36 +969,19 @@ fn listResumablePageForScope(
     active_id: ?[]const u8,
     continuation: ?session_store.ResumableSessionContinuation,
     limit: usize,
-) !session_store.ResumableSessionPage {
-    var scoped = store;
-    scoped.resume_page_limit = limit;
-    return switch (scope) {
-        .current_workspace => try scoped.listResumableWorkspacePage(alloc, active_id, continuation),
-        .all_workspaces => try scoped.listResumablePage(alloc, active_id, continuation),
-    };
+) !subagent_resume_admission.ActionableSessionPage {
+    return subagent_resume_admission.listActionablePage(
+        store,
+        alloc,
+        switch (scope) {
+            .current_workspace => .current_workspace,
+            .all_workspaces => .all_workspaces,
+        },
+        active_id,
+        continuation,
+        limit,
+    );
 }
-
-const default_cancelled_command_replay_inline_limit: usize = 64 * 1024;
-
-const DisabledCancelledCommandCapture = struct {
-    turn_id: u64,
-    call_id_hash: u64,
-    call_id_len: usize,
-
-    fn init(id: types.ToolLifecycleId) DisabledCancelledCommandCapture {
-        return .{
-            .turn_id = id.turn_id,
-            .call_id_hash = std.hash.Wyhash.hash(0, id.call_id),
-            .call_id_len = id.call_id.len,
-        };
-    }
-
-    fn matches(self: DisabledCancelledCommandCapture, id: types.ToolLifecycleId) bool {
-        return self.turn_id == id.turn_id and
-            self.call_id_len == id.call_id.len and
-            self.call_id_hash == std.hash.Wyhash.hash(0, id.call_id);
-    }
-};
 
 const JsHostSessionStore = struct {
     ctx: ?*anyopaque = null,
@@ -1041,9 +1054,6 @@ const JsHostSessionOwner = struct {
 
 const PendingCancelledCommand = struct {
     lifecycle_id: types.ToolLifecycleId,
-    capture: ?*command_replay_store.Capture,
-    cancelled: bool = false,
-    completed: bool = false,
     command_artifact_handle: ?[]u8 = null,
 
     fn matches(self: PendingCancelledCommand, id: types.ToolLifecycleId) bool {
@@ -1052,20 +1062,6 @@ const PendingCancelledCommand = struct {
     }
 
     fn discard(self: *PendingCancelledCommand, alloc: Allocator) void {
-        if (self.capture) |capture| {
-            capture.discard(alloc);
-            alloc.destroy(capture);
-        }
-        alloc.free(@constCast(self.lifecycle_id.call_id));
-        if (self.command_artifact_handle) |handle| alloc.free(handle);
-        self.* = undefined;
-    }
-
-    fn releaseRetained(self: *PendingCancelledCommand, alloc: Allocator) void {
-        if (self.capture) |capture| {
-            capture.releaseRetained(alloc);
-            alloc.destroy(capture);
-        }
         alloc.free(@constCast(self.lifecycle_id.call_id));
         if (self.command_artifact_handle) |handle| alloc.free(handle);
         self.* = undefined;
@@ -1090,11 +1086,40 @@ pub const Persistence = struct {
     session_picker_all_cache: SessionPickerPageCache = .{},
     degraded_warning_emitted: bool = false,
     pending_cancelled_command: ?PendingCancelledCommand = null,
-    disabled_cancelled_command_capture: ?DisabledCancelledCommandCapture = null,
     image_snapshot_temp_dir: ?[]u8 = null,
     resume_view_admission: ?session_store.ResumeViewAdmission = null,
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
+
+    /// Fieldwise initialization avoids retaining undefined optional payloads
+    /// in a static release-binary template.
+    pub fn initInto(storage: *Persistence) void {
+        comptime {
+            if (std.meta.fields(Persistence).len != 19) {
+                @compileError("update Persistence.initInto for the changed field set");
+            }
+        }
+        storage.* = undefined;
+        storage.write_mutex = .init;
+        storage.store = null;
+        storage.writable = null;
+        storage.subagent_host = null;
+        storage.workspace_preferences = null;
+        storage.session_preferences = null;
+        storage.js_host_store = .{};
+        storage.js_host_session = null;
+        storage.process_model_override = null;
+        storage.session_picker = .{};
+        storage.session_picker_load = .{};
+        storage.session_picker_current_cache = .{};
+        storage.session_picker_all_cache = .{};
+        storage.degraded_warning_emitted = false;
+        storage.pending_cancelled_command = null;
+        storage.image_snapshot_temp_dir = null;
+        storage.resume_view_admission = null;
+        storage.resume_handoff_intent = .none;
+        storage.pending_live_session_policy = null;
+    }
 
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
         if (self.pending_live_session_policy) |policy| {
@@ -1121,9 +1146,24 @@ pub const Persistence = struct {
         self.session_picker_load.deinit();
         self.session_picker_current_cache.deinit();
         self.session_picker_all_cache.deinit();
-        self.* = .{};
+        self.* = undefined;
     }
 };
+
+test "persistence in-place initialization preserves empty ownership" {
+    var persistence: Persistence = undefined;
+    Persistence.initInto(&persistence);
+    defer persistence.deinit(std.testing.allocator);
+
+    try std.testing.expect(persistence.store == null);
+    try std.testing.expect(persistence.writable == null);
+    try std.testing.expect(persistence.subagent_host == null);
+    try std.testing.expect(!persistence.session_picker.active);
+    try std.testing.expect(persistence.session_picker_load.task == null);
+    try std.testing.expect(!persistence.session_picker_current_cache.ready);
+    try std.testing.expect(!persistence.session_picker_all_cache.ready);
+    try std.testing.expect(persistence.resume_handoff_intent == .none);
+}
 
 pub fn Runtime(comptime App: type) type {
     return struct {
@@ -1291,6 +1331,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn configureStartupPreferences(
             app: *App,
+            provider: model_provider.ProviderId,
             configured_model: []const u8,
             model_source: config_runtime.ModelSource,
             selected_model: []const u8,
@@ -1301,6 +1342,7 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc,
                 &app.session_persistence.workspace_preferences,
                 .{
+                    .provider = provider,
                     .model = @constCast(configured_model),
                     .effort = effort,
                     .fast_mode = fast_mode,
@@ -1534,8 +1576,14 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "queued_prompt_review")) {
                 input_queue_runtime.Runtime(App).reset(app);
             }
-            app.shell.render_requests.finishSubmittedPromptTransition();
-            app.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
+            if (comptime @hasDecl(App, "clearPendingSubmissionForSessionTransition")) {
+                App.clearPendingSubmissionForSessionTransition(app);
+            } else {
+                if (comptime @hasDecl(App, "clearPendingSubmission")) {
+                    App.clearPendingSubmission(app, "session_transition");
+                }
+                app.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
+            }
         }
 
         fn applyIdleLiveSessionTransition(
@@ -1786,14 +1834,20 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn startResumedSessionReconciliation(app: *App) void {
-            if (comptime @hasField(App, "auth")) {
-                if (app.auth.apiKey()) |api_key| {
-                    app.session.usage.startReconciliation(
-                        app.alloc,
-                        api_key,
-                    );
-                }
-            }
+            if (comptime !@hasField(App, "auth") or !provider_runtime.supported(App)) return;
+            if (comptime !@hasDecl(@TypeOf(app.auth), "credentialSource") or
+                !@hasDecl(@TypeOf(app.auth), "accountId") or
+                !@hasDecl(@TypeOf(app.session.usage), "replaceProviderReconciliationCredential")) return;
+
+            const source = app.auth.credentialSource() orelse return;
+            const credential = app.auth.apiKey() orelse return;
+            app.session.usage.replaceProviderReconciliationCredential(
+                app.alloc,
+                provider_runtime.provider(app),
+                source,
+                app.auth.accountId(),
+                credential,
+            );
         }
 
         pub fn resumeSelectedSession(app: *App) !bool {
@@ -1825,7 +1879,7 @@ pub fn Runtime(comptime App: type) type {
             log_options: session_log.Options,
         ) !session_store.LoadedWritableSession {
             const store = app.session_persistence.store orelse
-                return error.SessionStoreUnavailable;
+                return session_log.failLoadedWritableSession(error.SessionStoreUnavailable);
             return subagent_resume_admission.resumeForExternalPrompt(
                 store,
                 app.alloc,
@@ -1996,6 +2050,13 @@ pub fn Runtime(comptime App: type) type {
             const now_ns = io_mod.nanoTimestamp();
             if (cache.matches(active_id, limit)) {
                 try replaceSessionPickerPage(picker, app.alloc, &cache.page);
+                const continuation: ?subagent_resume_admission.ActionableContinuation =
+                    if (cache.page.continuation) |value| .{
+                        .updated_at_ms = value.updated_at_ms,
+                        .id = try app.alloc.dupe(u8, value.id),
+                    } else null;
+                if (picker.continuation) |*prior| prior.deinit(app.alloc);
+                picker.continuation = continuation;
                 picker.has_more = cache.page.has_more;
                 picker.load_state = .ready;
                 cache_visible = true;
@@ -2184,8 +2245,17 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             picker: *SessionPicker,
             task: *const SessionPickerLoad.Task,
-            page: *const session_store.ResumableSessionPage,
+            page: *const subagent_resume_admission.ActionableSessionPage,
         ) !void {
+            var continuation: ?subagent_resume_admission.ActionableContinuation =
+                if (page.continuation) |value| .{
+                    .updated_at_ms = value.updated_at_ms,
+                    .id = try app.alloc.dupe(u8, value.id),
+                } else null;
+            errdefer if (continuation) |value| {
+                var owned = value;
+                owned.deinit(app.alloc);
+            };
             const selected_load_more = task.request.continuation != null and
                 picker.selected == picker.filteredItemCount();
             const previous_filtered_count = picker.filteredItemCount();
@@ -2194,6 +2264,9 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 try picker.appendPage(app.alloc, page.summaries.items);
             }
+            if (picker.continuation) |*prior| prior.deinit(app.alloc);
+            picker.continuation = continuation;
+            continuation = null;
             picker.has_more = page.has_more;
             picker.loading_more = false;
             picker.load_state = .ready;
@@ -2204,7 +2277,7 @@ pub fn Runtime(comptime App: type) type {
                     picker.has_more,
                 );
             }
-            input_completion_runtime.CompletionRuntime(App).syncSessionPickerWindowStart(app);
+            try input_completion_runtime.CompletionRuntime(App).syncSessionPickerWindowStart(app);
         }
 
         pub fn loadMoreSessionPicker(app: *App) !bool {
@@ -2221,7 +2294,8 @@ pub fn Runtime(comptime App: type) type {
                 value
             else
                 return error.SessionStoreUnavailable;
-            const last = picker.summaries.items[picker.summaries.items.len - 1];
+            const continuation = picker.continuation orelse
+                return error.SessionStoreUnavailable;
             const active_id = if (app.session_persistence.writable) |*loaded|
                 loaded.active_id
             else
@@ -2234,10 +2308,7 @@ pub fn Runtime(comptime App: type) type {
                 picker.generation,
                 picker.scope,
                 active_id,
-                .{
-                    .updated_at_ms = last.updated_at_ms,
-                    .id = last.id,
-                },
+                continuation.view(),
                 limit,
             );
 
@@ -2303,28 +2374,6 @@ pub fn Runtime(comptime App: type) type {
             return moved;
         }
 
-        pub fn recordAppliedCommandOutput(
-            app: *App,
-            lifecycle_id: ?types.ToolLifecycleId,
-            stream: command_output_content.Stream,
-            bytes: []const u8,
-        ) void {
-            const id = lifecycle_id orelse return;
-            if (app.session_persistence.disabled_cancelled_command_capture) |disabled| {
-                if (disabled.matches(id)) return;
-                debug_trace.logf(
-                    "session",
-                    "cancelled command replay disabled lifecycle replaced turn_id={d}",
-                    .{disabled.turn_id},
-                );
-                app.session_persistence.disabled_cancelled_command_capture = null;
-            }
-            const pending = ensurePendingCancelledCommand(app, id, true) orelse return;
-            if (pending.capture) |capture| {
-                capture.appendAccepted(app.alloc, stream, bytes);
-            }
-        }
-
         pub fn recordToolTerminal(
             app: *App,
             event: types.ToolLifecycleEvent,
@@ -2334,13 +2383,6 @@ pub fn Runtime(comptime App: type) type {
                 .terminal => |value| value,
                 .provisional, .authoritative_started, .progress, .turn_finished => return,
             };
-            const capture_disabled = if (app.session_persistence.disabled_cancelled_command_capture) |disabled|
-                disabled.matches(terminal.id)
-            else
-                false;
-            if (capture_disabled) {
-                app.session_persistence.disabled_cancelled_command_capture = null;
-            }
             if (!captured_command_call) {
                 discardPendingCancelledCommand(app, terminal.id, "non_command_terminal");
                 return;
@@ -2349,12 +2391,7 @@ pub fn Runtime(comptime App: type) type {
                 discardPendingCancelledCommand(app, terminal.id, "ordinary_command_terminal");
                 return;
             }
-            const pending = ensurePendingCancelledCommand(
-                app,
-                terminal.id,
-                !capture_disabled,
-            ) orelse return;
-            pending.cancelled = true;
+            const pending = ensurePendingCancelledCommand(app, terminal.id) orelse return;
             if (pending.command_artifact_handle) |handle| {
                 app.alloc.free(handle);
                 pending.command_artifact_handle = null;
@@ -2371,20 +2408,6 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        pub fn recordCommandOutputComplete(
-            app: *App,
-            lifecycle_id: ?types.ToolLifecycleId,
-        ) void {
-            const id = lifecycle_id orelse return;
-            const pending = if (app.session_persistence.pending_cancelled_command) |*value|
-                value
-            else
-                return;
-            if (!pending.matches(id)) return;
-            if (pending.capture) |capture| capture.seal(app.alloc);
-            pending.completed = true;
-        }
-
         pub fn appendHistoryTurn(app: *App, turn: types.HistoryTurn) !void {
             _ = try appendHistoryTurnWithPendingPresentation(app, turn, .strict, null);
         }
@@ -2393,9 +2416,13 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             finished: types.FinishedPrompt,
         ) !void {
+            var turn = finished.turn;
+            if (finished.summary) |summary| {
+                types.setHistoryTurnSummary(&turn, summary);
+            }
             _ = try appendHistoryTurnWithPendingPresentation(
                 app,
-                finished.turn,
+                turn,
                 .strict,
                 finished.snapshot_file_ownership,
             );
@@ -2547,7 +2574,6 @@ pub fn Runtime(comptime App: type) type {
                 else => return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership),
             };
             var pending = app.session_persistence.pending_cancelled_command orelse {
-                app.session_persistence.disabled_cancelled_command_capture = null;
                 return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership);
             };
             app.session_persistence.pending_cancelled_command = null;
@@ -2560,33 +2586,41 @@ pub fn Runtime(comptime App: type) type {
                 call.name,
                 call.arguments_json,
             );
-            if (!pending.cancelled or
-                !pending.completed or
-                !is_command or
+            if (!is_command or
                 !std.mem.eql(u8, call.id, pending.lifecycle_id.call_id))
             {
                 pending.discard(app.alloc);
                 return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership);
             }
+            defer pending.discard(app.alloc);
 
-            const output_replay = if (pending.capture) |capture|
-                capture.retain(app.alloc)
-            else
-                null;
+            if (interrupted.cancelled_command) |authoritative| {
+                var enriched_presentation = authoritative;
+                if (enriched_presentation.command_artifact_handle == null) {
+                    enriched_presentation.command_artifact_handle =
+                        pending.command_artifact_handle;
+                }
+                var enriched_interrupted = interrupted;
+                enriched_interrupted.cancelled_command = enriched_presentation;
+                return appendHistoryTurnWithOutcome(
+                    app,
+                    .{ .interrupted = enriched_interrupted },
+                    mode,
+                    snapshot_file_ownership,
+                );
+            }
+
             var enriched_interrupted = interrupted;
             enriched_interrupted.cancelled_command = .{
-                .output_replay = output_replay,
                 .command_artifact_handle = pending.command_artifact_handle,
             };
             const enriched: types.HistoryTurn = .{ .interrupted = enriched_interrupted };
-            defer pending.releaseRetained(app.alloc);
             return appendHistoryTurnWithOutcome(app, enriched, mode, snapshot_file_ownership);
         }
 
         fn ensurePendingCancelledCommand(
             app: *App,
             id: types.ToolLifecycleId,
-            capture_enabled: bool,
         ) ?*PendingCancelledCommand {
             if (app.session_persistence.pending_cancelled_command) |*pending| {
                 if (pending.matches(id)) return pending;
@@ -2594,38 +2628,18 @@ pub fn Runtime(comptime App: type) type {
             }
 
             const call_id = app.alloc.dupe(u8, id.call_id) catch |err| {
-                app.session_persistence.disabled_cancelled_command_capture =
-                    DisabledCancelledCommandCapture.init(id);
                 debug_trace.logf(
                     "session",
-                    "cancelled command capture identity unavailable call_id={s} err={s}",
+                    "cancelled command metadata identity unavailable call_id={s} err={s}",
                     .{ id.call_id, @errorName(err) },
                 );
                 return null;
             };
-            errdefer app.alloc.free(call_id);
-            const capability = childCapability(app);
-            const capture = if (capture_enabled)
-                command_replay_store.Capture.create(
-                    app.alloc,
-                    default_cancelled_command_replay_inline_limit,
-                    capability,
-                ) catch |err| blk: {
-                    debug_trace.logf(
-                        "session",
-                        "cancelled command replay capture unavailable call_id={s} err={s}",
-                        .{ id.call_id, @errorName(err) },
-                    );
-                    break :blk null;
-                }
-            else
-                null;
             app.session_persistence.pending_cancelled_command = .{
                 .lifecycle_id = .{
                     .turn_id = id.turn_id,
                     .call_id = call_id,
                 },
-                .capture = capture,
             };
             return &app.session_persistence.pending_cancelled_command.?;
         }
@@ -2650,7 +2664,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             debug_trace.logf(
                 "session",
-                "cancelled command replay candidate discarded call_id={s} reason={s}",
+                "cancelled command metadata discarded call_id={s} reason={s}",
                 .{ pending.lifecycle_id.call_id, reason },
             );
             pending.discard(app.alloc);
@@ -2663,19 +2677,12 @@ pub fn Runtime(comptime App: type) type {
             mode: AppendHistoryMode,
             snapshot_file_ownership: ?types.SnapshotFileOwnership,
         ) !HistoryAppendOutcome {
-            var inserted = false;
-            defer {
-                if (comptime @hasField(App, "session_persistence")) {
-                    if (!inserted) discardUncommittedCancelledReplay(app, turn);
-                }
-            }
             app.session.appendHistoryEntry(app.alloc, turn) catch |err| {
                 return switch (mode) {
                     .strict => err,
                     .visual_epoch => .uncommitted,
                 };
             };
-            inserted = true;
             if (snapshot_file_ownership) |ownership| ownership.transfer();
             // The footer title freezes at the first usable prompt, matching the
             // sidecar derivation the resume picker shows.
@@ -2747,37 +2754,6 @@ pub fn Runtime(comptime App: type) type {
                 },
             };
             return .committed;
-        }
-
-        fn discardUncommittedCancelledReplay(
-            app: *App,
-            turn: types.HistoryTurn,
-        ) void {
-            const interrupted = switch (turn) {
-                .interrupted => |entry| entry,
-                else => return,
-            };
-            const presentation = interrupted.cancelled_command orelse return;
-            const replay = presentation.output_replay orelse return;
-            const descriptor = switch (replay) {
-                .available => |value| value,
-                .unavailable => return,
-            };
-            const capability = childCapability(app) orelse {
-                debug_trace.logf(
-                    "session",
-                    "uncommitted cancelled replay cleanup unavailable handle_bytes={d}",
-                    .{descriptor.handle.len},
-                );
-                return;
-            };
-            capability.delete(.command_artifacts, descriptor.handle) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "uncommitted cancelled replay cleanup failed handle_bytes={d} err={s}",
-                    .{ descriptor.handle.len, @errorName(err) },
-                );
-            };
         }
 
         pub fn compactHistory(app: *App) !void {
@@ -2853,6 +2829,7 @@ pub fn Runtime(comptime App: type) type {
                         @constCast(model)
                     else
                         null,
+                    .provider = patch.provider,
                     .effort = patch.effort,
                     .fast_mode = patch.fast_mode,
                 } },
@@ -2943,7 +2920,7 @@ pub fn Runtime(comptime App: type) type {
         /// workspace basename. The active model remains visible as secondary
         /// context, including after a model switch.
         pub fn syncTerminalTitle(app: *App) void {
-            if (comptime !@hasField(App, "selected_model")) return;
+            if (comptime !provider_runtime.supported(App)) return;
             syncTerminalTitleWith(app, terminalTitle(app));
         }
 
@@ -2951,7 +2928,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             provider: host_capability.TerminalTitle,
         ) void {
-            if (comptime !@hasField(App, "selected_model")) return;
+            if (comptime !provider_runtime.supported(App)) return;
             var label_buffer: [terminal_title_label_max_bytes]u8 = undefined;
             var writer: std.Io.Writer = .fixed(&label_buffer);
             const primary = cachedSessionTitle(app) orelse workspaceTerminalTitle(app);
@@ -2960,11 +2937,12 @@ pub fn Runtime(comptime App: type) type {
                 primary,
                 terminal_title_primary_max_bytes,
             ) catch return;
-            if (app.selected_model.items.len > 0) {
+            const selected_model = provider_runtime.model(app);
+            if (selected_model.len > 0) {
                 writer.writeAll(terminal_title_separator) catch return;
                 writeBoundedTerminalTitleComponent(
                     &writer,
-                    app.selected_model.items,
+                    selected_model,
                     terminal_title_model_max_bytes,
                 ) catch return;
             }
@@ -3233,7 +3211,6 @@ pub fn Runtime(comptime App: type) type {
         /// Background authority must already be detached (or is detached here).
         fn abandonParkedWritableSession(app: *App) void {
             discardAnyPendingCancelledCommand(app, "writable_session_abandon");
-            app.session_persistence.disabled_cancelled_command_capture = null;
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else
@@ -3282,6 +3259,20 @@ pub fn Runtime(comptime App: type) type {
 
                 fn appendNotice(self: *Self, notice: types.SemanticNotice) !void {
                     try self.app.writeDomainNotice(notice, true);
+                }
+
+                fn setCreatedAtMs(_: *Self, _: i64) void {}
+
+                fn materializeCommandReplay(_: *const Self) bool {
+                    return true;
+                }
+
+                fn appendTurnSummary(self: *Self, summary: types.TurnSummary) !void {
+                    if (comptime @hasField(SinkApp, "shell")) {
+                        if (comptime @hasDecl(@TypeOf(self.app.shell), "appendTurnSummaryEntry")) {
+                            _ = try self.app.shell.appendTurnSummaryEntry(self.app.alloc, summary);
+                        }
+                    }
                 }
 
                 fn appendUserTurn(self: *Self, user: types.UserTurn, has_prior_turns: bool) !void {
@@ -3444,6 +3435,18 @@ pub fn Runtime(comptime App: type) type {
 
                 fn appendNotice(self: *Self, notice: types.SemanticNotice) !void {
                     _ = try self.projection.appendNotice(notice);
+                }
+
+                fn setCreatedAtMs(self: *Self, created_at_ms: i64) void {
+                    self.projection.setCreatedAtMs(created_at_ms);
+                }
+
+                fn materializeCommandReplay(_: *const Self) bool {
+                    return false;
+                }
+
+                fn appendTurnSummary(self: *Self, summary: types.TurnSummary) !void {
+                    try self.projection.appendTurnSummary(summary);
                 }
 
                 fn appendUserTurn(self: *Self, user: types.UserTurn, _: bool) !void {
@@ -3623,7 +3626,7 @@ pub fn Runtime(comptime App: type) type {
                 .upgrade => |version| {
                     const body = try std.fmt.allocPrint(
                         app.alloc,
-                        "𝒇x has been updated to v{s}",
+                        "fx has been updated to v{s}",
                         .{version},
                     );
                     defer app.alloc.free(body);
@@ -3713,20 +3716,38 @@ pub fn Runtime(comptime App: type) type {
                         });
                     },
                     .assistant => |entry| {
+                        if (entry.execution.turn_summary) |summary| {
+                            sink.setCreatedAtMs(summary.started_at_ms);
+                        }
                         try sink.appendUserTurn(entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, sink, entry.execution);
+                        if (entry.execution.turn_summary) |summary| {
+                            sink.setCreatedAtMs(summary.completed_at_ms);
+                        }
                         if (entry.assistant.len > 0) {
                             try writeAssistantHistoryMarkdownToSink(app, sink, entry.assistant);
                         }
+                        if (entry.execution.turn_summary) |summary| {
+                            try sink.appendTurnSummary(summary);
+                        }
                     },
                     .background_command => |entry| {
+                        if (entry.execution.turn_summary) |summary| {
+                            sink.setCreatedAtMs(summary.started_at_ms);
+                        }
                         try sink.appendUserTurn(entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
 
                         try writeExecutionHistoryToSink(app, sink, entry.execution);
+                        if (entry.execution.turn_summary) |summary| {
+                            sink.setCreatedAtMs(summary.completed_at_ms);
+                        }
                         if (entry.assistant) |assistant| {
                             if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
+                        }
+                        if (entry.execution.turn_summary) |summary| {
+                            try sink.appendTurnSummary(summary);
                         }
                         const text = try formatBackgroundReplayContext(app, entry);
                         defer app.alloc.free(text);
@@ -3737,9 +3758,15 @@ pub fn Runtime(comptime App: type) type {
                         });
                     },
                     .interrupted => |entry| {
+                        if (entry.execution.turn_summary) |summary| {
+                            sink.setCreatedAtMs(summary.started_at_ms);
+                        }
                         try sink.appendUserTurn(entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, sink, entry.execution);
+                        if (entry.execution.turn_summary) |summary| {
+                            sink.setCreatedAtMs(summary.completed_at_ms);
+                        }
                         if (entry.assistant) |assistant| {
                             if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                         }
@@ -3747,6 +3774,9 @@ pub fn Runtime(comptime App: type) type {
                             try writeCancelledCommandPresentation(app, sink, entry.tool_call.?, presentation);
                         }
                         try sink.appendNotice(session_runtime.interruptedTurnNotice(entry));
+                        if (entry.execution.turn_summary) |summary| {
+                            try sink.appendTurnSummary(summary);
+                        }
                     },
                 }
             }
@@ -3834,6 +3864,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
             }
+            try writePermissionFeedback(sink, execution.steering);
         }
 
         fn writePermissionFeedback(sink: anytype, feedback: []const []const u8) !void {
@@ -3881,11 +3912,26 @@ pub fn Runtime(comptime App: type) type {
             );
             const context_deferred = types.isContextDeferredToolResult(result);
             const deferred = types.isDeferredToolResult(result);
-            const process_ran = result.command_process_presentation != null;
+            const permission_denial_reason = tool_result_errors.toolPermissionDenialReason(result.output);
 
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
             defer action_arena.deinit();
-            const formatted_action = if (deferred)
+            const command_decision = if (is_command)
+                try tool_presentation.commandOutcomeDecision(
+                    action_arena.allocator(),
+                    result.command_process_presentation,
+                )
+            else
+                null;
+            const terminal_action_decision = if (std.mem.eql(u8, call.name, "terminal"))
+                try tool_presentation.terminalActionOutcomeDecision(
+                    action_arena.allocator(),
+                    result.terminal_action_presentation,
+                )
+            else
+                null;
+            const outcome_decision = command_decision orelse terminal_action_decision;
+            const formatted_action_base = if (deferred)
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
                     call,
@@ -3896,7 +3942,23 @@ pub fn Runtime(comptime App: type) type {
                         types.deferred_tool_result_output,
                     &.{},
                 )
-            else if (result.status == .success or process_ran)
+            else if (permission_denial_reason) |reason|
+                try app.describeToolActionDeniedWithAdvertised(
+                    action_arena.allocator(),
+                    call,
+                    null,
+                    tool_admission.permissionDeniedStatusLabel(reason),
+                    &.{},
+                )
+            else if (outcome_decision) |decision|
+                try app.describeToolActionDeniedWithAdvertised(
+                    action_arena.allocator(),
+                    call,
+                    null,
+                    decision.label,
+                    &.{},
+                )
+            else if (result.status == .success)
                 try app.describeToolActionCompletedWithAdvertised(
                     action_arena.allocator(),
                     call,
@@ -3911,14 +3973,27 @@ pub fn Runtime(comptime App: type) type {
                     "Failed",
                     &.{},
                 );
+            const formatted_action = if (outcome_decision) |decision|
+                if (decision.detail) |detail|
+                    try std.fmt.allocPrint(
+                        action_arena.allocator(),
+                        "{s}: {s}",
+                        .{ formatted_action_base, detail },
+                    )
+                else
+                    formatted_action_base
+            else
+                formatted_action_base;
             const action = try app.alloc.dupe(u8, formatted_action);
             defer app.alloc.free(action);
 
             const outcome: types.ToolOutcomeKind = if (context_deferred)
                 .deferred
-            else if (deferred)
+            else if (deferred or permission_denial_reason != null)
                 .denied
-            else if (result.status == .success or process_ran)
+            else if (outcome_decision) |decision|
+                decision.outcome
+            else if (result.status == .success)
                 .completed
             else
                 .failed;
@@ -3927,7 +4002,11 @@ pub fn Runtime(comptime App: type) type {
                 outcome,
                 action,
             );
-            if (!is_command or deferred) {
+            if (!is_command or deferred or permission_denial_reason != null) {
+                try sink.attachHistoricalToolDetail(entry_id, call, result);
+                return;
+            }
+            if (!sink.materializeCommandReplay()) {
                 try sink.attachHistoricalToolDetail(entry_id, call, result);
                 return;
             }
@@ -4366,7 +4445,6 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             discardAnyPendingCancelledCommand(app, "writable_session_close");
-            app.session_persistence.disabled_cancelled_command_capture = null;
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else
@@ -4539,7 +4617,6 @@ pub fn Runtime(comptime App: type) type {
                     .tool_set = app.toolAdvertisementSet(),
                     .mode = .full,
                 },
-                if (comptime @hasField(App, "permission_state")) app.permission_state.sandbox_backend else .none,
                 integrations,
                 if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
                 if (comptime @hasField(App, "permission_engine")) app.permission_engine.grants.items else &.{},
@@ -4832,15 +4909,13 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             preferences: session_codec.DurableSessionPreferences,
         ) !void {
-            app.selected_model.clearRetainingCapacity();
-            try app.selected_model.appendSlice(app.alloc, preferences.model);
+            try provider_runtime.replaceSelection(app, preferences.provider, preferences.model);
             if (app.session_persistence.process_model_override) |model| {
-                app.selected_model.clearRetainingCapacity();
-                try app.selected_model.appendSlice(app.alloc, model);
+                try provider_runtime.replaceModel(app, model);
             }
             try app.worker.syncQueuedPromptModel(
                 std.heap.c_allocator,
-                app.selected_model.items,
+                provider_runtime.model(app),
             );
             app.effort = preferences.effort;
             app.fast_mode = preferences.fast_mode;
@@ -4908,6 +4983,7 @@ fn applyPreferencePatch(
     patch: SessionPreferencePatch,
 ) !void {
     var current = target.* orelse return error.SessionPreferencesUnavailable;
+    if (patch.provider) |provider| current.provider = provider;
     if (patch.model) |model| {
         const replacement = try alloc.dupe(u8, model);
         alloc.free(current.model);
@@ -5142,7 +5218,6 @@ const TestApp = struct {
     permission_engine: permissions.PermissionEngine = .{},
     permission_state: struct {
         authority_mutex: std.Io.Mutex = .init,
-        sandbox_backend: types.BackendKind = .none,
     } = .{},
     mcp_tool_names: std.ArrayList([]u8) = .empty,
 
@@ -5568,6 +5643,7 @@ test "js-host resume restores transcript context preferences usage and revision"
     defer app.deinit();
     try Runtime(TestApp).configureStartupPreferences(
         &app,
+        .gateway,
         "startup/model",
         .user_global,
         "startup/model",
@@ -5623,6 +5699,7 @@ test "js-host resume store failures and missing records fall back to fresh sessi
         defer app.deinit();
         try Runtime(TestApp).configureStartupPreferences(
             &app,
+            .gateway,
             "fresh/model",
             .user_global,
             "fresh/model",
@@ -5651,6 +5728,7 @@ test "js-host picker request stays unsupported and starts fresh" {
     defer app.deinit();
     try Runtime(TestApp).configureStartupPreferences(
         &app,
+        .gateway,
         "fresh/model",
         .user_global,
         "fresh/model",
@@ -5675,6 +5753,7 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
     defer app.deinit();
     try Runtime(TestApp).configureStartupPreferences(
         &app,
+        .gateway,
         "fresh/model",
         .user_global,
         "fresh/model",
@@ -5741,6 +5820,7 @@ test "js-host preference changes snapshot the updated session preferences" {
     defer app.deinit();
     try Runtime(TestApp).configureStartupPreferences(
         &app,
+        .gateway,
         "fresh/model",
         .user_global,
         "fresh/model",
@@ -5835,6 +5915,7 @@ fn testPaths(alloc: Allocator, tmp: *std.testing.TmpDir) !struct { home: []u8, w
 fn configureTestPreferences(app: *TestApp) !void {
     try Runtime(TestApp).configureStartupPreferences(
         app,
+        .gateway,
         "configured/model",
         .user_workspace,
         "configured/model",
@@ -6362,7 +6443,7 @@ test "enableSessionStores replaces existing subagent host without leaking" {
     try std.testing.expect(app.session_persistence.subagent_host != null);
 }
 
-test "interactive subagent host resolves current tools rules grants sandbox and integrations" {
+test "interactive subagent host resolves current tools rules grants and integrations" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6388,10 +6469,8 @@ test "interactive subagent host resolves current tools rules grants sandbox and 
         root_id,
     );
     defer initial.deinit(alloc);
-    try std.testing.expectEqual(types.BackendKind.none, initial.sandbox_backend);
     try std.testing.expectEqual(@as(usize, 0), initial.integrations.len);
 
-    app.permission_state.sandbox_backend = .vercel;
     try app.permission_engine.allow(alloc, "run_command", "zig build test");
     try app.mcp_tool_names.append(alloc, try alloc.dupe(u8, "mcp_fixture_echo"));
     var changed = try host.host_authority.resolve_fn(
@@ -6400,7 +6479,6 @@ test "interactive subagent host resolves current tools rules grants sandbox and 
         root_id,
     );
     defer changed.deinit(alloc);
-    try std.testing.expectEqual(types.BackendKind.vercel, changed.sandbox_backend);
     try std.testing.expectEqualStrings("mcp_fixture_echo", changed.integrations[0]);
     try std.testing.expectEqualStrings("zig build test", changed.grants[0].target_path);
     try std.testing.expect(initial.generation != changed.generation);
@@ -6500,6 +6578,83 @@ test "execution replay renders persisted permission feedback after its tool resu
     try std.testing.expectEqual(@as(usize, 1), app.cards.items.len);
     try std.testing.expectEqualStrings("Then read the file and report its exact contents.", app.cards.items[0].text);
     try std.testing.expect(app.cards.items[0].has_prior_turns);
+}
+
+test "execution replay preserves permission denial reasons" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    const reasons = [_]types.ToolPermissionDenialReason{
+        .user_denied,
+        .auto_denied,
+        .policy_denied,
+        .permission_required,
+        .review_caution,
+        .review_unavailable,
+    };
+    const call_ids = [_][]const u8{
+        "call_user_denied",
+        "call_auto_denied",
+        "call_policy_denied",
+        "call_permission_required",
+        "call_review_caution",
+        "call_review_unavailable",
+    };
+    var outputs: [reasons.len][]u8 = undefined;
+    var allocated_outputs: usize = 0;
+    defer for (outputs[0..allocated_outputs]) |output| alloc.free(output);
+    var calls: [reasons.len]types.ToolCall = undefined;
+    var results: [reasons.len]types.PersistedToolResult = undefined;
+    for (reasons, 0..) |reason, index| {
+        outputs[index] = switch (reason) {
+            .review_caution, .review_unavailable => try tool_result_errors.toolReviewHeldJson(
+                alloc,
+                "run_command",
+                reason,
+                null,
+            ),
+            .user_denied, .auto_denied, .policy_denied, .permission_required => try tool_result_errors.toolPermissionDeniedJson(
+                alloc,
+                "run_command",
+                reason,
+            ),
+        };
+        allocated_outputs += 1;
+        calls[index] = .{
+            .id = call_ids[index],
+            .name = "run_command",
+            .arguments_json = "{\"command\":\"pwd\"}",
+        };
+        results[index] = .{
+            .tool_call_id = @constCast(call_ids[index]),
+            .tool_name = @constCast("run_command"),
+            .status = .failure,
+            .output = outputs[index],
+            .output_bytes = outputs[index].len,
+            .stored_output_bytes = outputs[index].len,
+        };
+    }
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+
+    try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = steps[0..] });
+
+    try std.testing.expectEqualSlices(
+        types.ToolOutcomeKind,
+        &.{ .denied, .denied, .denied, .denied, .denied, .denied },
+        app.completed_tool_outcomes.items,
+    );
+    try std.testing.expectEqual(@as(usize, 6), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqualStrings("● Denied run_command\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● Denied by auto agent run_command\n", app.completed_tool_statuses.items[1]);
+    try std.testing.expectEqualStrings("● Denied run_command\n", app.completed_tool_statuses.items[2]);
+    try std.testing.expectEqualStrings("● Permission required run_command\n", app.completed_tool_statuses.items[3]);
+    try std.testing.expectEqualStrings("● Safety caution run_command\n", app.completed_tool_statuses.items[4]);
+    try std.testing.expectEqualStrings("● Review unavailable run_command\n", app.completed_tool_statuses.items[5]);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
 
 test "execution replay writes completed status before saved command output" {
@@ -6732,7 +6887,7 @@ test "resume falls back to saved command output when replay contains an empty fr
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
 
-test "historical command replay prefers tagged frames and preserves Ran outcome" {
+test "historical command replay prefers tagged frames and preserves exit outcome" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6787,7 +6942,7 @@ test "historical command replay prefers tagged frames and preserves Ran outcome"
 
     try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = steps[0..] });
 
-    try std.testing.expectEqualStrings("● Ran pwd\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● Exited 7 run_command\n", app.completed_tool_statuses.items[0]);
     try std.testing.expectEqual(@as(usize, 3), app.command_output_writes.items.len);
     try std.testing.expectEqual(.stdout, app.command_output_writes.items[0].stream);
     try std.testing.expectEqualStrings("first", app.command_output_writes.items[0].text);
@@ -6806,6 +6961,126 @@ test "historical command replay prefers tagged frames and preserves Ran outcome"
             .command_output_summary_flush,
         },
         app.replay_events.items,
+    );
+}
+
+test "historical command timeout preserves its typed outcome" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var calls = [_]types.ToolCall{.{
+        .id = "call_timeout",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"sleep 5\"}",
+    }};
+    const output =
+        "timeout=true\n" ++
+        "timeout_ms=25\n" ++
+        "cleanup_scope=process_group_and_tracked_descendants\n" ++
+        "cleanup_guarantee=best_effort\n";
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_timeout"),
+        .tool_name = @constCast("run_command"),
+        .status = .failure,
+        .output = @constCast(output),
+        .output_bytes = output.len,
+        .stored_output_bytes = output.len,
+        .command_process_presentation = .timed_out,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+
+    try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = steps[0..] });
+
+    try std.testing.expectEqualStrings(
+        "● Timed out run_command\n",
+        app.completed_tool_statuses.items[0],
+    );
+    try std.testing.expectEqualSlices(
+        types.ToolOutcomeKind,
+        &.{.failed},
+        app.completed_tool_outcomes.items,
+    );
+}
+
+test "historical terminal actions preserve typed return and failure causes" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var calls = [_]types.ToolCall{
+        .{
+            .id = "start_exit",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"start\",\"command\":\"true\"}",
+        },
+        .{
+            .id = "wait_ceiling",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"wait\",\"session_id\":\"terminal-1\"}",
+        },
+        .{
+            .id = "wait_missing",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"wait\",\"session_id\":\"terminal-2\"}",
+        },
+    };
+    var results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("start_exit"),
+            .tool_name = @constCast("terminal"),
+            .status = .success,
+            .output = @constCast("start exited"),
+            .output_bytes = 12,
+            .stored_output_bytes = 12,
+            .terminal_action_presentation = .{ .returned = .{ .exited = 0 } },
+        },
+        .{
+            .tool_call_id = @constCast("wait_ceiling"),
+            .tool_name = @constCast("terminal"),
+            .status = .success,
+            .output = @constCast("wait ceiling"),
+            .output_bytes = 12,
+            .stored_output_bytes = 12,
+            .terminal_action_presentation = .{ .returned = .safety_ceiling },
+        },
+        .{
+            .tool_call_id = @constCast("wait_missing"),
+            .tool_name = @constCast("terminal"),
+            .status = .failure,
+            .output = @constCast("wait missing"),
+            .output_bytes = 12,
+            .stored_output_bytes = 12,
+            .terminal_action_presentation = .{ .failed = .session_not_found },
+        },
+    };
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+
+    try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = steps[0..] });
+
+    try std.testing.expectEqual(@as(usize, 3), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqualStrings(
+        "● Exited 0 terminal\n",
+        app.completed_tool_statuses.items[0],
+    );
+    try std.testing.expectEqualStrings(
+        "● Wait limit reached for terminal\n",
+        app.completed_tool_statuses.items[1],
+    );
+    try std.testing.expectEqualStrings(
+        "● Failed terminal: terminal session not found\n",
+        app.completed_tool_statuses.items[2],
+    );
+    try std.testing.expectEqualSlices(
+        types.ToolOutcomeKind,
+        &.{ .completed, .completed, .failed },
+        app.completed_tool_outcomes.items,
     );
 }
 
@@ -7270,6 +7545,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try configureTestPreferences(&app);
     try Runtime(TestApp).configureStartupPreferences(
         &app,
+        .gateway,
         "configured/model",
         .process_override,
         "env/model",
@@ -7360,7 +7636,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expectEqualStrings("inspect file", context[1].assistant.user.text);
     try std.testing.expectEqualStrings("run server", context[2].background_command.user.text);
     try std.testing.expectEqual(@as(usize, 3), app.notices.items.len);
-    try std.testing.expectEqualStrings("● 𝒇x has been updated to v9.9.9", app.notices.items[0]);
+    try std.testing.expectEqualStrings("● fx has been updated to v9.9.9", app.notices.items[0]);
     try std.testing.expect(std.mem.find(u8, app.notices.items[1], "older context") != null);
     try std.testing.expect(std.mem.find(u8, app.notices.items[2], "Re-check runtime context") != null);
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
@@ -7431,7 +7707,7 @@ test "resumed recovery checkpoint replays its unfinished turn once" {
             .assistant_source = @constCast("Partial output before EOF."),
             .cause = .response_interrupted,
             .action = .continuing_response,
-            .route_model = @constCast("saved/model"),
+            .authority = .{ .provider = .gateway, .model = @constCast("saved/model") },
             .requested_fast_mode = false,
             .fast_mode = false,
             .max_provider_attempts = 10,
@@ -8051,22 +8327,22 @@ test "cancelled command presentation survives a persisted session restart" {
         try configureTestPreferences(&app);
         try Runtime(TestApp).initializePersistence(&app, true);
         try Runtime(TestApp).beginFreshPersistedSession(&app);
+        const capability = Runtime(TestApp).childCapability(&app) orelse
+            return error.TestExpectedSessionCapability;
+        const capture = try command_replay_store.Capture.create(alloc, 1, capability);
+        capture.setPolicyBeforeCapture(.required);
+        try capture.appendAcceptedRequired(alloc, .stdout, "INTERRUPT_START\n");
+        try capture.appendAcceptedRequired(alloc, .stderr, "warning\n");
+        const descriptor = (try capture.retainRequired(alloc)) orelse
+            return error.TestExpectedReplay;
+        defer {
+            capture.releaseRetained(alloc);
+            alloc.destroy(capture);
+        }
         const lifecycle_id = types.ToolLifecycleId{
             .turn_id = 7,
             .call_id = "cancelled-command",
         };
-        Runtime(TestApp).recordAppliedCommandOutput(
-            &app,
-            lifecycle_id,
-            .stdout,
-            "INTERRUPT_START\n",
-        );
-        Runtime(TestApp).recordAppliedCommandOutput(
-            &app,
-            lifecycle_id,
-            .stderr,
-            "warning\n",
-        );
         Runtime(TestApp).recordToolTerminal(
             &app,
             .{ .terminal = .{
@@ -8076,7 +8352,6 @@ test "cancelled command presentation survives a persisted session restart" {
             } },
             true,
         );
-        Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
 
         try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
             .user = .{ .text = @constCast("run the slow command") },
@@ -8085,6 +8360,9 @@ test "cancelled command presentation survives a persisted session restart" {
                 .id = "cancelled-command",
                 .name = "terminal",
                 .arguments_json = "{\"action\":\"exec\",\"command\":\"slow\"}",
+            },
+            .cancelled_command = .{
+                .output_replay = .{ .available = descriptor },
             },
         } });
         session_id = try alloc.dupe(u8, app.session_persistence.writable.?.active_id);
@@ -8119,7 +8397,7 @@ test "cancelled command presentation survives a persisted session restart" {
     );
 }
 
-test "cancelled command capture creation failure preserves the row" {
+test "cancelled command metadata allocation failure preserves core presentation" {
     const alloc = std.testing.allocator;
     var failing = std.testing.FailingAllocator.init(alloc, .{});
     const app_alloc = failing.allocator();
@@ -8129,14 +8407,7 @@ test "cancelled command capture creation failure preserves the row" {
         .turn_id = 8,
         .call_id = "capture-unavailable",
     };
-    failing.fail_index = failing.alloc_index + 1;
-    Runtime(TestApp).recordAppliedCommandOutput(
-        &app,
-        lifecycle_id,
-        .stdout,
-        "applied before capture failure\n",
-    );
-    failing.fail_index = std.math.maxInt(usize);
+    failing.fail_index = failing.alloc_index;
     Runtime(TestApp).recordToolTerminal(
         &app,
         .{ .terminal = .{
@@ -8145,7 +8416,7 @@ test "cancelled command capture creation failure preserves the row" {
         } },
         true,
     );
-    Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
+    failing.fail_index = std.math.maxInt(usize);
     try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
         .user = .{ .text = @constCast("cancel") },
         .tool_call = .{
@@ -8153,6 +8424,7 @@ test "cancelled command capture creation failure preserves the row" {
             .name = "run_command",
             .arguments_json = "{\"command\":\"slow\"}",
         },
+        .cancelled_command = .{},
     } });
 
     const history = try app.session.snapshotHistory(alloc);
@@ -8162,30 +8434,114 @@ test "cancelled command capture creation failure preserves the row" {
     try std.testing.expect(presentation.output_replay == null);
 }
 
-test "cancelled command identity failure never persists a replay suffix" {
+fn expectAuthoritativeCancelledReplayIsSoleArtifact() !void {
     const alloc = std.testing.allocator;
-    var failing = std.testing.FailingAllocator.init(alloc, .{});
-    const app_alloc = failing.allocator();
-    var app = try TestApp.init(app_alloc, "/workspace");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    const capability = Runtime(TestApp).childCapability(&app) orelse
+        return error.TestExpectedSessionCapability;
+    const authoritative = try command_replay_store.Capture.create(
+        alloc,
+        1,
+        capability,
+    );
+    authoritative.setPolicyBeforeCapture(.required);
+    try authoritative.appendAcceptedRequired(
+        alloc,
+        .stdout,
+        "SHARED-CANCELLED-OUTPUT\n",
+    );
+    const descriptor = (try authoritative.retainRequired(alloc)) orelse
+        return error.TestExpectedReplay;
+    var published = false;
+    defer {
+        if (published)
+            authoritative.releaseRetained(alloc)
+        else
+            authoritative.discard(alloc);
+        alloc.destroy(authoritative);
+    }
+
+    const lifecycle_id = types.ToolLifecycleId{
+        .turn_id = 9,
+        .call_id = "authoritative-cancelled-command",
+    };
+    Runtime(TestApp).recordToolTerminal(
+        &app,
+        .{ .terminal = .{
+            .id = lifecycle_id,
+            .outcome = .{ .kind = .cancelled, .summary = "Cancelled" },
+            .command_artifact_handle = "fx-command-cancelled.log",
+        } },
+        true,
+    );
+
+    try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
+        .user = .{ .text = @constCast("cancel") },
+        .tool_call = .{
+            .id = "authoritative-cancelled-command",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"exec\",\"command\":\"slow\",\"timeout_ms\":600000}",
+        },
+        .cancelled_command = .{
+            .output_replay = .{ .available = descriptor },
+        },
+    } });
+    published = true;
+
+    const history = try app.session.snapshotHistory(alloc);
+    defer session_runtime.freeHistoryTurnSlice(alloc, history);
+    const stored = switch (history[0].interrupted.cancelled_command.?
+        .output_replay orelse return error.TestExpectedReplay) {
+        .available => |value| value,
+        .unavailable => return error.TestExpectedReplay,
+    };
+    try std.testing.expectEqualStrings(descriptor.handle, stored.handle);
+    try std.testing.expectEqualStrings(
+        "fx-command-cancelled.log",
+        history[0].interrupted.cancelled_command.?
+            .command_artifact_handle orelse return error.TestExpectedArtifactHandle,
+    );
+    const page = try command_replay_store.readAgentPageManaged(
+        alloc,
+        capability,
+        stored.handle,
+        1,
+        4096,
+    );
+    defer alloc.free(page);
+    try std.testing.expect(
+        std.mem.find(u8, page, "SHARED-CANCELLED-OUTPUT") != null,
+    );
+    var artifacts = try capability.iterate(alloc, .command_artifacts);
+    defer artifacts.deinit();
+    try std.testing.expectEqual(@as(usize, 1), artifacts.names.len);
+}
+
+test "authoritative cancelled replay is the sole output artifact" {
+    try expectAuthoritativeCancelledReplayIsSoleArtifact();
+}
+
+test "cancelled command metadata does not create output replay" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
     defer app.deinit();
     const lifecycle_id = types.ToolLifecycleId{
         .turn_id = 9,
         .call_id = "identity-unavailable",
     };
-    failing.fail_index = failing.alloc_index;
-    Runtime(TestApp).recordAppliedCommandOutput(
-        &app,
-        lifecycle_id,
-        .stdout,
-        "first chunk\n",
-    );
-    failing.fail_index = std.math.maxInt(usize);
-    Runtime(TestApp).recordAppliedCommandOutput(
-        &app,
-        lifecycle_id,
-        .stdout,
-        "must not become a suffix\n",
-    );
     Runtime(TestApp).recordToolTerminal(
         &app,
         .{ .terminal = .{
@@ -8194,7 +8550,6 @@ test "cancelled command identity failure never persists a replay suffix" {
         } },
         true,
     );
-    Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
     try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
         .user = .{ .text = @constCast("cancel") },
         .tool_call = .{
@@ -8211,125 +8566,7 @@ test "cancelled command identity failure never persists a replay suffix" {
     try std.testing.expect(presentation.output_replay == null);
 }
 
-test "cancelled command spill failure degrades without losing the row" {
-    const alloc = std.testing.allocator;
-    var app = try TestApp.init(alloc, "/workspace");
-    defer app.deinit();
-    const lifecycle_id = types.ToolLifecycleId{
-        .turn_id = 10,
-        .call_id = "spill-unavailable",
-    };
-    const output = try alloc.alloc(u8, default_cancelled_command_replay_inline_limit + 1);
-    defer alloc.free(output);
-    @memset(output, 'x');
-    Runtime(TestApp).recordAppliedCommandOutput(&app, lifecycle_id, .stdout, output);
-    Runtime(TestApp).recordAppliedCommandOutput(
-        &app,
-        lifecycle_id,
-        .stderr,
-        "must not become a suffix\n",
-    );
-    Runtime(TestApp).recordToolTerminal(
-        &app,
-        .{ .terminal = .{
-            .id = lifecycle_id,
-            .outcome = .{ .kind = .cancelled, .summary = "Cancelled" },
-        } },
-        true,
-    );
-    Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
-    try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
-        .user = .{ .text = @constCast("cancel") },
-        .tool_call = .{
-            .id = "spill-unavailable",
-            .name = "run_command",
-            .arguments_json = "{\"command\":\"slow\"}",
-        },
-    } });
-
-    const history = try app.session.snapshotHistory(alloc);
-    defer session_runtime.freeHistoryTurnSlice(alloc, history);
-    const replay = history[0].interrupted.cancelled_command.?.output_replay orelse
-        return error.TestExpectedReplay;
-    try std.testing.expect(replay == .unavailable);
-}
-
-test "reactive interrupted history discards the app replay candidate" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
-    }
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
-    const lifecycle_id = types.ToolLifecycleId{
-        .turn_id = 9,
-        .call_id = "reactive-cancelled-command",
-    };
-    const output = try alloc.alloc(u8, default_cancelled_command_replay_inline_limit + 1);
-    defer alloc.free(output);
-    @memset(output, 'x');
-    Runtime(TestApp).recordAppliedCommandOutput(&app, lifecycle_id, .stdout, output);
-    Runtime(TestApp).recordToolTerminal(
-        &app,
-        .{ .terminal = .{
-            .id = lifecycle_id,
-            .outcome = .{ .kind = .cancelled, .summary = "Cancelled" },
-        } },
-        true,
-    );
-    Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
-    var before = try Runtime(TestApp).childCapability(&app).?.iterate(
-        alloc,
-        .command_artifacts,
-    );
-    defer before.deinit();
-    try std.testing.expectEqual(@as(usize, 1), before.names.len);
-
-    var execution_calls = [_]types.ToolCall{.{
-        .id = "reactive-execution-command",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"restricted then broader\"}",
-    }};
-    var execution_results = [_]types.PersistedToolResult{.{
-        .tool_call_id = @constCast("reactive-execution-command"),
-        .tool_name = @constCast("run_command"),
-        .status = .failure,
-        .output = @constCast("restricted and broader attempts retained"),
-        .output_bytes = 40,
-        .stored_output_bytes = 40,
-    }};
-    var execution_steps = [_]types.ToolExecutionStep{.{
-        .tool_calls = execution_calls[0..],
-        .tool_results = execution_results[0..],
-    }};
-    try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
-        .user = .{ .text = @constCast("cancel") },
-        .tool_call = null,
-        .execution = .{ .tool_steps = execution_steps[0..] },
-    } });
-    const history = try app.session.snapshotHistory(alloc);
-    defer session_runtime.freeHistoryTurnSlice(alloc, history);
-    try std.testing.expect(history[0].interrupted.cancelled_command == null);
-    try Runtime(TestApp).replayHistory(&app, history);
-    try std.testing.expectEqual(@as(usize, 1), app.completed_tool_statuses.items.len);
-    var after = try Runtime(TestApp).childCapability(&app).?.iterate(
-        alloc,
-        .command_artifacts,
-    );
-    defer after.deinit();
-    try std.testing.expectEqual(@as(usize, 0), after.names.len);
-}
-
-test "ordinary command terminal discards the app replay candidate" {
+test "ordinary command terminal creates no cancellation metadata" {
     const alloc = std.testing.allocator;
     var app = try TestApp.init(alloc, "/workspace");
     defer app.deinit();
@@ -8337,7 +8574,6 @@ test "ordinary command terminal discards the app replay candidate" {
         .turn_id = 10,
         .call_id = "completed-command",
     };
-    Runtime(TestApp).recordAppliedCommandOutput(&app, lifecycle_id, .stdout, "done\n");
     Runtime(TestApp).recordToolTerminal(
         &app,
         .{ .terminal = .{
@@ -8349,7 +8585,7 @@ test "ordinary command terminal discards the app replay candidate" {
     try std.testing.expect(app.session_persistence.pending_cancelled_command == null);
 }
 
-test "cancelled durable terminal action preserves the exec replay candidate" {
+test "cancelled durable terminal action preserves exec metadata" {
     const alloc = std.testing.allocator;
     var app = try TestApp.init(alloc, "/workspace");
     defer app.deinit();
@@ -8362,12 +8598,6 @@ test "cancelled durable terminal action preserves the exec replay candidate" {
         .call_id = "cancelled-read",
     };
 
-    Runtime(TestApp).recordAppliedCommandOutput(
-        &app,
-        exec_id,
-        .stdout,
-        "captured before cancellation\n",
-    );
     Runtime(TestApp).recordToolTerminal(
         &app,
         .{ .terminal = .{
@@ -8376,7 +8606,6 @@ test "cancelled durable terminal action preserves the exec replay candidate" {
         } },
         true,
     );
-    Runtime(TestApp).recordCommandOutputComplete(&app, exec_id);
 
     Runtime(TestApp).recordToolTerminal(
         &app,
@@ -8390,8 +8619,6 @@ test "cancelled durable terminal action preserves the exec replay candidate" {
     const pending = app.session_persistence.pending_cancelled_command orelse
         return error.TestExpectedEqual;
     try std.testing.expect(pending.matches(exec_id));
-    try std.testing.expect(pending.cancelled);
-    try std.testing.expect(pending.completed);
 }
 
 test "zero-output cancelled command restores detail without an output block" {
@@ -8511,7 +8738,7 @@ test "cancelled replay survives event persistence failure after history insertio
     _ = try capability.stat(.command_artifacts, descriptor.handle);
 }
 
-test "cancelled replay is deleted when history insertion fails" {
+test "authoritative cancelled replay survives history insertion failure" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8531,13 +8758,19 @@ test "cancelled replay is deleted when history insertion fails" {
     var capture_arena = std.heap.ArenaAllocator.init(alloc);
     defer capture_arena.deinit();
     const capture_alloc = capture_arena.allocator();
-    const capture = try command_replay_store.Capture.create(capture_alloc, 1, capability);
-    capture.appendAccepted(capture_alloc, .stdout, "accepted\n");
-    const replay = capture.retain(capture_alloc) orelse return error.TestExpectedReplay;
-    const descriptor = switch (replay) {
-        .available => |value| value,
-        .unavailable => return error.TestExpectedReplay,
-    };
+    const capture = try command_replay_store.Capture.create(
+        capture_alloc,
+        1,
+        capability,
+    );
+    capture.setPolicyBeforeCapture(.required);
+    try capture.appendAcceptedRequired(
+        capture_alloc,
+        .stdout,
+        "externally owned\n",
+    );
+    const descriptor = (try capture.retainRequired(capture_alloc)) orelse
+        return error.TestExpectedReplay;
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     app.alloc = failing.allocator();
     defer app.alloc = alloc;
@@ -8547,17 +8780,25 @@ test "cancelled replay is deleted when history insertion fails" {
         Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
             .user = .{ .text = @constCast("cancel") },
             .tool_call = .{
-                .id = "failed-insert",
-                .name = "run_command",
-                .arguments_json = "{\"command\":\"slow\"}",
+                .id = "failed-external-insert",
+                .name = "terminal",
+                .arguments_json = "{\"action\":\"exec\",\"command\":\"slow\",\"timeout_ms\":600000}",
             },
-            .cancelled_command = .{ .output_replay = replay },
+            .cancelled_command = .{
+                .output_replay = .{ .available = descriptor },
+            },
         } }),
     );
-    try std.testing.expectError(
-        error.FileNotFound,
-        capability.stat(.command_artifacts, descriptor.handle),
+    _ = try capability.stat(.command_artifacts, descriptor.handle);
+    const page = try command_replay_store.readAgentPageManaged(
+        alloc,
+        capability,
+        descriptor.handle,
+        1,
+        4096,
     );
+    defer alloc.free(page);
+    try std.testing.expect(std.mem.find(u8, page, "externally owned") != null);
 }
 
 test "appendHistoryTurn commits canonical history event and totals" {
@@ -8634,10 +8875,25 @@ test "appendFinishedPrompt transfers snapshot ownership after history acceptance
             .user = .{ .text = @constCast("inspect") },
             .assistant = @constCast("done"),
         } },
+        .summary = .{
+            .started_at_ms = 100,
+            .completed_at_ms = 250,
+            .turn_duration_ms = 150,
+            .token_progress = .{ .input_tokens = 2, .output_tokens = 3 },
+        },
         .snapshot_file_ownership = probe.handle(),
     });
 
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
+    try std.testing.expectEqual(
+        @as(?types.TurnSummary, .{
+            .started_at_ms = 100,
+            .completed_at_ms = 250,
+            .turn_duration_ms = 150,
+            .token_progress = .{ .input_tokens = 2, .output_tokens = 3 },
+        }),
+        types.historyTurnSummary(app.session.history.items[0]),
+    );
     try std.testing.expectEqual(@as(usize, 1), probe.transfers);
 }
 
@@ -8746,6 +9002,7 @@ test "fresh interactive session retains one writable schema-v3 handle" {
 
     try Runtime(TestApp).configureStartupPreferences(
         &app,
+        .gateway,
         "configured/model",
         .user_workspace,
         "configured/model",
@@ -8854,10 +9111,10 @@ test "combined preference patch writes user defaults cleans legacy fields and ap
 
     var detailed = try config_runtime.loadMergedSettingsDetailed(alloc, paths.workspace);
     defer detailed.deinit(alloc);
-    try std.testing.expectEqualStrings("user/model", detailed.settings.model.?);
+    try std.testing.expectEqualStrings("user/model", detailed.settings.models.get(.gateway).?);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), detailed.settings.effort.?);
     try std.testing.expectEqual(false, detailed.settings.fast_mode.?);
-    try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.model);
+    try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.models.get(.gateway));
     try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.effort);
     try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.fast_mode);
 }
@@ -9045,8 +9302,8 @@ test "session picker rejects a load more completion after switching to a fresh c
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
-    const current_page: session_store.ResumableSessionPage = .{};
-    var all_page: session_store.ResumableSessionPage = .{ .has_more = true };
+    const current_page: subagent_resume_admission.ActionableSessionPage = .{};
+    var all_page: subagent_resume_admission.ActionableSessionPage = .{ .has_more = true };
     defer all_page.deinit(alloc);
     try all_page.summaries.append(alloc, .{
         .id = try alloc.dupe(u8, "foreign-session"),
@@ -9472,7 +9729,7 @@ test "session picker keeps stale cached rows ready when refresh fails" {
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
-    var cached_page: session_store.ResumableSessionPage = .{};
+    var cached_page: subagent_resume_admission.ActionableSessionPage = .{};
     defer cached_page.deinit(alloc);
     try cached_page.summaries.append(alloc, .{
         .id = try alloc.dupe(u8, "cached-session"),
@@ -9691,6 +9948,69 @@ test "renameActiveSession persists the title to the sidecar and session index" {
     defer display.deinit(alloc);
     try std.testing.expect(display.present);
     try std.testing.expectEqualStrings("deploy pipeline fix", display.title);
+}
+
+const ReconciliationOriginUsage = struct {
+    replaced_provider: ?model_provider.ProviderId = null,
+    replaced_source: ?types.CredentialSource = null,
+
+    fn replaceProviderReconciliationCredential(
+        self: *@This(),
+        _: Allocator,
+        provider: model_provider.ProviderId,
+        source: types.CredentialSource,
+        _: ?[]const u8,
+        _: []const u8,
+    ) void {
+        self.replaced_provider = provider;
+        self.replaced_source = source;
+    }
+};
+
+const ReconciliationOriginAuth = struct {
+    source: types.CredentialSource,
+
+    fn credentialSource(self: *const @This()) ?types.CredentialSource {
+        return self.source;
+    }
+
+    fn apiKey(_: *const @This()) ?[]const u8 {
+        return "origin-bound-token";
+    }
+
+    fn accountId(_: *const @This()) ?[]const u8 {
+        return null;
+    }
+
+    fn gatewayTeam(_: *const @This()) ?[]const u8 {
+        return null;
+    }
+};
+
+const ReconciliationOriginApp = struct {
+    alloc: Allocator = std.testing.allocator,
+    auth: ReconciliationOriginAuth,
+    session: struct { usage: ReconciliationOriginUsage = .{} } = .{},
+    selected_provider: model_provider.ProviderId,
+    selected_model: std.ArrayList(u8) = .empty,
+};
+
+test "resumed sessions install provider-scoped usage reconciliation authority" {
+    var chatgpt = ReconciliationOriginApp{
+        .auth = .{ .source = .chatgpt_subscription },
+        .selected_provider = .codex,
+    };
+    Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&chatgpt);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, chatgpt.session.usage.replaced_provider.?);
+    try std.testing.expectEqual(types.CredentialSource.chatgpt_subscription, chatgpt.session.usage.replaced_source.?);
+
+    var gateway = ReconciliationOriginApp{
+        .auth = .{ .source = .ai_gateway_api_key },
+        .selected_provider = .gateway,
+    };
+    Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&gateway);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.session.usage.replaced_provider.?);
+    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.session.usage.replaced_source.?);
 }
 
 test "ensureCachedSessionTitle derives from the first prompt and then freezes" {

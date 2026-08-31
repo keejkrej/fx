@@ -9,6 +9,7 @@ const ctrl_c: u8 = 3;
 const ctrl_l: u8 = 12;
 const ctrl_n: u8 = 14;
 const ctrl_p: u8 = 16;
+const ctrl_t: u8 = 20;
 const ctrl_u: u8 = 21;
 const ctrl_d: u8 = 4;
 const ctrl_x: u8 = 24;
@@ -31,7 +32,12 @@ const ViewerKey = union(enum) {
     previous_match,
     next_hunk,
     previous_hunk,
+    next_file,
+    previous_file,
     toggle_layout,
+    toggle_file_list,
+    comment,
+    cycle,
     confirm,
     cancel,
     prompt_byte: u8,
@@ -70,8 +76,23 @@ pub fn Runtime(comptime App: type) type {
                                 try app_code_viewer_runtime.Runtime(App).close(owned_app);
                                 return;
                             },
+                            .cycle => {
+                                if (comptime @hasField(App, "scripting")) {
+                                    const app_lua_runtime = @import("app_lua_runtime.zig");
+                                    if (try app_lua_runtime.Runtime(App).cycleView(owned_app)) return;
+                                }
+                                try app_code_viewer_runtime.Runtime(App).close(owned_app);
+                                return;
+                            },
                             .cancel => owned_app.code_viewer.cancelPrompt(),
-                            .confirm => owned_app.code_viewer.confirmPrompt(),
+                            .confirm => {
+                                if (owned_app.code_viewer.mode == .comment) {
+                                    try submitDiffComment(App, owned_app);
+                                } else {
+                                    owned_app.code_viewer.confirmPrompt();
+                                }
+                            },
+                            .comment => owned_app.code_viewer.beginComment(),
                             .prompt_byte => |byte| try owned_app.code_viewer.appendPromptByte(byte),
                             .prompt_delete => try owned_app.code_viewer.deletePromptByte(),
                             .move => |delta| owned_app.code_viewer.moveBy(delta),
@@ -87,7 +108,10 @@ pub fn Runtime(comptime App: type) type {
                             .previous_match => owned_app.code_viewer.previousMatch(),
                             .next_hunk => owned_app.code_viewer.nextHunk(),
                             .previous_hunk => owned_app.code_viewer.previousHunk(),
+                            .next_file => owned_app.code_viewer.nextFile() catch {},
+                            .previous_file => owned_app.code_viewer.previousFile() catch {},
                             .toggle_layout => owned_app.code_viewer.toggleDiffLayout(),
+                            .toggle_file_list => owned_app.code_viewer.toggleFileList(),
                             .redraw => {},
                             .subagent_manager => {
                                 try app_code_viewer_runtime.Runtime(App).close(owned_app);
@@ -107,6 +131,22 @@ pub fn Runtime(comptime App: type) type {
     };
 }
 
+fn submitDiffComment(comptime App: type, app: *App) !void {
+    if (comptime !@hasField(App, "code_viewer")) return;
+    const snippet = try app.code_viewer.formatDiffComment(app.alloc);
+    defer app.alloc.free(snippet);
+    if (comptime @hasField(App, "input_runtime")) {
+        const merged = try app_code_viewer_runtime.mergeComposerContext(
+            app.alloc,
+            app.input_runtime.edit_state.input.items,
+            snippet,
+        );
+        defer app.alloc.free(merged);
+        try app.input_runtime.textReplacementState().replace(app.alloc, merged);
+    }
+    app.code_viewer.cancelPrompt();
+}
+
 fn keyForByte(mode: app_code_viewer_runtime.Mode, byte: u8) ?ViewerKey {
     if (mode != .browse) {
         return switch (byte) {
@@ -121,6 +161,7 @@ fn keyForByte(mode: app_code_viewer_runtime.Mode, byte: u8) ?ViewerKey {
     return switch (byte) {
         ctrl_c => .interrupt,
         'q', 'Q' => .quit,
+        ctrl_t => .cycle,
         ctrl_l => .redraw,
         ctrl_x => .subagent_manager,
         'j' => .{ .move = 1 },
@@ -134,9 +175,13 @@ fn keyForByte(mode: app_code_viewer_runtime.Mode, byte: u8) ?ViewerKey {
         'd' => .definition,
         'n' => .next_match,
         'N' => .previous_match,
-        ']', ctrl_n => .next_hunk,
-        '[', ctrl_p => .previous_hunk,
+        ']', '}', ctrl_n => .next_hunk,
+        '[', '{', ctrl_p => .previous_hunk,
+        'l' => .next_file,
+        'h' => .previous_file,
+        '\t' => .toggle_file_list,
         't', 'T' => .toggle_layout,
+        'c', 'C', 'i' => .comment,
         else => null,
     };
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
+const model_provider = @import("../config/model_provider.zig");
 const session_event = @import("session_event.zig");
 const types = @import("../shared/types.zig");
 
@@ -73,6 +74,27 @@ pub const Checkpoint = struct {
         self.* = undefined;
     }
 };
+
+inline fn failCheckpoint(err: anytype) @TypeOf(err)!Checkpoint {
+    return @errorCast(failCheckpointDynamic(err));
+}
+
+noinline fn failCheckpointDynamic(err: anyerror) anyerror!Checkpoint {
+    return err;
+}
+
+test "checkpoint failures preserve exact error types and identities" {
+    const invalid = failCheckpoint(error.InvalidCheckpoint);
+    try std.testing.expect(
+        @TypeOf(invalid) == error{InvalidCheckpoint}!Checkpoint,
+    );
+    try std.testing.expectError(error.InvalidCheckpoint, invalid);
+    try std.testing.expectError(
+        error.CheckpointTooLarge,
+        failCheckpoint(error.CheckpointTooLarge),
+    );
+    try std.testing.expectError(error.OutOfMemory, failCheckpoint(error.OutOfMemory));
+}
 
 pub const EventBoundary = struct {
     log_generation: session_event.Identifier,
@@ -283,6 +305,7 @@ fn durablePreferencesEqual(
     right: session_codec.DurableSessionPreferences,
 ) bool {
     return std.mem.eql(u8, left.model, right.model) and
+        left.provider == right.provider and
         left.effort.eql(right.effort) and
         left.fast_mode == right.fast_mode;
 }
@@ -312,9 +335,9 @@ pub fn encodeCheckpoint(alloc: Allocator, checkpoint: Checkpoint) ![]u8 {
 
 pub fn decodeCheckpoint(alloc: Allocator, bytes: []const u8) !Checkpoint {
     return decodeCheckpointImpl(alloc, bytes) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.CheckpointTooLarge => return error.CheckpointTooLarge,
-        else => return error.InvalidCheckpoint,
+        error.OutOfMemory => return failCheckpoint(error.OutOfMemory),
+        error.CheckpointTooLarge => return failCheckpoint(error.CheckpointTooLarge),
+        else => return failCheckpoint(error.InvalidCheckpoint),
     };
 }
 
@@ -456,16 +479,26 @@ fn writePreferences(
     try writeJsonString(writer, preferences.model);
     try writer.writeAll(",\"effort\":");
     try writeJsonString(writer, preferences.effort.label());
-    try writer.print(",\"fast_mode\":{s}}}", .{
+    try writer.print(",\"fast_mode\":{s},\"provider\":", .{
         if (preferences.fast_mode) "true" else "false",
     });
+    try writeJsonString(writer, @tagName(preferences.provider));
+    try writer.writeByte('}');
 }
 
 fn parsePreferences(alloc: Allocator, value: std.json.Value) !session_codec.DurableSessionPreferences {
-    const object = try exactObject(value, &.{ "model", "effort", "fast_mode" });
+    const raw_object = if (value == .object) value.object else return error.InvalidManifest;
+    const object = if (raw_object.get("provider") != null)
+        try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" })
+    else
+        try exactObject(value, &.{ "model", "effort", "fast_mode" });
     const model = try dupeString(alloc, object, "model");
     errdefer alloc.free(model);
     return .{
+        .provider = if (object.get("provider")) |provider_value| blk: {
+            if (provider_value != .string) return error.InvalidManifest;
+            break :blk model_provider.parse(provider_value.string) orelse return error.InvalidManifest;
+        } else .gateway,
         .model = model,
         .effort = types.ReasoningEffort.parse(try requireString(object, "effort")) orelse
             return error.InvalidManifest,

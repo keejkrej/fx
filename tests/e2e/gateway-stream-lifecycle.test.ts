@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { createServer, type Socket } from "node:net";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -41,7 +43,7 @@ import {
 } from "./tmux-helpers";
 
 const MODEL = "openai/gpt-5.5";
-const DEFAULT_MODEL = "zai/glm-5.2";
+const DEFAULT_MODEL = "moonshotai/kimi-k3";
 const DELAY_MS = 32_500;
 const MALFORMED_ARGUMENTS = '{"depth":1,"depth":2}';
 const MALFORMED_CALL_ID = "malformed_ask_1";
@@ -141,7 +143,7 @@ function sse(body: string): Response {
 
 function startGateway(
   response: () => Response,
-  classifierDecision: "allow" | "ask" = "allow",
+  classifierDecision: "clear" | "caution" = "clear",
 ): GatewayFixture {
   return startDynamicFakeGateway(response, {
     classifierDecision,
@@ -182,7 +184,7 @@ function lengthLimitedCommandResponse(command: string): Response {
       `data: ${JSON.stringify({
         type: "tool-call",
         toolName: "terminal",
-        input: { action: "exec", command },
+        input: { action: "exec", command, timeout_ms: 600_000 },
       })}\n\n` +
       'data: {"type":"finish","finishReason":{"unified":"length","raw":"length"}}\n\n' +
       "data: [DONE]\n\n",
@@ -653,31 +655,31 @@ describe("gateway stream lifecycle", () => {
     }]);
     expect(findUnavailableCapabilityReferences(installSkillCurrent)).toEqual([]);
 
-    const mcpSearchOld = fixture("neutral", [{
+    const capabilitySearchOld = fixture("neutral", [{
       type: "function",
-      name: "mcp_search_tools",
+      name: "capability_search",
       description: "When NOT to use: memory, skill, or ask-user work.",
       inputSchema: { type: "object", properties: {} },
     }]);
-    expect(findUnavailableCapabilityReferences(mcpSearchOld)).toEqual([
+    expect(findUnavailableCapabilityReferences(capabilitySearchOld)).toEqual([
       {
         capability: "skill",
-        source: "tool:mcp_search_tools",
+        source: "tool:capability_search",
         clause: "memory, skill, or ask-user work",
       },
       {
         capability: "memory",
-        source: "tool:mcp_search_tools",
+        source: "tool:capability_search",
         clause: "memory, skill, or ask-user work",
       },
     ]);
-    const mcpSearchCurrent = fixture("neutral", [{
+    const capabilitySearchCurrent = fixture("neutral", [{
       type: "function",
-      name: "mcp_search_tools",
+      name: "capability_search",
       description: "When NOT to use: the needed capability is already advertised directly.",
       inputSchema: { type: "object", properties: {} },
     }]);
-    expect(findUnavailableCapabilityReferences(mcpSearchCurrent)).toEqual([]);
+    expect(findUnavailableCapabilityReferences(capabilitySearchCurrent)).toEqual([]);
 
     const excludedText = [
       "Use terminal and web_search.",
@@ -703,7 +705,7 @@ describe("gateway stream lifecycle", () => {
     })).toEqual([]);
   });
 
-  test("ask sends status text normally with the full tool surface", async () => {
+  test("no-save ask sends status text with the exec-only terminal surface", async () => {
     const root = createFixtureRoot("status-text-ask");
     const tracePath = join(root.root, "trace.log");
     const gateway = startGateway(() => fakeGatewayFinalText("STATUS_TEXT_ASK_COMPLETE"));
@@ -729,17 +731,17 @@ describe("gateway stream lifecycle", () => {
       expect(serializedToolNames(oracleRequest)).toEqual(
         AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
       );
-      expect(request.tools).toHaveLength(25);
+      expect(request.tools).toHaveLength(17);
       expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
       expect(customProviderGuidanceState(oracleRequest)).toEqual({
-        providerToolIndices: [22],
+        providerToolIndices: [14],
         guidanceMessageIndices: [1],
       });
       expect(request.prompt[0]?.role).toBe("system");
       expect(request.prompt[1]?.role).toBe("system");
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
-      expect(toolByName(oracleRequest, "terminal")?.description).toContain(
-        "Use exec for a foreground command",
+      expect(toolByName(oracleRequest, "terminal")?.description).toBe(
+        "Run one captured command with a required finite timeout_ms and return its result. Timeout cleanup covers the process group and tracked descendants; fully detached descendant cleanup is best effort on macOS.",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",
@@ -806,7 +808,56 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("ask keeps the GLM default model identity without enabling fast mode", async () => {
+  test("memory save rejects a corrupt store without replacing it", async () => {
+    const root = createFixtureRoot("memory-corrupt-save");
+    const tracePath = join(root.root, "trace.log");
+    const memoriesPath = join(root.home, ".fx", "memories.json");
+    const corruptStore = '["recoverable prior memory",\n';
+    writeFileSync(memoriesPath, corruptStore);
+
+    const callId = "memory_corrupt_save_1";
+    const responses = [
+      fakeGatewayToolCall(callId, "memory", {
+        action: "save",
+        fact: "replacement memory",
+      }),
+      fakeGatewayFinalText("Corrupt memory store handled."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--auto", "--json", "--no-save", "Save a memory."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.error).toBeUndefined();
+      expect(json.output).toContain("Corrupt memory store handled.");
+      expect(json.tool_calls).toContainEqual({
+        name: "memory",
+        status: "error",
+      });
+      expect(gateway.requestCount()).toBe(2);
+      expect(toolResultOutput(gateway.requests[1]!.body, callId)).toContain(
+        "memory store is malformed; ~/.fx/memories.json was not modified",
+      );
+      expect(readFileSync(memoriesPath, "utf8")).toBe(corruptStore);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("ask keeps Kimi K3 as the default model with fast mode enabled", async () => {
     const root = createFixtureRoot("default-model");
     const tracePath = join(root.root, "trace.log");
     const gateway = startDynamicFakeGateway(
@@ -846,7 +897,9 @@ describe("gateway stream lifecycle", () => {
       );
       const request = JSON.parse(gateway.requests[0]!.body);
       expect(request).not.toHaveProperty("fast");
-      expect(request).not.toHaveProperty("providerOptions.gateway.speed");
+      expect(request).toMatchObject({
+        providerOptions: { gateway: { speed: "fast" } },
+      });
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -1182,21 +1235,9 @@ describe("gateway stream lifecycle", () => {
         );
         expect(full).toContain("● Context:");
         expect(full).not.toContain("[context]");
-        const reviewGrid = await tui.capturePaneGrid();
-        const reviewNavigationRow = reviewGrid.findIndex((row) =>
-          row.includes("┃ Review · ←/→ switch · ctrl o close")
-        );
-        expect(reviewNavigationRow).toBeGreaterThan(0);
-        expect(reviewGrid[reviewNavigationRow - 1]!.trim()).toBe("");
-
-        await tui.sendKeys("Right");
-        await tui.waitForPane(
-          (text) => text.includes("Full detail · ←/→ switch · ctrl o close"),
-          15_000,
-        );
         const fullGrid = await tui.capturePaneGrid();
         const fullNavigationRow = fullGrid.findIndex((row) =>
-          row.includes("┃ Full detail · ←/→ switch · ctrl o close")
+          row.includes("┃ Full detail · ctrl o close")
         );
         expect(fullNavigationRow).toBeGreaterThan(0);
         expect(fullGrid[fullNavigationRow - 1]!.trim()).toBe("");
@@ -1230,11 +1271,6 @@ describe("gateway stream lifecycle", () => {
         );
         expect(finalFull.split("project instruction file").length - 1).toBe(1);
         expect(finalFull.split("skill catalog omitted").length - 1).toBe(1);
-        await tui.sendKeys("Right");
-        await tui.waitForPane(
-          (text) => text.includes("Full detail · ←/→ switch · ctrl o close"),
-          15_000,
-        );
         await tui.sendKeys("C-o");
 
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -1353,11 +1389,6 @@ describe("gateway stream lifecycle", () => {
         expect(full.indexOf("reason=oversized rule file")).toBeLessThan(
           full.indexOf("reason=selection cap"),
         );
-        await tui.sendKeys("Right");
-        await tui.waitForPane(
-          (text) => text.includes("Full detail · ←/→ switch · ctrl o close"),
-          15_000,
-        );
         await tui.sendKeys("C-o");
         await tui.waitForPane(
           (text) =>
@@ -1452,11 +1483,6 @@ describe("gateway stream lifecycle", () => {
         );
         expect(full).toContain("● Context:");
         expect(full).not.toContain("[context]");
-        await tui.sendKeys("Right");
-        await tui.waitForPane(
-          (text) => text.includes("Full detail · ←/→ switch · ctrl o close"),
-          15_000,
-        );
         await tui.sendKeys("C-o");
         await tui.waitForPane(
           (text) =>
@@ -1652,6 +1678,7 @@ describe("gateway stream lifecycle", () => {
     );
 
     const ambiguousCallId = "exact_skill_ambiguous";
+    const searchCallId = "exact_skill_search";
     const exactBCallId = "exact_skill_b";
     let advertisedA = "";
     let advertisedB = "";
@@ -1665,14 +1692,29 @@ describe("gateway stream lifecycle", () => {
             throw new Error(`Expected two advertised ${skillName} locations, got ${JSON.stringify(locations)}`);
           }
           [advertisedA, advertisedB] = locations;
+          return fakeGatewayToolCall(searchCallId, "capability_search", {
+            query: "managed exact duplicate workflow",
+          });
+        }
+        case 1: {
+          const searchOutput = JSON.parse(
+            toolResultOutput(gateway.requests[1]!.body, searchCallId),
+          ) as {
+            skills: Array<{ name: string; description: string; location: string }>;
+            count: number;
+            more_available: boolean;
+          };
+          if (searchOutput.skills[0]?.location !== advertisedB) {
+            throw new Error(`Expected managed skill first, got ${JSON.stringify(searchOutput)}`);
+          }
           return fakeGatewayToolCall(ambiguousCallId, "skill", { name: skillName });
         }
-        case 1:
+        case 2:
           return fakeGatewayToolCall(exactBCallId, "skill", {
             name: skillName,
             location: advertisedB,
           });
-        case 2:
+        case 3:
           return fakeGatewayFinalText("Exact duplicate selection complete.");
         default:
           return new Response("unexpected request", { status: 500 });
@@ -1699,20 +1741,27 @@ describe("gateway stream lifecycle", () => {
       expect(firstJson.exit_code).toBe(0);
       expect(firstJson.error).toBeUndefined();
       expect(firstJson.tool_calls).toEqual([
+        { name: "capability_search", status: "success" },
         { name: "skill", status: "error" },
         { name: "skill", status: "success" },
       ]);
       expect(advertisedA).toBe(skillDirectoryA);
       expect(advertisedB).toBe(skillDirectoryB);
-      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requestCount()).toBe(4);
 
       const initialRequest = gatewayRequest(gateway.requests[0]!.body);
       const skillSchema = initialRequest.tools.find((tool) => tool.name === "skill");
+      const capabilitySearchSchema = initialRequest.tools.find((tool) =>
+        tool.name === "capability_search"
+      );
       expect(skillSchema).toBeDefined();
       expect(skillSchema?.inputSchema.type).toBe("object");
       expect(skillSchema?.inputSchema.properties.name.type).toBe("string");
       expect(skillSchema?.inputSchema.properties.location.type).toBe("string");
       expect(skillSchema?.inputSchema.required).toEqual(["name"]);
+      expect(capabilitySearchSchema).toBeDefined();
+      expect(capabilitySearchSchema?.inputSchema.required).toEqual(["query"]);
+      expect((capabilitySearchSchema?.inputSchema.properties.query as { maxLength?: number }).maxLength).toBe(4096);
 
       const available = taggedBlock(gateway.requests[0]!.body, "available_skills");
       expect(promptText(gateway.requests[0]!.body)).toContain(
@@ -1727,13 +1776,29 @@ describe("gateway stream lifecycle", () => {
       expect(available).not.toContain(bodyA);
       expect(available).not.toContain(bodyB);
 
-      const ambiguity = toolResultOutput(gateway.requests[1]!.body, ambiguousCallId);
+      const searchOutputText = toolResultOutput(gateway.requests[1]!.body, searchCallId);
+      const searchOutput = JSON.parse(searchOutputText) as {
+        skills: Array<{ name: string; description: string; location: string }>;
+        counts: { skills: number; mcp_tools: number };
+        more_available: { skills: boolean; mcp_tools: boolean };
+      };
+      expect(searchOutput.counts.skills).toBe(2);
+      expect(searchOutput.more_available.skills).toBe(false);
+      expect(searchOutput.skills.map((entry) => entry.location)).toEqual([
+        advertisedB,
+        advertisedA,
+      ]);
+      expect(searchOutputText).not.toContain(bodyA);
+      expect(searchOutputText).not.toContain(bodyB);
+      expect(searchOutputText).not.toContain(malformedBody);
+
+      const ambiguity = toolResultOutput(gateway.requests[2]!.body, ambiguousCallId);
       expect(ambiguity).toContain(advertisedA);
       expect(ambiguity).toContain(advertisedB);
       expect(ambiguity).not.toContain(bodyA);
       expect(ambiguity).not.toContain(bodyB);
 
-      const loadedB = toolResultOutput(gateway.requests[2]!.body, exactBCallId);
+      const loadedB = toolResultOutput(gateway.requests[3]!.body, exactBCallId);
       expect(loadedB).toContain(bodyB);
       expect(loadedB).not.toContain(companionB);
       expect(loadedB).not.toContain(bodyA);
@@ -1747,6 +1812,127 @@ describe("gateway stream lifecycle", () => {
       const firstTrace = readFileSync(tracePath, "utf8");
       expect(firstTrace).toContain(malformedDirectory);
       expect(firstTrace).toContain("cause=duplicate_recognized_key");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
+  test("capability search ranks natural skill intent and keeps durable model-visible JSON exact after redaction", async () => {
+    const root = createFixtureRoot("skill-search-projection");
+    const tracePath = join(root.root, "trace.log");
+    const unsafeDirectory = join(
+      root.workspace,
+      ".agents",
+      "skills",
+      "TOKEN=runtime-location-secret",
+    );
+    const safeDirectory = join(root.home, ".fx", "skills", "mail-helper");
+    const safeBody = "SAFE_SKILL_SEARCH_BODY_SENTINEL";
+    mkdirSync(unsafeDirectory, { recursive: true });
+    mkdirSync(safeDirectory, { recursive: true });
+    for (const name of [
+      "humanizer",
+      "animate",
+      "animation-accessibility",
+      "animation-performance",
+      "animation-vocabulary",
+      "css-animations",
+      "find-animation-opportunities",
+      "hyperframes-animation",
+    ]) {
+      const directory = join(root.workspace, ".agents", "skills", name);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(
+        join(directory, "SKILL.md"),
+        `---\nname: ${name}\ndescription: Animation workflow for visual motion\n---\n\nDISTRACTOR_BODY_MUST_NOT_LOAD\n`,
+      );
+    }
+    writeFileSync(
+      join(unsafeDirectory, "SKILL.md"),
+      "---\nname: unsafe-workflow\ndescription: Review unsafe workflow\n---\n\nUNSAFE_BODY_MUST_NOT_LOAD\n",
+    );
+    writeFileSync(
+      join(safeDirectory, "SKILL.md"),
+      `---\nname: mail-helper\ndescription: Send email messages. API_KEY=runtime-description-secret\n---\n\n${safeBody}\n`,
+    );
+
+    const searchCallId = "projected_capability_search";
+    const loadCallId = "projected_skill_load";
+    let projectedSearch: {
+      skills: Array<{ name: string; description: string; location: string }>;
+      counts: { skills: number; mcp_tools: number };
+      more_available: { skills: boolean; mcp_tools: boolean };
+    } | undefined;
+    let responseIndex = 0;
+    let gateway: GatewayFixture;
+    gateway = startGateway(() => {
+      switch (responseIndex++) {
+        case 0:
+          return fakeGatewayToolCall(searchCallId, "capability_search", {
+            query: "send an email",
+          });
+        case 1: {
+          projectedSearch = JSON.parse(
+            toolResultOutput(gateway.requests[1]!.body, searchCallId),
+          );
+          const selected = projectedSearch!.skills[0];
+          if (!selected) throw new Error("Expected one projected skill result");
+          return fakeGatewayToolCall(loadCallId, "skill", {
+            name: selected.name,
+            location: selected.location,
+          });
+        }
+        case 2:
+          return fakeGatewayFinalText("Projected skill search complete.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Exercise projected skill discovery."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+          },
+          timeoutMs: 30_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.error).toBeUndefined();
+      expect(json.tool_calls).toEqual([
+        { name: "capability_search", status: "success" },
+        { name: "skill", status: "success" },
+      ]);
+      expect(projectedSearch?.skills[0]).toEqual({
+        name: "mail-helper",
+        description: "Send email messages. API_KEY=[redacted]",
+        location: safeDirectory,
+      });
+      expect(projectedSearch?.counts.skills).toBe(8);
+      expect(projectedSearch?.counts.mcp_tools).toBe(0);
+      expect(projectedSearch?.more_available.skills).toBe(true);
+      expect(projectedSearch?.skills.some((skill) => skill.name === "unsafe-workflow"))
+        .toBe(false);
+      const projectedText = toolResultOutput(gateway.requests[1]!.body, searchCallId);
+      expect(projectedText).not.toContain("unsafe-workflow");
+      expect(projectedText).not.toContain("TOKEN=runtime-location-secret");
+      expect(projectedText).not.toContain("UNSAFE_BODY_MUST_NOT_LOAD");
+      expect(projectedText).not.toContain("DISTRACTOR_BODY_MUST_NOT_LOAD");
+      expect(projectedText).not.toContain(safeBody);
+
+      const loaded = toolResultOutput(gateway.requests[2]!.body, loadCallId);
+      expect(loaded).toContain(safeBody);
+      expect(loaded).not.toContain("UNSAFE_BODY_MUST_NOT_LOAD");
+      expect(loaded).not.toContain("DISTRACTOR_BODY_MUST_NOT_LOAD");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -1945,7 +2131,7 @@ describe("gateway stream lifecycle", () => {
           'data: {"type":"tool-input-start","id":"call_1","toolName":"read_file"}\n\n' +
             'data: {"type":"tool-input-delta","id":"call_1","delta":"{\\"path\\":\\"victim.txt\\"}"}\n\n' +
             'data: {"type":"tool-input-end","id":"call_1"}\n\n' +
-            'data: {"type":"tool-call","toolCallId":"call_1","toolName":"delete_file"}\n\n' +
+            'data: {"type":"tool-call","toolCallId":"call_1","toolName":"edit_file"}\n\n' +
             'data: {"type":"finish","finishReason":{"unified":"tool-calls","raw":"tool-calls"}}\n\n' +
             "data: [DONE]\n\n",
         );
@@ -1969,7 +2155,7 @@ describe("gateway stream lifecycle", () => {
 
       expect(existsSync(victimPath)).toBe(true);
       expect(json.tool_calls).not.toContainEqual({
-        name: "delete_file",
+        name: "edit_file",
         status: "success",
       });
     } finally {
@@ -2032,7 +2218,7 @@ describe("gateway stream lifecycle", () => {
           toolCallId: MALFORMED_CALL_ID,
           toolName: MALFORMED_TOOL_NAME,
           output: expect.objectContaining({
-            type: "text",
+            type: "error-text",
             value: expect.stringContaining("tool_execution_failed"),
           }),
         }),
@@ -2042,6 +2228,80 @@ describe("gateway stream lifecycle", () => {
       expect(result.stdout).not.toContain(MALFORMED_ARGUMENTS);
       expect(result.stderr).not.toContain(MALFORMED_ARGUMENTS);
       expect(trace).not.toContain(MALFORMED_ARGUMENTS);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("default ask stops a consecutive malformed argument loop", async () => {
+    const root = createFixtureRoot("repeated-malformed-arguments");
+    const tracePath = join(root.root, "trace.log");
+    const alternateMalformedArguments = '{"path":"README.md",}';
+    const responses = [
+      fakeGatewaySerializedToolCall(
+        "malformed_repeat_1",
+        MALFORMED_TOOL_NAME,
+        MALFORMED_ARGUMENTS,
+      ),
+      fakeGatewaySerializedToolCall(
+        "malformed_repeat_2",
+        MALFORMED_TOOL_NAME,
+        MALFORMED_ARGUMENTS,
+      ),
+      fakeGatewaySerializedToolCall(
+        "malformed_repeat_3",
+        "read_file",
+        alternateMalformedArguments,
+      ),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--no-save",
+          "Run the repeated malformed argument fixture.",
+        ],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MAX_AGENT_STEPS: undefined,
+          },
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+      const notice =
+        "Repeated malformed tool arguments stopped the agent loop. The invalid calls were not executed. Continue with a follow-up prompt if needed.";
+
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBeUndefined();
+      expect(result.stderr).toContain(notice);
+      expect(gateway.requestCount()).toBe(3);
+      expect(
+        json.tool_calls.filter(
+          (call) => call.name === MALFORMED_TOOL_NAME && call.status === "error",
+        ),
+      ).toHaveLength(2);
+      expect(json.tool_calls).toContainEqual({
+        name: "read_file",
+        status: "error",
+      });
+      expect(result.stdout).not.toContain(MALFORMED_ARGUMENTS);
+      expect(result.stderr).not.toContain(MALFORMED_ARGUMENTS);
+      expect(trace).toContain("event=repeated_malformed_tool_arguments");
+      expect(trace).not.toContain(MALFORMED_ARGUMENTS);
+      expect(result.stdout).not.toContain(alternateMalformedArguments);
+      expect(result.stderr).not.toContain(alternateMalformedArguments);
+      expect(trace).not.toContain(alternateMalformedArguments);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -2320,8 +2580,8 @@ describe("gateway stream lifecycle", () => {
     mkdirSync(blockedPath);
     chmodSync(blockedPath, 0);
     const responses = [
-      fakeGatewayToolCall("os_access_denial_context", "list_files", { path: blockedPath }),
-      fakeGatewayToolCall(callId, "list_files", { path: blockedPath }),
+      fakeGatewayToolCall("os_access_denial_context", "glob_files", { pattern: "*", path: blockedPath }),
+      fakeGatewayToolCall(callId, "glob_files", { pattern: "*", path: blockedPath }),
       fakeGatewayFinalText("Reported the operating-system access denial."),
     ];
     const gateway = startGateway(() =>
@@ -2345,21 +2605,21 @@ describe("gateway stream lifecycle", () => {
       const resultPart = parts.find((part) =>
         part.type === "tool-result" &&
         part.toolCallId === callId &&
-        part.toolName === "list_files"
+        part.toolName === "glob_files"
       );
       const output = contentText(resultPart?.output);
 
       expect(result.code).toBe(0);
-      expect(result.stderr).toContain(`Listing ${blockedPath}`);
+      expect(result.stderr).toContain("Matching *");
       expect(json.error).toBeUndefined();
       expect(gateway.requestCount()).toBe(3);
       expect(output).toContain("tool_execution_failed");
-      expect(output).toContain("list_files");
+      expect(output).toContain("glob_files");
       expect(output).toContain(blockedPath);
       expect(output).toContain("AccessDenied");
       expect(output).toContain("Do not retry");
       expect(output).toContain("symlink");
-      expect(output).toContain("/sandbox none");
+      expect(output).toContain("fx permissions");
     } finally {
       gateway.stop();
       chmodSync(blockedPath, 0o700);
@@ -2565,9 +2825,17 @@ describe("gateway stream lifecycle", () => {
       );
       expect(historicalCalls).toHaveLength(1);
       expect(historicalCalls[0]).toEqual(
-        expect.objectContaining({ input: {} }),
+        expect.objectContaining({ input: { request: {} } }),
       );
       expect(historicalResults).toHaveLength(1);
+      expect(historicalResults[0]).toEqual(
+        expect.objectContaining({
+          output: expect.objectContaining({
+            type: "error-text",
+            value: expect.stringContaining("tool_execution_failed"),
+          }),
+        }),
+      );
       expect(gateway.requests[2].body).toContain("tool_execution_failed");
       expect(gateway.requests[2].body).not.toContain(malformedArguments);
       const resumeTrace = readFileSync(resumeTracePath, "utf8");
@@ -2601,7 +2869,11 @@ describe("gateway stream lifecycle", () => {
     const command = `cat <<'FX_LONG_COMMAND' > long-command-output.txt\n${payload}\nFX_LONG_COMMAND\n`;
     expect(Buffer.byteLength(command)).toBeGreaterThan(20 * 1024);
     const responses = [
-      fakeGatewayToolCall(callId, "terminal", { action: "exec", command }),
+      fakeGatewayToolCall(callId, "terminal", {
+        action: "exec",
+        command,
+        timeout_ms: 600_000,
+      }),
       fakeGatewayFinalText("Long command fixture written."),
     ];
     const gateway = startGateway(() =>
@@ -2635,6 +2907,851 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("indeterminate terminal termination reports one truthful result without replaying effects", async () => {
+    const root = createFixtureRoot("terminal-indeterminate-outcome");
+    const tracePath = join(root.root, "trace.log");
+    const effectPath = join(root.workspace, "command-effect.txt");
+    const callId = "terminal_indeterminate_1";
+    let observedFailure = "";
+    let step = 0;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(callId, "terminal", {
+            action: "exec",
+            command: "printf 'effect\\n' >> command-effect.txt",
+            timeout_ms: 30_000,
+          });
+        case 1:
+          observedFailure = toolResultOutput(body, callId);
+          return fakeGatewayFinalText("Indeterminate command outcome acknowledged without retry.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the mutation exactly once."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT: "1",
+          },
+          timeoutMs: 15_000,
+        },
+      );
+      const json = JSON.parse(result.stdout) as {
+        exit_code: number;
+        output: string;
+        tool_calls: Array<{
+          name: string;
+          status: string;
+          command_result?: { termination_indeterminate?: boolean };
+        }>;
+      };
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toContain("acknowledged without retry");
+      expect(gateway.requestCount()).toBe(2);
+      expect(readFileSync(effectPath, "utf8")).toBe("effect\n");
+      expect(observedFailure).toContain("could not be confirmed");
+      expect(observedFailure).toContain("Do not retry");
+      expect(observedFailure).not.toContain("Unexpected");
+      expect(json.tool_calls).toHaveLength(1);
+      expect(json.tool_calls[0]).toMatchObject({
+        name: "terminal",
+        status: "error",
+        command_result: { termination_indeterminate: true },
+      });
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "command termination became indeterminate",
+      );
+      expect(result.stderr).not.toContain("Unexpected");
+      expect(result.stderr).not.toContain("error.Unexpected");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("suffixless stored result handle remains readable", async () => {
+    const root = createFixtureRoot("suffixless-tool-result-handle");
+    const tracePath = join(root.root, "trace.log");
+    const readFileCallId = "suffixless_handle_read_file_1";
+    const readResultCallId = "suffixless_handle_read_result_1";
+    const needle = "E2E_SUFFIX_NEEDLE";
+    const lines = Array.from(
+      { length: 500 },
+      (_, index) => `fixture line ${index.toString().padStart(3, "0")}: ${"x".repeat(72)}`,
+    );
+    lines[300] = needle;
+    writeFileSync(join(root.workspace, "large-result.txt"), `${lines.join("\n")}\n`);
+
+    let step = 0;
+    let canonicalHandle = "";
+    let suffixlessHandle = "";
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(readFileCallId, "read_file", {
+            path: "large-result.txt",
+          });
+        case 1: {
+          const output = toolResultOutput(body, readFileCallId);
+          const match = output.match(
+            /<tool_result_handle>([^<]+)<\/tool_result_handle>/,
+          );
+          canonicalHandle = match?.[1] ?? "";
+          expect(canonicalHandle.endsWith(".txt")).toBe(true);
+          suffixlessHandle = canonicalHandle.slice(0, -4);
+          return fakeGatewayToolCall(readResultCallId, "read_tool_result", {
+            handle: suffixlessHandle,
+            query: needle,
+          });
+        }
+        case 2: {
+          const output = toolResultOutput(body, readResultCallId);
+          expect(output).toContain(needle);
+          expect(output).toContain(
+            `<tool_result_query handle="${canonicalHandle}">`,
+          );
+          return fakeGatewayFinalText("Suffixless result handle inspected.");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "Inspect the retained large result."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const sessionRoot = join(root.home, ".fx", "sessions", json.session_id);
+
+      expect(result.code).toBe(0);
+      expect(json.error).toBeUndefined();
+      expect(json.output).toContain("Suffixless result handle inspected.");
+      expect(gateway.requestCount()).toBe(3);
+      expect(json.tool_calls).toContainEqual({ name: "read_file", status: "success" });
+      expect(json.tool_calls).toContainEqual({
+        name: "read_tool_result",
+        status: "success",
+      });
+      expect(existsSync(join(sessionRoot, "tool-results", canonicalHandle))).toBe(true);
+      const sessionEvents = readFileSync(join(sessionRoot, "events.jsonl"), "utf8");
+      expect(sessionEvents).toContain(suffixlessHandle);
+      expect(sessionEvents).toContain(canonicalHandle);
+      expect(sessionEvents).toContain(needle);
+      expect(result.stderr).not.toContain("ResultHandleNotFound");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("no-save terminal timeout returns a readable process-scoped replay handle", async () => {
+    const root = createFixtureRoot("terminal-timeout-replay");
+    const tracePath = join(root.root, "trace.log");
+    const markerPath = join(root.workspace, "must-not-run.txt");
+    const childPidPath = join(root.workspace, "timeout-child.pid");
+    const invalidCallId = "terminal_missing_timeout_1";
+    const timeoutCallId = "terminal_timeout_1";
+    const readCallId = "terminal_replay_read_1";
+    let step = 0;
+    let replayHandle = "";
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(invalidCallId, "terminal", {
+            action: "exec",
+            command: "printf should-not-run > must-not-run.txt",
+            timeout_ms: undefined,
+          });
+        case 1: {
+          const correction = toolResultOutput(body, invalidCallId);
+          expect(correction).toContain("missing_fields");
+          expect(correction).toContain("timeout_ms");
+          expect(existsSync(markerPath)).toBe(false);
+          return fakeGatewayToolCall(timeoutCallId, "terminal", {
+            action: "exec",
+            command: `sleep 30 & child=$!; printf '%s' "$child" > ${JSON.stringify(childPidPath)}; printf 'PRE-TIMEOUT-OUT\\n'; wait "$child"`,
+            profile: "clean",
+            timeout_ms: 500,
+          });
+        }
+        case 2: {
+          const timedOut = toolResultOutput(body, timeoutCallId);
+          expect(timedOut).toContain("timeout=true");
+          const match = timedOut.match(
+            /<command_output_handle>([^<]+)<\/command_output_handle>/,
+          );
+          replayHandle = match?.[1] ?? "";
+          expect(replayHandle).not.toBe("");
+          return fakeGatewayToolCall(readCallId, "read_tool_result", {
+            handle: replayHandle,
+            query: "PRE-TIMEOUT-OUT",
+          });
+        }
+        case 3:
+          expect(toolResultOutput(body, readCallId)).toContain("PRE-TIMEOUT-OUT");
+          return fakeGatewayFinalText("Timeout replay inspected.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const startedAt = Date.now();
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the timeout fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const elapsedMs = Date.now() - startedAt;
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Timeout replay inspected.");
+      expect(gateway.requestCount()).toBe(4);
+      expect(elapsedMs).toBeLessThan(5_000);
+      expect(existsSync(markerPath)).toBe(false);
+      expect(existsSync(join(root.home, ".fx", "sessions"))).toBe(false);
+      const childPid = Number.parseInt(readFileSync(childPidPath, "utf8"), 10);
+      expect(Number.isInteger(childPid)).toBe(true);
+      await waitForProcessExit(childPid);
+      expect(isProcessAlive(childPid)).toBe(false);
+
+      const expiredCallId = "expired_replay_read_1";
+      const expiredResponses = [
+        fakeGatewayToolCall(expiredCallId, "read_tool_result", {
+          handle: replayHandle,
+          start_byte: 1,
+          byte_count: 1024,
+        }),
+        fakeGatewayFinalText("Expired replay handled."),
+      ];
+      const expiredGateway = startGateway(() =>
+        expiredResponses.shift() ?? new Response("unexpected request", { status: 500 })
+      );
+      try {
+        const expired = await runFx(
+          ["ask", "--json", "--yolo", "--no-save", "Read the prior replay."],
+          {
+            cwd: root.workspace,
+            env: fixtureEnv(root, expiredGateway, tracePath),
+            timeoutMs: 15_000,
+          },
+        );
+        expect(expired.code).toBe(0);
+        expect(expiredGateway.requestCount()).toBe(2);
+        expect(
+          toolResultOutput(expiredGateway.requests[1]!.body, expiredCallId),
+        ).toContain("ResultHandleNotFound");
+      } finally {
+        expiredGateway.stop();
+      }
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("terminal timeout prevents the default user shell from evaluating trailing statements", async () => {
+    const root = createFixtureRoot("terminal-timeout-stops-trailing-statements");
+    const tracePath = join(root.root, "trace.log");
+    const effectPath = join(root.workspace, "post-timeout-effect.txt");
+    const timeoutCallId = "terminal_timeout_stops_trailing_1";
+    const readCallId = "terminal_timeout_stops_trailing_read_1";
+    const trailingMarker = "POST-TIMEOUT-SHOULD-NOT-RUN";
+    let step = 0;
+    let replayHandle = "";
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(timeoutCallId, "terminal", {
+            action: "exec",
+            command: `printf 'PRE-TIMEOUT\n'; sleep 2; printf '${trailingMarker}\n'; printf '${trailingMarker}' > ${JSON.stringify(effectPath)}`,
+            timeout_ms: 500,
+          });
+        case 1: {
+          const timedOut = toolResultOutput(body, timeoutCallId);
+          expect(timedOut).toContain("timeout=true");
+          expect(existsSync(effectPath)).toBe(false);
+          const match = timedOut.match(
+            /<command_output_handle>([^<]+)<\/command_output_handle>/,
+          );
+          replayHandle = match?.[1] ?? "";
+          expect(replayHandle).not.toBe("");
+          return fakeGatewayToolCall(readCallId, "read_tool_result", {
+            handle: replayHandle,
+            query: trailingMarker,
+          });
+        }
+        case 2: {
+          const replay = toolResultOutput(body, readCallId);
+          expect(replay).toContain("(no matches)");
+          expect(replay).not.toContain(`[stdout]\n${trailingMarker}`);
+          return fakeGatewayFinalText("Post-timeout statements were blocked.");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the strict timeout fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Post-timeout statements were blocked.");
+      expect(gateway.requestCount()).toBe(3);
+      expect(existsSync(effectPath)).toBe(false);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "command termination requested source=timeout",
+      );
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("terminal timeout reaps a descendant that escapes with setsid", async () => {
+    const root = createFixtureRoot("terminal-timeout-reaps-setsid");
+    const tracePath = join(root.root, "trace.log");
+    const pidPath = join(root.workspace, "escaped-timeout.pid");
+    const timeoutCallId = "terminal_timeout_reaps_setsid_1";
+    const command = [
+      "python3 -c 'import os,time",
+      "pid=os.fork()",
+      "if pid == 0:",
+      " os.setsid()",
+      " null=os.open(\"/dev/null\",os.O_RDWR)",
+      " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)",
+      ` open(${JSON.stringify(pidPath)},\"w\").write(str(os.getpid()))`,
+      " time.sleep(30)",
+      "else:",
+      " while True: time.sleep(1)'",
+    ].join("\n");
+    let step = 0;
+    let escapedPid: number | null = null;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(timeoutCallId, "terminal", {
+            action: "exec",
+            command,
+            timeout_ms: 2_000,
+          });
+        case 1: {
+          const timedOut = toolResultOutput(body, timeoutCallId);
+          expect(timedOut).toContain("timeout=true");
+          expect(existsSync(pidPath)).toBe(true);
+          escapedPid = Number.parseInt(readFileSync(pidPath, "utf8"), 10);
+          expect(Number.isSafeInteger(escapedPid) && escapedPid > 0).toBe(true);
+          expect(isProcessAlive(escapedPid)).toBe(false);
+          return fakeGatewayFinalText("Escaped descendant was reaped.");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the setsid timeout fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Escaped descendant was reaped.");
+      expect(gateway.requestCount()).toBe(2);
+    } finally {
+      if (escapedPid !== null && isProcessAlive(escapedPid)) {
+        try {
+          process.kill(escapedPid, "SIGKILL");
+        } catch {}
+      }
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("terminal timeout reaps env-cleared Bash double-fork descendants", async () => {
+    const root = createFixtureRoot("terminal-timeout-reaps-env-bash-descendants");
+    const tracePath = join(root.root, "trace.log");
+    const pidPath = join(root.workspace, "escaped-timeout.pids");
+    const effectPath = join(root.workspace, "post-timeout-effect.txt");
+    const scriptPath = join(root.workspace, "spawn-descendants.sh");
+    const timeoutCallId = "terminal_timeout_reaps_env_bash_1";
+    const trailingMarker = "POST_TIMEOUT_BASH_STATEMENT_MUST_NOT_RUN";
+    const descendantCount = 8;
+    const readEscapedPids = (): number[] => {
+      if (!existsSync(pidPath)) return [];
+      return readFileSync(pidPath, "utf8")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .map(Number);
+    };
+    const python = [
+      "import os,sys,time",
+      "pid_path=sys.argv[1]",
+      `count=${descendantCount}`,
+      "for _ in range(count):",
+      " pid=os.fork()",
+      " if pid == 0:",
+      "  os.setsid()",
+      "  grandchild=os.fork()",
+      "  if grandchild > 0: os._exit(0)",
+      "  with open(pid_path, 'a') as output:",
+      "   output.write(str(os.getpid())+'\\n')",
+      "   output.flush()",
+      "  null=os.open('/dev/null',os.O_RDWR)",
+      "  os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)",
+      "  time.sleep(30)",
+      "  os._exit(0)",
+      "while True: time.sleep(1)",
+    ].join("\n");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+/usr/bin/python3 - ${JSON.stringify(pidPath)} <<'PY'
+${python}
+PY
+printf '%s\\n' ${JSON.stringify(trailingMarker)}
+printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
+`,
+    );
+    chmodSync(scriptPath, 0o700);
+    const command =
+      `/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash ${JSON.stringify(scriptPath)}`;
+    let step = 0;
+    let escapedPids: number[] = [];
+    let timeoutOutput = "";
+    let aliveAtResult: number[] = [];
+    let effectExistedAtResult = false;
+    let gatewayObservationError: unknown;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(timeoutCallId, "terminal", {
+            action: "exec",
+            command,
+            timeout_ms: 2_000,
+          });
+        case 1: {
+          try {
+            timeoutOutput = toolResultOutput(body, timeoutCallId);
+            escapedPids = readEscapedPids();
+            aliveAtResult = escapedPids.filter(isProcessAlive);
+            effectExistedAtResult = existsSync(effectPath);
+          } catch (error) {
+            gatewayObservationError = error;
+          }
+          return fakeGatewayFinalText("Combined timeout cleanup complete.");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the combined timeout fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      if (result.code !== 0) {
+        const trace = existsSync(tracePath)
+          ? readFileSync(tracePath, "utf8").slice(-4_000)
+          : "(trace missing)";
+        throw new Error(
+          `fx ask exited ${result.code}; signal=${result.signal}; timed_out=${result.timedOut}; kill_sent=${result.killSent}; elapsed_ms=${result.elapsedMs}; pid=${result.pid}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}\nprocess_at_timeout:\n${result.processStateAtTimeout}\nprocess_after_close:\n${result.processStateAfterClose}\ntrace:\n${trace}`,
+        );
+      }
+      const json = parseAskJson(result.stdout);
+
+      expect(json.output).toContain("Combined timeout cleanup complete.");
+      expect(gateway.requestCount()).toBe(2);
+      if (gatewayObservationError) throw gatewayObservationError;
+      expect(timeoutOutput).toContain("timeout=true");
+      expect(timeoutOutput).toContain(
+        "cleanup_scope=process_group_and_tracked_descendants",
+      );
+      expect(timeoutOutput).toContain("cleanup_guarantee=best_effort");
+      expect(escapedPids).toHaveLength(descendantCount);
+      expect(new Set(escapedPids).size).toBe(descendantCount);
+      for (const pid of escapedPids) {
+        expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+      }
+      expect(aliveAtResult).toEqual([]);
+      expect(effectExistedAtResult).toBe(false);
+      expect(existsSync(effectPath)).toBe(false);
+      expect(timeoutOutput).not.toContain(trailingMarker);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "command termination requested source=timeout",
+      );
+
+      const later = await runFx(["help"], {
+        cwd: root.workspace,
+        env: {
+          HOME: root.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_E2E_DISABLE_DOTENV: "1",
+        },
+      });
+      expect(later.code).toBe(0);
+      expect(later.stdout).not.toBe("");
+      expect(later.stderr).toBe("");
+    } finally {
+      try {
+        const cleanupPids = [...new Set([...escapedPids, ...readEscapedPids()])]
+          .filter((pid) => Number.isSafeInteger(pid) && pid > 0);
+        for (const pid of cleanupPids) {
+          if (!isProcessAlive(pid)) continue;
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {}
+        }
+        const cleanupDeadline = Date.now() + 5_000;
+        while (
+          cleanupPids.some(isProcessAlive) &&
+          Date.now() < cleanupDeadline
+        ) {
+          await Bun.sleep(25);
+        }
+        const cleanupSurvivors = cleanupPids.filter(isProcessAlive);
+        if (cleanupSurvivors.length > 0) {
+          throw new Error(
+            `timeout test cleanup left live descendants: ${cleanupSurvivors.join(",")}`,
+          );
+        }
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }
+  }, 30_000);
+
+  test("saved terminal replay handle remains readable after resume without re-execution", async () => {
+    const root = createFixtureRoot("saved-terminal-replay");
+    const firstTracePath = join(root.root, "first-trace.log");
+    const resumeTracePath = join(root.root, "resume-trace.log");
+    const executionsPath = join(root.workspace, "executions.txt");
+    const commandCallId = "saved_terminal_command_1";
+    const readCallId = "saved_terminal_read_1";
+    let replayHandle = "";
+    const firstResponses = [
+      fakeGatewayToolCall(commandCallId, "terminal", {
+        action: "exec",
+        command: "printf 'run\\n' >> executions.txt; printf 'SAVED-REPLAY-NEEDLE\\n'",
+        profile: "clean",
+        timeout_ms: 600_000,
+      }),
+      (body: string) => {
+        const commandOutput = toolResultOutput(body, commandCallId);
+        const match = commandOutput.match(
+          /<command_output_handle>([^<]+)<\/command_output_handle>/,
+        );
+        replayHandle = match?.[1] ?? "";
+        expect(replayHandle).not.toBe("");
+        return fakeGatewayToolCall(readCallId, "read_tool_result", {
+          handle: replayHandle,
+          query: "SAVED-REPLAY-NEEDLE",
+        });
+      },
+      (body: string) => {
+        expect(toolResultOutput(body, readCallId)).toContain("SAVED-REPLAY-NEEDLE");
+        return fakeGatewayFinalText("Saved replay inspected.");
+      },
+    ];
+    const firstGateway = startGateway((body) => {
+      const response = firstResponses.shift();
+      if (!response) return new Response("unexpected request", { status: 500 });
+      return typeof response === "function" ? response(body) : response;
+    });
+
+    try {
+      const first = await runFx(
+        ["ask", "--json", "--yolo", "Run the saved replay fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, firstGateway, firstTracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const firstJson = parseAskJson(first.stdout);
+      expect(first.code).toBe(0);
+      expect(firstJson.output).toContain("Saved replay inspected.");
+      expect(firstJson.session_id).not.toBe("");
+      expect(readFileSync(executionsPath, "utf8")).toBe("run\n");
+
+      const resumedReadCallId = "saved_terminal_resume_read_1";
+      const resumeResponses = [
+        fakeGatewayToolCall(resumedReadCallId, "read_tool_result", {
+          handle: replayHandle,
+          query: "SAVED-REPLAY-NEEDLE",
+        }),
+        (body: string) => {
+          expect(toolResultOutput(body, resumedReadCallId)).toContain(
+            "SAVED-REPLAY-NEEDLE",
+          );
+          return fakeGatewayFinalText("Resumed replay inspected.");
+        },
+      ];
+      const resumeGateway = startGateway((body) => {
+        const response = resumeResponses.shift();
+        if (!response) return new Response("unexpected request", { status: 500 });
+        return typeof response === "function" ? response(body) : response;
+      });
+      try {
+        const resumed = await runFx(
+          [
+            "ask",
+            "--json",
+            "--yolo",
+            "--resume-id",
+            firstJson.session_id,
+            "Read the saved replay again.",
+          ],
+          {
+            cwd: root.workspace,
+            env: fixtureEnv(root, resumeGateway, resumeTracePath),
+            timeoutMs: 15_000,
+          },
+        );
+        expect(resumed.code).toBe(0);
+        expect(parseAskJson(resumed.stdout).output).toContain(
+          "Resumed replay inspected.",
+        );
+        expect(readFileSync(executionsPath, "utf8")).toBe("run\n");
+      } finally {
+        resumeGateway.stop();
+      }
+    } finally {
+      firstGateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("SIGKILL leaves no named no-save replay output", async () => {
+    const root = createFixtureRoot("no-save-replay-sigkill");
+    const tracePath = join(root.root, "trace.log");
+    const before = new Set(
+      readdirSync("/tmp").filter((name) =>
+        name.startsWith(".fx-command-replay-")
+      ),
+    );
+    const gateway = startGateway(() =>
+      fakeGatewayToolCall("no_save_sigkill_1", "terminal", {
+        action: "exec",
+        command:
+          "awk 'BEGIN { for (i = 0; i < 100000; i++) printf \"x\"; printf \"\\n\" }'; sleep 30",
+        profile: "clean",
+        timeout_ms: 600_000,
+      })
+    );
+    const proc = Bun.spawn(
+      [FX_BIN, "ask", "--yolo", "--no-save", "Run the crash cleanup fixture."],
+      {
+        cwd: root.workspace,
+        env: {
+          ...fixtureEnv(root, gateway, tracePath),
+          FX_TRACE_SCOPES: "agent,core,gateway,stream,session",
+        },
+        stdout: "ignore",
+        stderr: "pipe",
+      },
+    );
+
+    try {
+      const deadline = Date.now() + 10_000;
+      while (
+        Date.now() < deadline &&
+        (!existsSync(tracePath) ||
+          !readFileSync(tracePath, "utf8").includes(
+            "command replay ephemeral backing opened",
+          ))
+      ) {
+        await Bun.sleep(25);
+      }
+      expect(existsSync(tracePath)).toBe(true);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "command replay ephemeral backing opened",
+      );
+
+      proc.kill("SIGKILL");
+      await proc.exited;
+      await Bun.sleep(50);
+      const after = readdirSync("/tmp").filter((name) =>
+        name.startsWith(".fx-command-replay-") && !before.has(name)
+      );
+      expect(after).toEqual([]);
+      expect(existsSync(join(root.home, ".fx", "sessions"))).toBe(false);
+    } finally {
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test.skipIf(process.platform !== "linux")(
+    "a second headless terminal exec survives replacing the running fx binary",
+    async () => {
+      const root = createFixtureRoot("headless-reexec-after-rebuild");
+      const tracePath = join(root.root, "trace.log");
+      const liveBin = join(root.root, "fx");
+      const replacementBin = join(root.root, "fx.next");
+      const parentExePath = join(root.root, "parent-exe.txt");
+      const firstHelperPidPath = join(root.root, "first-helper.pid");
+      const secondHelperPidPath = join(root.root, "second-helper.pid");
+      const firstCallId = "headless_reexec_replace_1";
+      const secondCallId = "headless_reexec_after_replace_2";
+
+      copyFileSync(FX_BIN, liveBin);
+      chmodSync(liveBin, 0o755);
+      copyFileSync("/bin/sh", replacementBin);
+      chmodSync(replacementBin, 0o755);
+
+      let fxPid: number | null = null;
+      let responseIndex = 0;
+      const gateway = startGateway(() => {
+        switch (responseIndex++) {
+          case 0:
+            if (fxPid === null) {
+              return new Response("fx pid unavailable", { status: 500 });
+            }
+            return fakeGatewayToolCall(firstCallId, "terminal", {
+              action: "exec",
+              timeout_ms: 600_000,
+              command: [
+                `printf '%s\\n' "$PPID" > ${JSON.stringify(firstHelperPidPath)}`,
+                `mv -f ${JSON.stringify(replacementBin)} ${JSON.stringify(liveBin)}`,
+                `readlink ${JSON.stringify(`/proc/${fxPid}/exe`)} > ${JSON.stringify(parentExePath)}`,
+                "printf 'first-terminal-exec-ok\\n'",
+              ].join("; "),
+            });
+          case 1:
+            return fakeGatewayToolCall(secondCallId, "terminal", {
+              action: "exec",
+              timeout_ms: 600_000,
+              command: [
+                `printf '%s\\n' "$PPID" > ${JSON.stringify(secondHelperPidPath)}`,
+                "printf 'second-terminal-exec-ok\\n'",
+              ].join("; "),
+            });
+          case 2:
+            return fakeGatewayFinalText("Both terminal commands completed.");
+          default:
+            return new Response("unexpected request", { status: 500 });
+        }
+      });
+      const proc = Bun.spawn([
+        liveBin,
+        "ask",
+        "--json",
+        "--yolo",
+        "--no-save",
+        "Run both terminal commands.",
+      ], {
+        cwd: root.workspace,
+        env: {
+          ...process.env,
+          ...fixtureEnv(root, gateway, tracePath),
+          FX_AUTO_UPGRADE: "0",
+        },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      fxPid = proc.pid;
+
+      try {
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+        const json = parseAskJson(stdout);
+        const firstOutput = toolResultOutput(
+          gateway.requests[1]!.body,
+          firstCallId,
+        );
+        const secondOutput = toolResultOutput(
+          gateway.requests[2]!.body,
+          secondCallId,
+        );
+
+        expect(exitCode).toBe(0);
+        expect(json.error).toBeUndefined();
+        expect(json.tool_calls).toEqual([
+          expect.objectContaining({ name: "terminal", status: "success" }),
+          expect.objectContaining({ name: "terminal", status: "success" }),
+        ]);
+        expect(gateway.requestCount()).toBe(3);
+        expect(firstOutput).toContain("first-terminal-exec-ok");
+        expect(secondOutput).toContain("second-terminal-exec-ok");
+        expect(readFileSync(parentExePath, "utf8").trim()).toBe(
+          `${liveBin} (deleted)`,
+        );
+        expect(
+          [stdout, stderr, firstOutput, secondOutput, readFileSync(tracePath, "utf8")]
+            .join("\n"),
+        ).not.toContain("FileNotFound");
+
+        const firstHelperPid = Number.parseInt(
+          readFileSync(firstHelperPidPath, "utf8"),
+          10,
+        );
+        const secondHelperPid = Number.parseInt(
+          readFileSync(secondHelperPidPath, "utf8"),
+          10,
+        );
+        expect(Number.isSafeInteger(firstHelperPid) && firstHelperPid > 0).toBe(
+          true,
+        );
+        expect(Number.isSafeInteger(secondHelperPid) && secondHelperPid > 0).toBe(
+          true,
+        );
+        await waitForProcessExit(firstHelperPid, 3_000);
+        await waitForProcessExit(secondHelperPid, 3_000);
+      } finally {
+        proc.kill("SIGKILL");
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
   test("SIGTERM drains an active headless terminal command without panic or survivors", async () => {
     const root = createFixtureRoot("headless-sigterm");
     const tracePath = join(root.root, "trace.log");
@@ -2648,6 +3765,7 @@ describe("gateway stream lifecycle", () => {
       fakeGatewayToolCall("headless_sigterm_1", "terminal", {
         action: "exec",
         command,
+        timeout_ms: 600_000,
       })
     );
     const proc = Bun.spawn([
@@ -2714,6 +3832,120 @@ describe("gateway stream lifecycle", () => {
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 20_000);
+
+  test("saved SIGINT retains cancelled terminal output for resume without re-execution", async () => {
+    const root = createFixtureRoot("saved-cancelled-terminal-replay");
+    const firstTracePath = join(root.root, "first-trace.log");
+    const resumeTracePath = join(root.root, "resume-trace.log");
+    const readyPath = join(root.workspace, "cancelled-command.ready");
+    const executionsPath = join(root.workspace, "cancelled-executions.txt");
+    const commandCallId = "saved_cancelled_terminal_1";
+    const readCallId = "saved_cancelled_replay_read_1";
+    const command = [
+      "printf 'run\\n' >> cancelled-executions.txt",
+      "printf 'CANCELLED-REPLAY-NEEDLE\\n'",
+      `printf ready > ${JSON.stringify(readyPath)}`,
+      "trap 'exit 0' TERM",
+      "while :; do sleep 1; done",
+    ].join("; ");
+    let phase: "initial" | "resume" = "initial";
+    let resumeStep = 0;
+    let replayHandle = "";
+    const gateway = startGateway((body) => {
+      if (phase === "initial") {
+        return fakeGatewayToolCall(commandCallId, "terminal", {
+          action: "exec",
+          command,
+          profile: "clean",
+          timeout_ms: 600_000,
+        });
+      }
+      if (resumeStep++ === 0) {
+        const replayMatches = [
+          ...body.matchAll(
+            /<command_output_handle>([^<]+)<\/command_output_handle>/g,
+          ),
+        ];
+        expect(replayMatches).toHaveLength(1);
+        replayHandle = replayMatches[0]?.[1] ?? "";
+        expect(replayHandle).not.toBe("");
+        return fakeGatewayToolCall(readCallId, "read_tool_result", {
+          handle: replayHandle,
+          query: "CANCELLED-REPLAY-NEEDLE",
+        });
+      }
+      expect(toolResultOutput(body, readCallId)).toContain(
+        "CANCELLED-REPLAY-NEEDLE",
+      );
+      return fakeGatewayFinalText("Cancelled replay inspected after resume.");
+    });
+    const proc = Bun.spawn(
+      [FX_BIN, "ask", "--json", "--yolo", "Run the cancellable command fixture."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, firstTracePath),
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+
+    try {
+      const startDeadline = Date.now() + 10_000;
+      while (!existsSync(readyPath)) {
+        if (Date.now() >= startDeadline) {
+          throw new Error("cancellable terminal command did not start");
+        }
+        await Bun.sleep(10);
+      }
+      proc.kill("SIGINT");
+      const exitCode = await proc.exited;
+      const stderr = await new Response(proc.stderr).text();
+      expect(exitCode).toBe(130);
+      expect(proc.signalCode).toBe("SIGINT");
+      expect(stderr).not.toContain("panic: reached unreachable code");
+
+      const latest = await runFx(["session", "last", "--json"], {
+        cwd: root.workspace,
+        env: { HOME: root.home },
+      });
+      expect(latest.code).toBe(0);
+      const sessionId = JSON.parse(latest.stdout).id as string;
+      const sessionRoot = join(root.home, ".fx", "sessions", sessionId);
+      expect(
+        readdirSync(join(sessionRoot, "logs", "commands")).filter((name) =>
+          name.endsWith(".bin")
+        ),
+      ).toHaveLength(1);
+
+      phase = "resume";
+      const resumed = await runFx(
+        [
+          "ask",
+          "--json",
+          "--yolo",
+          "--resume-id",
+          sessionId,
+          "Inspect the cancelled command output.",
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, resumeTracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      expect(resumed.code).toBe(0);
+      expect(parseAskJson(resumed.stdout).output).toContain(
+        "Cancelled replay inspected after resume.",
+      );
+      expect(readFileSync(executionsPath, "utf8")).toBe("run\n");
+      expect(gateway.requestCount()).toBe(3);
+    } finally {
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test(
     "nine saved turns stay canonical while the next request uses bounded context",
@@ -3441,6 +4673,7 @@ describe("gateway stream lifecycle", () => {
       if (responseIndex++ === 0) {
         return fakeGatewayToolCall("prompt_too_long_tool_1", "terminal", {
           action: "exec",
+          timeout_ms: 600_000,
           command: `printf 'once\\n' >> '${sideEffectPath}'`,
         });
       }
@@ -3489,12 +4722,11 @@ describe("gateway stream lifecycle", () => {
     const broadSearchCallId = "mcp_search_broad_1";
     const selectCallId = "mcp_select_lazy_1";
     const responses = [
-      fakeGatewayToolCall(searchCallId, "mcp_search_tools", {
-        query: "fixture echo",
+      fakeGatewayToolCall(searchCallId, "capability_search", {
+        query: "fixture input public",
       }),
-      fakeGatewayToolCall(broadSearchCallId, "mcp_search_tools", {
+      fakeGatewayToolCall(broadSearchCallId, "capability_search", {
         query: "fixture",
-        limit: 20,
       }),
       fakeGatewayToolCall(selectCallId, "mcp_select_tool", {
         name: DYNAMIC_MCP_TOOL_NAME,
@@ -3510,7 +4742,7 @@ describe("gateway stream lifecycle", () => {
       requestIndex += 1;
       return responses.shift() ?? new Response("unexpected request", { status: 500 });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
     try {
@@ -3540,7 +4772,7 @@ describe("gateway stream lifecycle", () => {
       expect(existsSync(mcp.readyPath)).toBe(true);
 
       const searchOutput = toolResultOutput(gateway.requests[1]!.body, searchCallId);
-      const searchTools = JSON.stringify(JSON.parse(searchOutput).tools);
+      const searchTools = JSON.stringify(JSON.parse(searchOutput).mcp_tools);
       expect(searchOutput).toContain(DYNAMIC_MCP_TOOL_NAME);
       expect(searchTools).not.toContain("inputSchema");
       expect(searchTools).not.toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");
@@ -3549,8 +4781,8 @@ describe("gateway stream lifecycle", () => {
       const broadSearchOutput = JSON.parse(
         toolResultOutput(gateway.requests[2]!.body, broadSearchCallId),
       );
-      expect(broadSearchOutput.count).toBe(20);
-      expect(broadSearchOutput.more_available).toBe(true);
+      expect(broadSearchOutput.counts.mcp_tools).toBe(8);
+      expect(broadSearchOutput.more_available.mcp_tools).toBe(true);
 
       const selectedRequest = gatewayRequest(gateway.requests[3]!.body);
       const selectedTool = selectedRequest.tools.find((tool) =>
@@ -3668,7 +4900,7 @@ describe("gateway stream lifecycle", () => {
         },
       });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
     try {
@@ -3760,7 +4992,7 @@ describe("gateway stream lifecycle", () => {
         },
       });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
     try {
@@ -4166,7 +5398,7 @@ describe("gateway stream lifecycle", () => {
       }
       return new Response("unexpected matrix request", { status: 500 });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
 
@@ -4267,8 +5499,8 @@ describe("gateway stream lifecycle", () => {
     }
   }, 90_000);
 
-  test("selected dynamic MCP automatic review asks with zero sends and allows exactly once", async () => {
-    for (const decision of ["ask", "allow"] as const) {
+  test("selected dynamic MCP review cautions with zero sends and clears exactly once", async () => {
+    for (const decision of ["caution", "clear"] as const) {
       const root = createFixtureRoot(`mcp-review-${decision}`);
       const tracePath = join(root.root, "trace.log");
       const mcp = writeMcpFixture(root);
@@ -4308,29 +5540,29 @@ describe("gateway stream lifecycle", () => {
         expect(gateway.classifierRequests[0]!.body).toContain(DYNAMIC_MCP_TOOL_NAME);
         expect(gateway.classifierRequests[0]!.body).toContain("exact-");
         expect(gateway.classifierRequests[0]!.body).toContain("inputSchema");
-        if (decision === "ask") {
-          // Headless automatic review returns a recoverable denial to the
+        if (decision === "caution") {
+          // Headless automatic review returns caution advice to the
           // primary model without executing the MCP tool or asking the user.
           expect(result.code).toBe(0);
           expect(gateway.requests).toHaveLength(3);
-          expect(gateway.requests[2]!.body).toContain("tool_permission_denied");
-          expect(gateway.requests[2]!.body).toContain("auto_denied");
+          expect(gateway.requests[2]!.body).toContain("tool_review_held");
+          expect(gateway.requests[2]!.body).toContain("review_caution");
           expect(gateway.requests[2]!.body).not.toContain("user_denied");
           const json = parseAskJson(result.stdout);
-          expect(json.output).toContain("MCP ask handled.");
+          expect(json.output).toContain("MCP caution handled.");
           expect(json.tool_calls).toContainEqual({
             name: DYNAMIC_MCP_TOOL_NAME,
             status: "error",
           });
           expect(result.stdout).not.toContain("NonInteractivePermissionRequired");
           expect(trace).toContain("event=auto_review_result");
-          expect(trace).toContain("decision=ask");
+          expect(trace).toContain("decision=caution");
           expect(trace).not.toContain("err=NonInteractivePermissionRequired");
           expect(existsSync(mcp.callLogPath)).toBe(false);
         } else {
           expect(result.code).toBe(0);
           const json = parseAskJson(result.stdout);
-          expect(trace).toContain("decision=allow");
+          expect(trace).toContain("decision=clear");
           expect(readFileSync(mcp.callLogPath, "utf8").trim().split("\n")).toHaveLength(1);
           expect(json.tool_calls).toContainEqual({
             name: DYNAMIC_MCP_TOOL_NAME,
@@ -4462,7 +5694,7 @@ describe("gateway stream lifecycle", () => {
     const sentinelPath = join(root.workspace, "command-must-not-run.txt");
     const responses = [
       sse(
-        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"terminal","input":{"action":"exec","command":"printf executed > command-must-not-run.txt"}}\n\n' +
+        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"terminal","input":{"action":"exec","command":"printf executed > command-must-not-run.txt","timeout_ms":30000}}\n\n' +
           'data: {"type":"finish","finishReason":{"unified":"error","raw":"provider_error"}}\n\n' +
           "data: [DONE]\n\n",
       ),
@@ -4931,7 +6163,7 @@ describe("gateway stream lifecycle", () => {
     const sentinelPath = join(root.workspace, "command-must-not-run.txt");
     const gateway = startGateway(() =>
       sse(
-        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"terminal","input":{"action":"exec","command":"printf executed > command-must-not-run.txt"}}\n\n' +
+        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"terminal","input":{"action":"exec","command":"printf executed > command-must-not-run.txt","timeout_ms":30000}}\n\n' +
           'data: {"type":"finish","finishReason":{"unified":"","raw":"provider_error"}}\n\n' +
           "data: [DONE]\n\n",
       ),

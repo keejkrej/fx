@@ -14,7 +14,6 @@ const command_specs = @import("../slash_commands/command_specs.zig");
 const app_lua_runtime = @import("app_lua_runtime.zig");
 const app_code_viewer_runtime = @import("app_code_viewer_runtime.zig");
 const config_runtime = @import("../config/config_runtime.zig");
-const input_appearance = @import("../config/input_appearance.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const editor_state = @import("../input/editor_state.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
@@ -29,19 +28,19 @@ const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const app_mcp_runtime = @import("app_mcp_runtime.zig");
 const model_cache_runtime = @import("model_cache_runtime.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const session_commands = @import("../session/session_commands.zig");
 const usage_recovery = @import("../session/usage_recovery.zig");
+const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
 const usage_report = @import("../session/usage_report.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
-const presentation_mode = @import("../config/presentation_mode.zig");
 const transcript_blocks = @import("../../ui/render_engine/transcript_blocks.zig");
 const ui_subagents = @import("../../ui/subagent/runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
@@ -127,6 +126,39 @@ fn formatMcpPublishedReload(
         try out.writer.print("'{s}'", .{name});
     }
     try out.writer.writeAll(". Run /mcp list for details.");
+    return out.toOwnedSlice();
+}
+
+fn formatMcpIssuerMismatch(
+    alloc: std.mem.Allocator,
+    server_name: []const u8,
+    mismatch: mcp_auth.IssuerMismatch,
+) ![]u8 {
+    var expected = try text_utils.encodeTerminalSafe(alloc, mismatch.expected, 1024);
+    defer expected.deinit(alloc);
+    var returned = try text_utils.encodeTerminalSafe(alloc, mismatch.returned, 1024);
+    defer returned.deinit(alloc);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.print("MCP authentication for '{s}' was rejected: expected issuer ", .{server_name});
+    try std.json.Stringify.value(expected.bytes, .{}, &out.writer);
+    switch (mismatch.source) {
+        .authorization_metadata => {
+            try out.writer.writeAll(" but metadata returned ");
+            try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
+            try out.writer.writeAll(". Add \"oauth\":{\"issuer\":");
+            try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
+            try out.writer.writeAll("} to this server's entry in ~/.fx/mcp.json and retry.");
+        },
+        .authorization_response => {
+            try out.writer.writeAll(" but the authorization response returned issuer ");
+            try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
+            try out.writer.writeAll(
+                ". fx stopped before token exchange. Contact the MCP server provider; changing oauth.issuer is not a safe workaround.",
+            );
+        },
+    }
     return out.toOwnedSlice();
 }
 
@@ -333,7 +365,6 @@ pub fn Handlers(comptime App: type) type {
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
-                .show_models = commandShowModels,
                 .handle_permissions = commandHandlePermissions,
                 .handle_allowlist = commandHandleAllowlist,
                 .show_stats = commandShowStats,
@@ -350,8 +381,6 @@ pub fn Handlers(comptime App: type) type {
                 .show_credits = commandShowCredits,
                 .paste_clipboard = commandPasteClipboard,
                 .toggle_fast = commandToggleFast,
-                .handle_appearance = commandHandleAppearance,
-                .handle_sandbox = commandHandleSandbox,
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
@@ -413,6 +442,17 @@ pub fn Handlers(comptime App: type) type {
                 },
                 .failed => |err| failed: {
                     warning = true;
+                    if (err == error.McpAuthorityReducedReloadFailed) {
+                        debug_trace.logf(
+                            "mcp",
+                            "authority-reducing reload left MCP unavailable",
+                            .{},
+                        );
+                        break :failed try app.alloc.dupe(
+                            u8,
+                            "MCP configuration could not be reloaded after project authority was reduced. MCP is unavailable; check the configuration and run /mcp reload.",
+                        );
+                    }
                     debug_trace.logf(
                         "mcp",
                         "profile reload retained current runtime err={s}",
@@ -430,6 +470,81 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (warning) .warning else .neutral,
                 .body = body,
             }, true);
+            if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
+                try app.presentProjectMcpPrompt();
+            }
+        }
+
+        pub fn collectMcpAuthenticationFacts(app: *App) !void {
+            if (comptime !@hasDecl(App, "takeMcpAuthenticationCompletion")) return;
+            var completion = (try app.takeMcpAuthenticationCompletion()) orelse return;
+            defer completion.deinit(app.alloc);
+
+            if (completion.result) |authentication| {
+                switch (authentication) {
+                    .authenticated => |authenticated| {
+                        const success = if (authenticated.repaired_entries == 0)
+                            try std.fmt.allocPrint(
+                                app.alloc,
+                                "Authenticated MCP server '{s}'.",
+                                .{completion.server_name},
+                            )
+                        else
+                            try std.fmt.allocPrint(
+                                app.alloc,
+                                "Authenticated MCP server '{s}'.\nRemoved {d} unreadable MCP credential {s}.",
+                                .{
+                                    completion.server_name,
+                                    authenticated.repaired_entries,
+                                    if (authenticated.repaired_entries == 1) "entry" else "entries",
+                                },
+                            );
+                        defer app.alloc.free(success);
+                        app.beginMcpReload() catch |err| {
+                            const body = try std.fmt.allocPrint(
+                                app.alloc,
+                                "{s}\nMCP configuration could not be reloaded. Your existing MCP servers are still active. Check the configuration and run /mcp list for details before trying again.",
+                                .{success},
+                            );
+                            defer app.alloc.free(body);
+                            debug_trace.logf("mcp", "profile reload retained current runtime err={s}", .{@errorName(err)});
+                            try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = body }, true);
+                            return;
+                        };
+                        const body = try std.fmt.allocPrint(
+                            app.alloc,
+                            "{s}\nMCP reconnection started. Your existing MCP servers will stay active while the new configuration is checked.",
+                            .{success},
+                        );
+                        defer app.alloc.free(body);
+                        try app.writeDomainNotice(.{ .topic = "mcp", .tone = .neutral, .body = body }, true);
+                    },
+                    .issuer_mismatch => |mismatch| {
+                        const body = try formatMcpIssuerMismatch(
+                            app.alloc,
+                            completion.server_name,
+                            mismatch,
+                        );
+                        defer app.alloc.free(body);
+                        try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = body }, true);
+                    },
+                }
+            } else |err| {
+                const body = if (err == error.Cancelled)
+                    try std.fmt.allocPrint(
+                        app.alloc,
+                        "MCP authentication for '{s}' was cancelled.",
+                        .{completion.server_name},
+                    )
+                else
+                    try std.fmt.allocPrint(
+                        app.alloc,
+                        "MCP authentication for '{s}' failed: {s}.",
+                        .{ completion.server_name, @errorName(err) },
+                    );
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = body }, true);
+            }
         }
 
         fn handleFeedback(app: *App) !void {
@@ -558,10 +673,10 @@ pub fn Handlers(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn commandLogin(ctx: *anyopaque, rest: []const u8) !void {
+        fn commandLogin(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "runLoginCommand")) {
-                try app.runLoginCommand(rest);
+                try app.runLoginCommand("");
             } else {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -635,15 +750,6 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleModel(ctx: *anyopaque, query: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try session_commands.Commands(App).handleModel(app, query);
-        }
-
-        fn commandShowModels(ctx: *anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            app.ensureModelCache();
-            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-            closeHelpMenuIfPresent(app);
-            try app.model_cache.openMenu();
-            app.shell.render_requests.request(.footer);
         }
 
         fn commandHandlePermissions(ctx: *anyopaque, rest: []const u8) !void {
@@ -919,6 +1025,10 @@ pub fn Handlers(comptime App: type) type {
             closeHelpMenuIfPresent(app);
             app.input_runtime.settings_menu.close();
             closeInlineCommandMenusIfPresent(app);
+            if (comptime @hasField(App, "usage_dashboard")) {
+                try openUsageDashboard(app, .days_30);
+                return;
+            }
             var usage = loadUsageSnapshot(app, .days_30) catch |err| {
                 debug_trace.logf(
                     "usage",
@@ -942,26 +1052,142 @@ pub fn Handlers(comptime App: type) type {
             app: *App,
             scope: usage_report.Scope,
         ) !void {
-            var usage = loadUsageSnapshot(app, scope) catch |err| {
-                debug_trace.logf(
-                    "usage",
-                    "usage dashboard refresh failed scope={s} reason={s}",
-                    .{ @tagName(scope), @errorName(err) },
-                );
-                try app.input_runtime.usage_menu.recordRefreshFailure(
-                    app.alloc,
-                    scope,
-                    "Local usage data is unavailable",
-                );
+            if (comptime @hasField(App, "usage_dashboard")) {
+                if (scope == .session) {
+                    var usage = loadUsageSnapshot(app, scope) catch |err| {
+                        try recordUsageRefreshFailure(app, scope, err);
+                        return;
+                    };
+                    errdefer usage.deinit(app.alloc);
+                    installUsageSnapshot(app, usage);
+                    return;
+                }
+                if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
+                    installUsageSnapshot(app, usage);
+                    return;
+                }
+                app.input_runtime.usage_menu.setLoadingScope(app.alloc, scope);
+                try requestUsageDashboardRefresh(app);
                 app.shell.render_requests.request(.footer);
+                return;
+            }
+            var usage = loadUsageSnapshot(app, scope) catch |err| {
+                try recordUsageRefreshFailure(app, scope, err);
                 return;
             };
             errdefer usage.deinit(app.alloc);
+            installUsageSnapshot(app, usage);
+        }
+
+        pub fn reloadUsageMenu(
+            app: *App,
+            scope: usage_report.Scope,
+        ) !void {
+            if (comptime !@hasField(App, "usage_dashboard")) {
+                try refreshUsageMenu(app, scope);
+                return;
+            }
+            if (scope == .session) {
+                try refreshUsageMenu(app, scope);
+                return;
+            }
+            app.input_runtime.usage_menu.requested_scope = scope;
+            requestUsageDashboardRefresh(app) catch |err| {
+                try recordUsageRefreshFailure(app, scope, err);
+                return;
+            };
+            app.shell.render_requests.request(.footer);
+        }
+
+        pub fn collectUsageDashboardFacts(app: *App) !bool {
+            if (comptime !@hasField(App, "usage_dashboard")) return false;
+            const transition = app.usage_dashboard.pollTransition();
+            if (transition == .none) return false;
+            if (!app.input_runtime.usage_menu.active or
+                app.input_runtime.usage_menu.navigationScope() == .session)
+            {
+                return false;
+            }
+            const scope = app.input_runtime.usage_menu.navigationScope();
+            if (transition == .failed) {
+                const err = app.usage_dashboard.lastError() orelse
+                    error.ProfileUsageUnavailable;
+                try recordUsageRefreshFailure(app, scope, err);
+                return true;
+            }
+            if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
+                installUsageSnapshot(app, usage);
+                return true;
+            }
+            const err = app.usage_dashboard.lastError() orelse
+                error.ProfileUsageUnavailable;
+            try recordUsageRefreshFailure(app, scope, err);
+            return true;
+        }
+
+        fn openUsageDashboard(
+            app: *App,
+            scope: usage_report.Scope,
+        ) !void {
+            const cached = try app.usage_dashboard.snapshot(app.alloc, scope);
+            if (cached) |usage| {
+                app.input_runtime.usage_menu.openOwned(app.alloc, usage);
+            } else {
+                app.input_runtime.usage_menu.openLoading(app.alloc, scope);
+            }
+            requestUsageDashboardRefresh(app) catch |err| {
+                try recordUsageRefreshFailure(app, scope, err);
+                return;
+            };
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn requestUsageDashboardRefresh(app: *App) !void {
+            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+            const availability = try app.session.ensureProfileUsageReadable(
+                app.alloc,
+                home,
+            );
+            if (availability == .unavailable) {
+                return app.session.profile_usage.lastError() orelse
+                    error.ProfileUsageUnavailable;
+            }
+            _ = try app.usage_dashboard.requestRefresh(
+                usage_dashboard_runtime.profileProvider(
+                    &app.session.profile_usage,
+                ),
+                home,
+                @max(io_mod.milliTimestamp(), 0),
+            );
+        }
+
+        fn installUsageSnapshot(
+            app: *App,
+            usage: usage_report.Snapshot,
+        ) void {
             if (app.input_runtime.usage_menu.active) {
                 app.input_runtime.usage_menu.replaceOwned(app.alloc, usage);
             } else {
                 app.input_runtime.usage_menu.openOwned(app.alloc, usage);
             }
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn recordUsageRefreshFailure(
+            app: *App,
+            scope: usage_report.Scope,
+            err: anyerror,
+        ) !void {
+            debug_trace.logf(
+                "usage",
+                "usage dashboard refresh failed scope={s} reason={s}",
+                .{ @tagName(scope), @errorName(err) },
+            );
+            try app.input_runtime.usage_menu.recordRefreshFailure(
+                app.alloc,
+                scope,
+                "Local usage data is unavailable",
+            );
             app.shell.render_requests.request(.footer);
         }
 
@@ -1022,12 +1248,26 @@ pub fn Handlers(comptime App: type) type {
                     defer display_path.deinit(app.alloc);
                     break :blk try std.fmt.allocPrint(app.alloc, "Deleted {s} (was newly created)", .{display_path.bytes});
                 },
+                .unavailable => |path| blk: {
+                    var display_path = try text_utils.encodeTerminalSafe(
+                        app.alloc,
+                        path,
+                        std.Io.Dir.max_path_bytes,
+                    );
+                    defer display_path.deinit(app.alloc);
+                    break :blk try std.fmt.allocPrint(
+                        app.alloc,
+                        "Could not undo {s}",
+                        .{display_path.bytes},
+                    );
+                },
                 .empty => try app.alloc.dupe(u8, "Nothing to undo."),
             };
             defer app.alloc.free(msg);
             switch (result) {
                 .restored => |path| std.heap.c_allocator.free(path),
                 .deleted => |path| std.heap.c_allocator.free(path),
+                .unavailable => |path| std.heap.c_allocator.free(path),
                 .empty => {},
             }
             try app.writeDomainNotice(.{
@@ -1065,6 +1305,10 @@ pub fn Handlers(comptime App: type) type {
             var reload_notice: ?[]u8 = null;
             defer if (reload_notice) |notice| app.alloc.free(notice);
             var reload_warning = false;
+            if (result.project_action) |action| {
+                try applyProjectMcpAction(app, action, command_body);
+                return;
+            }
             if (result.reload) {
                 app.beginMcpReload() catch |err| {
                     reload_warning = true;
@@ -1100,6 +1344,70 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (reload_warning) .warning else .neutral,
                 .body = body,
             }, true);
+        }
+
+        pub fn applyProjectMcpAction(
+            app: *App,
+            action: @import("../mcp/project_config.zig").ProjectMcpAction,
+            success_body: []const u8,
+        ) !void {
+            if (comptime !@hasField(App, "workspace_root") or
+                !@hasDecl(App, "beginMcpAuthorityReduction"))
+            {
+                return error.McpProjectChoicesUnavailable;
+            } else {
+                const reducing_requested = switch (action) {
+                    .reject, .reset => true,
+                    .approve, .approve_all => false,
+                };
+                var attempt = config_runtime.attemptProjectMcpMutation(
+                    app.alloc,
+                    app.workspace_root,
+                    action,
+                );
+                defer attempt.deinit(app.alloc);
+                var warning = false;
+                var owned_notice: ?[]u8 = null;
+                defer if (owned_notice) |notice| app.alloc.free(notice);
+                switch (attempt) {
+                    .outcome => |outcome| switch (outcome) {
+                        .unchanged => {},
+                        .committed => |committed| {
+                            if (committed.authority_reduced) {
+                                try app.beginMcpAuthorityReduction(true);
+                            } else {
+                                try app.beginMcpReload();
+                            }
+                        },
+                    },
+                    .failure => |failure| {
+                        warning = true;
+                        if (failure.err == error.SettingsCommitIndeterminate and reducing_requested) {
+                            try app.beginMcpAuthorityReduction(false);
+                            owned_notice = try app.alloc.dupe(
+                                u8,
+                                "Project MCP choices may have been saved, so live MCP authority was retired. Run /mcp reload after checking settings.json.",
+                            );
+                        } else {
+                            owned_notice = try std.fmt.allocPrint(
+                                app.alloc,
+                                "Project MCP choices were not applied: {s}.",
+                                .{@errorName(failure.err)},
+                            );
+                        }
+                    },
+                }
+                try app.writeDomainNotice(.{
+                    .topic = "mcp",
+                    .tone = if (warning) .warning else .neutral,
+                    .body = owned_notice orelse success_body,
+                }, true);
+                if (warning and owned_notice != null and
+                    comptime @hasDecl(App, "presentProjectMcpPrompt"))
+                {
+                    try app.presentProjectMcpPrompt();
+                }
+            }
         }
 
         fn listMcpServersAndTools(ctx: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
@@ -1324,16 +1632,12 @@ pub fn Handlers(comptime App: type) type {
         fn authenticateMcpServer(
             ctx: *anyopaque,
             name: []const u8,
-        ) !mcp_auth.AuthenticationResult {
-            if (comptime !@hasDecl(App, "acquireMcpRuntime") or
-                !@hasDecl(App, "urlOpener"))
-            {
+        ) !mcp_command_provider.AuthenticationStart {
+            if (comptime !@hasDecl(App, "startMcpAuthentication")) {
                 return error.McpAuthenticationUnavailable;
             }
             const app: *App = @ptrCast(@alignCast(ctx));
-            var lease = app.acquireMcpRuntime() orelse return error.McpServerNotFound;
-            defer lease.deinit();
-            return lease.runtime.authenticateServer(name, app, openMcpAuthUrl);
+            return app.startMcpAuthentication(name);
         }
 
         fn validateMcpAuthenticationServer(ctx: *anyopaque, name: []const u8) !void {
@@ -1346,16 +1650,6 @@ pub fn Handlers(comptime App: type) type {
             try lease.runtime.validateAuthenticationServer(name);
         }
 
-        fn openMcpAuthUrl(
-            ctx: ?*anyopaque,
-            alloc: std.mem.Allocator,
-            url: []const u8,
-        ) anyerror!bool {
-            if (comptime !@hasDecl(App, "urlOpener")) return false;
-            const app: *App = @ptrCast(@alignCast(ctx.?));
-            return app.urlOpener().open(alloc, url);
-        }
-
         fn logoutMcpServer(
             ctx: *anyopaque,
             name: []const u8,
@@ -1364,12 +1658,17 @@ pub fn Handlers(comptime App: type) type {
                 return error.McpAuthenticationUnavailable;
             }
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "mcpAuthenticationPending")) {
+                if (app.mcpAuthenticationPending(name)) return .{ .busy = true };
+            }
             var lease = app.acquireMcpRuntime() orelse return error.McpServerNotFound;
             defer lease.deinit();
             const result = try lease.runtime.logoutServer(name);
             return .{
                 .removed = result.removed,
                 .revocation_failed = result.revocation_failed,
+                .repaired_entries = result.repaired_entries,
+                .local_only = result.local_only,
             };
         }
 
@@ -1519,9 +1818,7 @@ pub fn Handlers(comptime App: type) type {
         fn closeInlineCommandMenusIfPresent(app: *App) void {
             if (comptime !@hasField(App, "input_runtime")) return;
             const InputRuntime = @TypeOf(app.input_runtime);
-            if (comptime @hasField(InputRuntime, "appearance_menu")) app.input_runtime.appearance_menu.close();
             if (comptime @hasField(InputRuntime, "statusline_menu")) app.input_runtime.statusline_menu.close();
-            if (comptime @hasField(InputRuntime, "sandbox_menu")) app.input_runtime.sandbox_menu.close();
             if (comptime @hasField(InputRuntime, "usage_menu")) app.input_runtime.usage_menu.close(app.alloc);
             if (comptime @hasField(InputRuntime, "workspace_menu")) app.input_runtime.workspace_menu.close();
         }
@@ -1606,6 +1903,10 @@ pub fn Handlers(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             var snapshot = app.creditsProvider().fetch(app.alloc, .{
                 .credential = app.auth.apiKey(),
+                .credential_source = if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource"))
+                    app.auth.credentialSource()
+                else
+                    null,
                 .tenant = app.auth.gatewayTeam(),
             });
             defer snapshot.deinit(app.alloc);
@@ -1627,52 +1928,15 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandPasteClipboard(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasField(App, "scripting")) {
+                if (app_lua_runtime.Runtime(App).dispatchPaste(app, "clipboard", null)) return;
+            }
             try image_commands.Commands(App).attachClipboard(app);
         }
 
         fn commandToggleFast(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try session_commands.Commands(App).toggleFast(app);
-        }
-
-        fn commandHandleAppearance(ctx: *anyopaque, rest: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            const trimmed = std.mem.trim(u8, rest, " \t");
-            if (trimmed.len == 0) {
-                if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-                if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
-                closeHelpMenuIfPresent(app);
-                app.input_runtime.settings_menu.close();
-                closeInlineCommandMenusIfPresent(app);
-                app.input_runtime.appearance_menu.open();
-                app.shell.render_requests.request(.footer);
-                return;
-            }
-
-            const change = parseAppearanceChange(trimmed) orelse {
-                try app.writeDomainNotice(.{
-                    .topic = "appearance",
-                    .tone = .@"error",
-                    .body = "Use: /appearance input lines|tint or /appearance presentation normal|minimal",
-                }, true);
-                return;
-            };
-            try applySettingsCatalogChange(app, change);
-        }
-
-        fn commandHandleSandbox(ctx: *anyopaque, rest: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            if (std.mem.trim(u8, rest, " \t").len == 0) {
-                if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-                if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
-                closeHelpMenuIfPresent(app);
-                app.input_runtime.settings_menu.close();
-                closeInlineCommandMenusIfPresent(app);
-                app.input_runtime.sandbox_menu.open();
-                app.shell.render_requests.request(.footer);
-                return;
-            }
-            try handleSandboxCommand(app, rest);
         }
 
         fn commandHandleStatusline(ctx: *anyopaque, rest: []const u8) !void {
@@ -1874,15 +2138,10 @@ fn buildTraceReport(app: anytype) ![]u8 {
     try out.writer.print("version: {s} ({s})\n", .{ App.app_version, build_options.git_commit });
     try out.writer.print("platform: {s}/{s}\n", .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) });
     try out.writer.print("build: {s}\n", .{@tagName(builtin.mode)});
-    try out.writer.print("model: {s}\n", .{app.selected_model.items});
+    try out.writer.print("model: {s}\n", .{provider_runtime.model(app)});
     if (app.fast_mode) try out.writer.writeAll("fast_mode: on\n");
     const perm_label = permissions.permissionModeLabel(app.permission_engine.mode);
     try out.writer.print("permission_mode: {s}\n", .{perm_label});
-    const sandbox_label = sandbox.publicModeForBackend(sandbox.effectiveBackend(
-        app.permission_engine.mode,
-        app.permission_state.sandbox_backend,
-    )).label();
-    try out.writer.print("sandbox: {s}\n", .{sandbox_label});
     try out.writer.print("workspace: {s}\n", .{app.workspace_root});
 
     try writeCurrentStateSummary(&out.writer, app, app.alloc);
@@ -2996,181 +3255,6 @@ fn stripAnsiEscapes(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
-noinline fn parseAppearanceChange(rest: []const u8) ?settings_catalog.Change {
-    var tokens = std.mem.tokenizeAny(u8, rest, " \t");
-    const first = tokens.next() orelse return null;
-    const second = tokens.next();
-    if (tokens.next() != null) return null;
-
-    if (second) |value| {
-        if (std.mem.eql(u8, first, "input")) {
-            const appearance = input_appearance.InputAppearance.parse(value) orelse return null;
-            return .{ .setting = .input_appearance, .value = appearance.label() };
-        }
-        if (std.mem.eql(u8, first, "presentation")) {
-            const mode = presentation_mode.MaxxingMode.parse(value) orelse return null;
-            return .{ .setting = .maxxing_mode, .value = mode.label() };
-        }
-        return null;
-    }
-
-    if (input_appearance.InputAppearance.parse(first)) |appearance| {
-        return .{ .setting = .input_appearance, .value = appearance.label() };
-    }
-    if (presentation_mode.MaxxingMode.parse(first)) |mode| {
-        return .{ .setting = .maxxing_mode, .value = mode.label() };
-    }
-    return null;
-}
-
-fn handleInputAppearanceCommand(app: anytype, rest: []const u8) !void {
-    const trimmed = std.mem.trim(u8, rest, " \t");
-
-    if (trimmed.len == 0) {
-        debug_trace.logf("core", "input command show current={s}", .{app.input_runtime.input_appearance.label()});
-        const msg = try std.fmt.allocPrint(
-            app.alloc,
-            "current: {s}\n" ++
-                "available: lines, tint\n" ++
-                "  lines current two-line composer chrome\n" ++
-                "  tint  tinted composer background\n" ++
-                "examples: /input lines, /input tint",
-            .{app.input_runtime.input_appearance.label()},
-        );
-        defer app.alloc.free(msg);
-        try app.writeDomainNotice(.{ .topic = "input", .tone = .neutral, .body = msg }, true);
-        return;
-    }
-
-    const next = input_appearance.InputAppearance.parse(trimmed) orelse {
-        debug_trace.logf("core", "input command rejected arg_bytes={d}", .{trimmed.len});
-        try app.writeDomainNotice(.{ .topic = "input", .tone = .@"error", .body = "Use: lines, tint" }, true);
-        return;
-    };
-
-    const runtime_changed = next != app.input_runtime.input_appearance;
-    if (runtime_changed) {
-        app.input_runtime.input_appearance = next;
-        app.shell.render_requests.request(.footer);
-    }
-    try persistInputAppearanceSetting(app, next, runtime_changed);
-
-    if (!runtime_changed) {
-        debug_trace.logf("core", "input command unchanged mode={s}", .{next.label()});
-        const msg = try std.fmt.allocPrint(app.alloc, "already in {s}", .{next.label()});
-        defer app.alloc.free(msg);
-        try app.writeDomainNotice(.{ .topic = "input", .tone = .neutral, .body = msg }, true);
-        return;
-    }
-
-    debug_trace.logf("core", "input command switched mode={s}", .{next.label()});
-    const msg = try std.fmt.allocPrint(app.alloc, "switched to {s}", .{next.label()});
-    defer app.alloc.free(msg);
-    try app.writeDomainNotice(.{ .topic = "input", .tone = .neutral, .body = msg }, true);
-}
-
-fn persistInputAppearanceSetting(app: anytype, next: input_appearance.InputAppearance, runtime_changed: bool) !void {
-    if (comptime @hasDecl(@TypeOf(app.*), "persistInputAppearance")) {
-        try app.persistInputAppearance(next.label(), runtime_changed);
-        return;
-    }
-
-    const patch = config_runtime.UserSettingsPatch{ .input_appearance = next.label() };
-    try persistUserPreferences(app, "input", patch, runtime_changed);
-}
-
-fn handleMaxxingCommand(app: anytype, rest: []const u8) !void {
-    const trimmed = std.mem.trim(u8, rest, " \t");
-
-    if (trimmed.len == 0) {
-        const msg = try std.fmt.allocPrint(
-            app.alloc,
-            "current: {s}\n" ++
-                "available: minimal, legacy\n" ++
-                "  minimal bare composer and grouped tool activity\n" ++
-                "  legacy  original Fx presentation\n" ++
-                "examples: /maxxing minimal, /maxxing legacy",
-            .{app.shell.maxxing_mode.label()},
-        );
-        defer app.alloc.free(msg);
-        try app.writeDomainNotice(.{ .topic = "maxxing", .tone = .neutral, .body = msg }, true);
-        return;
-    }
-
-    const next = presentation_mode.MaxxingMode.parse(trimmed) orelse {
-        try app.writeDomainNotice(.{ .topic = "maxxing", .tone = .@"error", .body = "Use: minimal, legacy" }, true);
-        return;
-    };
-
-    const runtime_changed = next != app.shell.maxxing_mode;
-    if (runtime_changed) {
-        app.shell.maxxing_mode = next;
-        app.shell.render_requests.request(.transcript);
-        app.shell.render_requests.request(.footer);
-    }
-    try persistMaxxingModeSetting(app, next, runtime_changed);
-
-    const msg = try std.fmt.allocPrint(app.alloc, "{s} {s}", .{
-        if (runtime_changed) "switched to" else "already in",
-        next.label(),
-    });
-    defer app.alloc.free(msg);
-    try app.writeDomainNotice(.{
-        .topic = "maxxing",
-        .tone = .neutral,
-        .body = msg,
-    }, true);
-}
-
-fn persistMaxxingModeSetting(app: anytype, next: presentation_mode.MaxxingMode, runtime_changed: bool) !void {
-    if (comptime @hasDecl(@TypeOf(app.*), "persistMaxxingMode")) {
-        try app.persistMaxxingMode(next.label(), runtime_changed);
-        return;
-    }
-
-    const patch = config_runtime.UserSettingsPatch{ .maxxing_mode = next.label() };
-    try persistUserPreferences(app, "maxxing", patch, runtime_changed);
-}
-
-fn handleSandboxCommand(app: anytype, rest: []const u8) !void {
-    const trimmed = std.mem.trim(u8, rest, " \t");
-
-    const mode = sandbox.PublicMode.parse(trimmed) orelse {
-        debug_trace.logf("core", "sandbox command rejected arg_bytes={d}", .{trimmed.len});
-        try app.writeDomainNotice(.{ .topic = "sandbox", .tone = .@"error", .body = "Use: os, none" }, true);
-        return;
-    };
-
-    if (mode == .os and !sandbox.osSandboxAvailable()) {
-        debug_trace.logf("core", "sandbox command rejected mode=os reason=unsupported_os_sandbox", .{});
-        try app.writeDomainNotice(.{ .topic = "sandbox", .tone = .warning, .body = sandbox.unsupported_os_sandbox_message }, true);
-        return;
-    }
-
-    const parsed = sandbox.backendForPublicMode(mode);
-    const changed = app_permission_runtime.Runtime(@TypeOf(app.*)).setSandboxBackend(app, parsed);
-
-    if (!changed) {
-        persistSandboxSetting(app, mode.label()) catch |err| {
-            try writeSandboxPersistenceFailure(app, err);
-        };
-        debug_trace.logf("core", "sandbox command unchanged mode={s}", .{mode.label()});
-        const msg = try std.fmt.allocPrint(app.alloc, "already set to {s}", .{mode.label()});
-        defer app.alloc.free(msg);
-        try app.writeDomainNotice(.{ .topic = "sandbox", .tone = .neutral, .body = msg }, true);
-        return;
-    }
-
-    persistSandboxSetting(app, mode.label()) catch |err| {
-        try writeSandboxPersistenceFailure(app, err);
-    };
-
-    debug_trace.logf("core", "sandbox command switched mode={s}", .{mode.label()});
-    const msg = try std.fmt.allocPrint(app.alloc, "switched to {s}", .{mode.label()});
-    defer app.alloc.free(msg);
-    try app.writeDomainNotice(.{ .topic = "sandbox", .tone = .neutral, .body = msg }, true);
-}
-
 fn handleRenameCommand(app: anytype, rest: []const u8) !void {
     const App = @TypeOf(app.*);
     const SessionRuntime = app_session_runtime.Runtime(App);
@@ -3209,74 +3293,86 @@ fn handleRenameCommand(app: anytype, rest: []const u8) !void {
     try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = msg }, true);
 }
 
-fn handleStatuslineCommand(app: anytype, rest: []const u8) !void {
-    const trimmed = std.mem.trim(u8, rest, " \t");
+const StatuslineFeedback = enum { announce, silent };
 
-    if (std.mem.eql(u8, trimmed, "sandbox")) {
-        app.statusline_sandbox = !app.statusline_sandbox;
-        const label: []const u8 = if (app.statusline_sandbox) "on" else "off";
-        persistStatuslineSetting(app, "sandbox", app.statusline_sandbox) catch |err| {
-            const notice = try std.fmt.allocPrint(
-                app.alloc,
-                "sandbox active for this process but not saved to user settings ({s})",
-                .{@errorName(err)},
-            );
-            defer app.alloc.free(notice);
-            try app.writeDomainNotice(.{ .topic = "statusline", .tone = .warning, .body = notice }, true);
-        };
-        const msg = try std.fmt.allocPrint(app.alloc, "sandbox: {s}", .{label});
-        defer app.alloc.free(msg);
-        try app.writeDomainNotice(.{ .topic = "statusline", .tone = .neutral, .body = msg }, true);
-        return;
+fn parseStatuslineItem(raw: []const u8) ?config_runtime.StatuslineItem {
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    inline for (std.meta.fields(config_runtime.StatuslineItem)) |field| {
+        if (std.mem.eql(u8, trimmed, field.name)) return @enumFromInt(field.value);
     }
-
-    if (std.mem.eql(u8, trimmed, "context")) {
-        app.statusline_context = !app.statusline_context;
-        const label: []const u8 = if (app.statusline_context) "on" else "off";
-        persistStatuslineSetting(app, "context", app.statusline_context) catch |err| {
-            const notice = try std.fmt.allocPrint(
-                app.alloc,
-                "context active for this process but not saved to user settings ({s})",
-                .{@errorName(err)},
-            );
-            defer app.alloc.free(notice);
-            try app.writeDomainNotice(.{ .topic = "statusline", .tone = .warning, .body = notice }, true);
-        };
-        const msg = try std.fmt.allocPrint(app.alloc, "context: {s}", .{label});
-        defer app.alloc.free(msg);
-        try app.writeDomainNotice(.{ .topic = "statusline", .tone = .neutral, .body = msg }, true);
-        return;
-    }
-
-    if (std.mem.eql(u8, trimmed, "session")) {
-        app.statusline_session = !app.statusline_session;
-        const label: []const u8 = if (app.statusline_session) "on" else "off";
-        persistStatuslineSetting(app, "session", app.statusline_session) catch |err| {
-            const notice = try std.fmt.allocPrint(
-                app.alloc,
-                "session active for this process but not saved to user settings ({s})",
-                .{@errorName(err)},
-            );
-            defer app.alloc.free(notice);
-            try app.writeDomainNotice(.{ .topic = "statusline", .tone = .warning, .body = notice }, true);
-        };
-        const msg = try std.fmt.allocPrint(app.alloc, "session: {s}", .{label});
-        defer app.alloc.free(msg);
-        try app.writeDomainNotice(.{ .topic = "statusline", .tone = .neutral, .body = msg }, true);
-        return;
-    }
-
-    try app.writeDomainNotice(.{ .topic = "statusline", .tone = .@"error", .body = "Use: sandbox, context, session" }, true);
+    return null;
 }
 
-fn persistStatuslineSetting(app: anytype, key: []const u8, value: bool) !void {
-    const item: config_runtime.UserSettingsPatch = if (std.mem.eql(u8, key, "sandbox"))
-        .{ .statusline_item = .{ .item = .sandbox, .enabled = value } }
-    else if (std.mem.eql(u8, key, "session"))
-        .{ .statusline_item = .{ .item = .session, .enabled = value } }
-    else
-        .{ .statusline_item = .{ .item = .context, .enabled = value } };
-    try persistUserPreferences(app, "statusline", item, true);
+fn statuslineItemForSetting(setting: settings_catalog.SettingId) ?config_runtime.StatuslineItem {
+    return switch (setting) {
+        .statusline_context => .context,
+        .statusline_session => .session,
+        .statusline_workspace => .workspace,
+        else => null,
+    };
+}
+
+fn statuslineItemEnabled(app: anytype, item: config_runtime.StatuslineItem) bool {
+    const App = @TypeOf(app.*);
+    return switch (item) {
+        .context => app.statusline_context,
+        .session => app.statusline_session,
+        .workspace => if (comptime @hasField(App, "workspace_identity"))
+            app.workspace_identity.enabled
+        else
+            false,
+    };
+}
+
+fn assignStatuslineItem(app: anytype, item: config_runtime.StatuslineItem, enabled: bool) bool {
+    const App = @TypeOf(app.*);
+    const current = statuslineItemEnabled(app, item);
+    switch (item) {
+        .context => app.statusline_context = enabled,
+        .session => app.statusline_session = enabled,
+        .workspace => if (comptime @hasField(App, "workspace_identity")) {
+            app.workspace_identity.enabled = enabled;
+        },
+    }
+    return current != enabled;
+}
+
+fn applyStatuslineItem(
+    app: anytype,
+    item: config_runtime.StatuslineItem,
+    enabled: bool,
+    feedback: StatuslineFeedback,
+) !void {
+    const runtime_changed = assignStatuslineItem(app, item, enabled);
+    const patch: config_runtime.UserSettingsPatch = .{
+        .statusline_item = .{ .item = item, .enabled = enabled },
+    };
+    switch (feedback) {
+        .announce => {
+            try persistUserPreferences(app, "statusline", patch, runtime_changed);
+            const message = try std.fmt.allocPrint(
+                app.alloc,
+                "{s}: {s}",
+                .{ @tagName(item), if (enabled) "on" else "off" },
+            );
+            defer app.alloc.free(message);
+            try app.writeDomainNotice(.{ .topic = "statusline", .tone = .neutral, .body = message }, true);
+        },
+        .silent => try persistUserPreferencesSilently(app, "statusline", patch, runtime_changed),
+    }
+    app.shell.render_requests.request(.footer);
+}
+
+fn handleStatuslineCommand(app: anytype, rest: []const u8) !void {
+    const item = parseStatuslineItem(rest) orelse {
+        try app.writeDomainNotice(.{
+            .topic = "statusline",
+            .tone = .@"error",
+            .body = "Use: context, session, workspace",
+        }, true);
+        return;
+    };
+    try applyStatuslineItem(app, item, !statuslineItemEnabled(app, item), .announce);
 }
 
 const SoundLevel = enum {
@@ -3370,30 +3466,27 @@ fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
 pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     const App = @TypeOf(app.*);
     var snapshot: settings_catalog.Snapshot = .{};
-    if (comptime @hasField(App, "selected_model")) snapshot.model = app.selected_model.items;
+    if (comptime provider_runtime.supported(App)) snapshot.model = provider_runtime.model(app);
     if (comptime @hasField(App, "effort")) snapshot.effort = app.effort.displayLabel();
     if (comptime @hasField(App, "fast_mode")) snapshot.fast_mode = app.fast_mode;
-    if (comptime @hasDecl(App, "resolvedModelCapabilities") and @hasField(App, "selected_model")) {
-        const capabilities = app.resolvedModelCapabilities(app.selected_model.items);
+    if (comptime @hasDecl(App, "resolvedModelCapabilities") and provider_runtime.supported(App)) {
+        const capabilities = app.resolvedModelCapabilities(provider_runtime.model(app));
         snapshot.reasoning_efforts = capabilities.reasoning_efforts;
         snapshot.supports_fast_mode = capabilities.supports_fast_mode;
     }
     if (comptime @hasField(App, "permission_engine")) snapshot.permission_mode = @tagName(app.permission_engine.mode);
     if (comptime @hasField(App, "input_runtime")) {
-        snapshot.input_appearance = app.input_runtime.input_appearance.label();
         snapshot.startup_scrollback = app.input_runtime.settings_menu.startup_scrollback;
         if (comptime @hasField(@TypeOf(app.input_runtime), "slash_menu_categories")) {
             snapshot.slash_menu_categories = app.input_runtime.slash_menu_categories;
         }
     }
-    if (comptime @hasField(App, "shell")) {
-        if (comptime @hasField(@TypeOf(app.shell), "maxxing_mode")) {
-            snapshot.maxxing_mode = app.shell.maxxing_mode.label();
-        }
+    if (comptime @hasField(App, "shell") and @hasField(@TypeOf(app.shell), "collapse_tool_calls")) {
+        snapshot.collapse_tool_calls = app.shell.collapse_tool_calls;
     }
-    if (comptime @hasField(App, "statusline_sandbox")) snapshot.statusline_sandbox = app.statusline_sandbox;
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
+    if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
     if (comptime @hasField(App, "prompt_history")) snapshot.prompt_history = app.prompt_history.enabled;
     if (comptime @hasDecl(App, "notificationPreferences")) {
         const notifications = app.notificationPreferences();
@@ -3403,88 +3496,19 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
             notifications.max,
         );
     }
-    if (comptime @hasField(App, "permission_state")) {
-        snapshot.sandbox = sandbox.publicModeForBackend(app.permission_state.sandbox_backend).label();
-    }
     return snapshot;
 }
 
 pub fn applySettingsCatalogMenuChange(app: anytype, change: settings_catalog.Change) !void {
     switch (change.setting) {
-        .input_appearance => {
-            const next = input_appearance.InputAppearance.parse(change.value) orelse
-                return error.InvalidSettingsCatalogValue;
-            const runtime_changed = next != app.input_runtime.input_appearance;
-            if (runtime_changed) app.input_runtime.input_appearance = next;
-            try persistUserPreferencesSilently(
-                app,
-                "input",
-                .{ .input_appearance = next.label() },
-                runtime_changed,
-            );
-        },
-        .maxxing_mode => {
-            const next = presentation_mode.MaxxingMode.parse(change.value) orelse
-                return error.InvalidSettingsCatalogValue;
-            const runtime_changed = next != app.shell.maxxing_mode;
-            if (runtime_changed) {
-                app.shell.maxxing_mode = next;
-                app.shell.render_requests.request(.transcript);
-            }
-            try persistUserPreferencesSilently(
-                app,
-                "maxxing",
-                .{ .maxxing_mode = next.label() },
-                runtime_changed,
-            );
-        },
-        .statusline_sandbox, .statusline_context, .statusline_session => {
+        .statusline_context, .statusline_session, .statusline_workspace => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            const runtime_changed = switch (change.setting) {
-                .statusline_sandbox => blk: {
-                    const changed = enabled != app.statusline_sandbox;
-                    app.statusline_sandbox = enabled;
-                    break :blk changed;
-                },
-                .statusline_context => blk: {
-                    const changed = enabled != app.statusline_context;
-                    app.statusline_context = enabled;
-                    break :blk changed;
-                },
-                .statusline_session => blk: {
-                    const changed = enabled != app.statusline_session;
-                    app.statusline_session = enabled;
-                    break :blk changed;
-                },
-                else => unreachable,
-            };
-            const item: config_runtime.UserSettingsPatch = switch (change.setting) {
-                .statusline_sandbox => .{ .statusline_item = .{ .item = .sandbox, .enabled = enabled } },
-                .statusline_context => .{ .statusline_item = .{ .item = .context, .enabled = enabled } },
-                .statusline_session => .{ .statusline_item = .{ .item = .session, .enabled = enabled } },
-                else => unreachable,
-            };
-            try persistUserPreferencesSilently(app, "statusline", item, runtime_changed);
-        },
-        .sandbox => {
-            const mode = sandbox.PublicMode.parse(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (mode == .os and !sandbox.osSandboxAvailable()) {
-                try app.writeDomainNotice(.{
-                    .topic = "sandbox",
-                    .tone = .warning,
-                    .body = sandbox.unsupported_os_sandbox_message,
-                }, true);
-                return;
-            }
-            _ = app_permission_runtime.Runtime(@TypeOf(app.*)).setSandboxBackend(
+            try applyStatuslineItem(
                 app,
-                sandbox.backendForPublicMode(mode),
+                statuslineItemForSetting(change.setting).?,
+                enabled,
+                .silent,
             );
-            var outcome = config_runtime.setSandbox(app.alloc, app.workspace_root, mode.label()) catch |err| {
-                try writeSandboxPersistenceFailure(app, err);
-                return;
-            };
-            outcome.deinit(app.alloc);
         },
         else => try applySettingsCatalogChange(app, change),
     }
@@ -3514,19 +3538,27 @@ fn persistUserPreferencesSilently(
 pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change) !void {
     switch (change.setting) {
         .model => unreachable,
-        .input_appearance => try handleInputAppearanceCommand(app, change.value),
-        .maxxing_mode => try handleMaxxingCommand(app, change.value),
-        .statusline_sandbox => {
+        .statusline_context, .statusline_session, .statusline_workspace => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (enabled != app.statusline_sandbox) try handleStatuslineCommand(app, "sandbox");
+            const item = statuslineItemForSetting(change.setting).?;
+            if (enabled != statuslineItemEnabled(app, item)) {
+                try applyStatuslineItem(app, item, enabled, .announce);
+            }
         },
-        .statusline_context => {
+        .collapse_tool_calls => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (enabled != app.statusline_context) try handleStatuslineCommand(app, "context");
-        },
-        .statusline_session => {
-            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (enabled != app.statusline_session) try handleStatuslineCommand(app, "session");
+            const runtime_changed = enabled != app.shell.collapse_tool_calls;
+            if (runtime_changed) {
+                app.shell.collapse_tool_calls = enabled;
+                app.shell.markTranscriptStructureDirty();
+                app.shell.render_requests.request(.transcript);
+            }
+            try persistUserPreferences(
+                app,
+                "collapse tool calls",
+                .{ .collapse_tool_calls = enabled },
+                runtime_changed,
+            );
         },
         .slash_menu_categories => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
@@ -3545,12 +3577,12 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         .effort => {
             const effort = types.ReasoningEffort.parseDisplayLabel(change.value) orelse
                 return error.InvalidSettingsCatalogValue;
-            const capabilities = app.resolvedModelCapabilities(app.selected_model.items);
+            const capabilities = app.resolvedModelCapabilities(provider_runtime.model(app));
             if (!model_capabilities.reasoningEffortSupported(capabilities, effort)) {
                 const message = try std.fmt.allocPrint(
                     app.alloc,
                     "{s} is not available for {s}",
-                    .{ effort.displayLabel(), app.selected_model.items },
+                    .{ effort.displayLabel(), provider_runtime.model(app) },
                 );
                 defer app.alloc.free(message);
                 try app.writeDomainNotice(.{ .topic = "effort", .tone = .neutral, .body = message }, true);
@@ -3564,7 +3596,6 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         },
         .permission_mode => try session_commands.Commands(@TypeOf(app.*)).handlePermissions(app, change.value),
         .sound_level => try handleNotificationsCommand(app, change.value),
-        .sandbox => try handleSandboxCommand(app, change.value),
         .startup_scrollback => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
             try session_commands.Commands(@TypeOf(app.*)).handleSettings(
@@ -3583,30 +3614,6 @@ fn parseOnOff(value: []const u8) ?bool {
     if (std.mem.eql(u8, value, "on")) return true;
     if (std.mem.eql(u8, value, "off")) return false;
     return null;
-}
-
-fn persistSandboxSetting(app: anytype, label: []const u8) !void {
-    if (@hasDecl(@TypeOf(app.*), "persistSandbox")) {
-        try app.persistSandbox(label);
-    } else {
-        var outcome = try config_runtime.setSandbox(app.alloc, app.workspace_root, label);
-        defer outcome.deinit(app.alloc);
-    }
-    try app.writeDomainNotice(.{
-        .topic = "sandbox",
-        .tone = .neutral,
-        .body = "saved to local settings (scope=local)",
-    }, true);
-}
-
-fn writeSandboxPersistenceFailure(app: anytype, err: anyerror) !void {
-    const notice = try std.fmt.allocPrint(
-        app.alloc,
-        "active for this process but not saved to local settings (scope=local, error={s})",
-        .{@errorName(err)},
-    );
-    defer app.alloc.free(notice);
-    try app.writeDomainNotice(.{ .topic = "sandbox", .tone = .warning, .body = notice }, true);
 }
 
 const SurfaceOnlyApp = struct {};
@@ -3684,6 +3691,7 @@ const McpCommandFakeApp = struct {
     last_tone: ?types.NoticeTone = null,
     reload_behavior: ReloadBehavior = .published_empty,
     reload_pending: bool = false,
+    authentication_pending: bool = false,
 
     fn deinit(self: *McpCommandFakeApp) void {
         self.notice_body.deinit(self.alloc);
@@ -3698,7 +3706,6 @@ const McpCommandFakeApp = struct {
         rest: []const u8,
         request: mcp_command_provider.Request,
     ) !mcp_command_provider.Result {
-        _ = request;
         if (std.mem.eql(u8, rest, "reload")) {
             return .{
                 .display = .{
@@ -3709,11 +3716,15 @@ const McpCommandFakeApp = struct {
             };
         }
         try std.testing.expectEqualStrings("auth fixture --open", rest);
+        const self: *McpCommandFakeApp = @ptrCast(@alignCast(request.list_ctx));
+        self.authentication_pending = true;
         return .{
             .display = .{
-                .line = try alloc.dupe(u8, "Authenticated MCP server 'fixture'."),
+                .line = try alloc.dupe(
+                    u8,
+                    "Waiting for MCP authentication for 'fixture'. You can continue using fx while the browser flow completes.",
+                ),
             },
-            .reload = true,
         };
     }
 
@@ -3772,6 +3783,17 @@ const McpCommandFakeApp = struct {
         };
     }
 
+    fn takeMcpAuthenticationCompletion(
+        self: *McpCommandFakeApp,
+    ) !?app_mcp_runtime.AuthenticationCompletion {
+        if (!self.authentication_pending) return null;
+        self.authentication_pending = false;
+        return .{
+            .server_name = try self.alloc.dupe(u8, "fixture"),
+            .result = .{ .authenticated = .{} },
+        };
+    }
+
     noinline fn writeDomainNotice(self: *McpCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
         self.notice_count += 1;
         self.last_topic = notice.topic;
@@ -3825,16 +3847,6 @@ test "quit command requests resume handoff before exit" {
     );
 }
 
-const SandboxCommandFakeWorker = struct {
-    synced: ?worker_runtime.PermissionSnapshot = null,
-    sync_count: usize = 0,
-
-    pub fn syncQueuedPromptPermissionSnapshot(self: *SandboxCommandFakeWorker, snapshot: worker_runtime.PermissionSnapshot) void {
-        self.synced = snapshot;
-        self.sync_count += 1;
-    }
-};
-
 const ClipboardCommandFakeApp = struct {
     const CopyOutcome = enum {
         copied,
@@ -3884,124 +3896,6 @@ const ClipboardCommandFakeApp = struct {
         self.last_topic = notice.topic;
         self.last_tone = notice.tone;
         self.last_body = notice.body;
-    }
-};
-
-const SandboxCommandFakeApp = struct {
-    alloc: std.mem.Allocator,
-    workspace_root: []const u8 = "/tmp/workspace",
-    permission_state: app_permission_runtime.State = .{},
-    permission_engine: struct { mode: types.PermissionMode = .auto } = .{},
-    worker: SandboxCommandFakeWorker = .{},
-    transcript: std.ArrayList(u8) = .empty,
-    persisted: std.ArrayList(u8) = .empty,
-    persist_calls: usize = 0,
-    persist_error: ?anyerror = null,
-    last_tone: ?types.NoticeTone = null,
-
-    fn deinit(self: *SandboxCommandFakeApp) void {
-        self.transcript.deinit(self.alloc);
-        self.persisted.deinit(self.alloc);
-    }
-
-    noinline fn writeDomainNotice(self: *SandboxCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
-        self.last_tone = notice.tone;
-        try self.transcript.appendSlice(self.alloc, notice.body);
-        try self.transcript.append(self.alloc, '\n');
-    }
-
-    fn persistSandbox(self: *SandboxCommandFakeApp, label: []const u8) !void {
-        self.persist_calls += 1;
-        if (self.persist_error) |err| return err;
-        self.persisted.clearRetainingCapacity();
-        try self.persisted.appendSlice(self.alloc, label);
-    }
-};
-
-const InputAppearanceCommandFakeApp = struct {
-    const InputAppearance = input_appearance.InputAppearance;
-
-    const FakeRenderRequests = struct {
-        footer_requests: usize = 0,
-
-        fn request(self: *FakeRenderRequests, reason: anytype) void {
-            _ = reason;
-            self.footer_requests += 1;
-        }
-    };
-
-    const FakeShell = struct {
-        render_requests: FakeRenderRequests = .{},
-    };
-
-    const FakeInputRuntime = struct {
-        input_appearance: InputAppearance = .tint,
-    };
-
-    alloc: std.mem.Allocator,
-    input_runtime: FakeInputRuntime = .{},
-    shell: FakeShell = .{},
-    transcript: std.ArrayList(u8) = .empty,
-    last_tone: ?types.NoticeTone = null,
-    persist_calls: usize = 0,
-    persisted_appearance: []const u8 = "",
-    persisted_runtime_changed: bool = false,
-
-    fn deinit(self: *InputAppearanceCommandFakeApp) void {
-        self.transcript.deinit(self.alloc);
-    }
-
-    noinline fn writeDomainNotice(self: *InputAppearanceCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
-        self.last_tone = notice.tone;
-        try self.transcript.appendSlice(self.alloc, notice.body);
-    }
-
-    fn persistInputAppearance(self: *InputAppearanceCommandFakeApp, appearance: []const u8, runtime_changed: bool) !void {
-        self.persist_calls += 1;
-        self.persisted_runtime_changed = runtime_changed;
-        self.persisted_appearance = appearance;
-    }
-};
-
-const MaxxingCommandFakeApp = struct {
-    const FakeRenderRequests = struct {
-        full_requests: usize = 0,
-
-        fn request(self: *FakeRenderRequests, reason: anytype) void {
-            _ = reason;
-            self.full_requests += 1;
-        }
-    };
-
-    const FakeShell = struct {
-        maxxing_mode: presentation_mode.MaxxingMode = presentation_mode.MaxxingMode.default,
-        render_requests: FakeRenderRequests = .{},
-    };
-
-    const FakeInputRuntime = struct {
-        input_appearance: input_appearance.InputAppearance = .default,
-    };
-
-    alloc: std.mem.Allocator,
-    input_runtime: FakeInputRuntime = .{},
-    shell: FakeShell = .{},
-    transcript: std.ArrayList(u8) = .empty,
-    last_tone: ?types.NoticeTone = null,
-    persisted_mode: []const u8 = "",
-    persisted_runtime_changed: bool = false,
-
-    fn deinit(self: *MaxxingCommandFakeApp) void {
-        self.transcript.deinit(self.alloc);
-    }
-
-    noinline fn writeDomainNotice(self: *MaxxingCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
-        self.last_tone = notice.tone;
-        try self.transcript.appendSlice(self.alloc, notice.body);
-    }
-
-    fn persistMaxxingMode(self: *MaxxingCommandFakeApp, mode: []const u8, runtime_changed: bool) !void {
-        self.persisted_mode = mode;
-        self.persisted_runtime_changed = runtime_changed;
     }
 };
 
@@ -4055,30 +3949,6 @@ const SkillsInstallReplayApp = struct {
     }
 };
 
-const ModelCatalogCommandFakeApp = struct {
-    alloc: std.mem.Allocator,
-    model_cache: model_cache_runtime.Runtime,
-    skills: skill_runtime.Runtime = .{},
-    shell: transcript_runtime.TranscriptRuntime = .{},
-    ensure_count: usize = 0,
-
-    fn init(alloc: std.mem.Allocator) !ModelCatalogCommandFakeApp {
-        return ModelCatalogCommandFakeApp{
-            .alloc = alloc,
-            .model_cache = model_cache_runtime.Runtime.init(alloc, "/v1/models"),
-        };
-    }
-
-    fn deinit(self: *ModelCatalogCommandFakeApp) void {
-        self.model_cache.deinit();
-        self.shell.deinit(self.alloc);
-    }
-
-    fn ensureModelCache(self: *ModelCatalogCommandFakeApp) void {
-        self.ensure_count += 1;
-    }
-};
-
 const ChangeCommandFakeApp = struct {
     alloc: std.mem.Allocator,
     change_tracker: change_tracker_mod.ChangeTracker = .{},
@@ -4098,40 +3968,6 @@ const ChangeCommandFakeApp = struct {
     }
 };
 
-fn runSandboxCommandForTest(app: *SandboxCommandFakeApp, rest: []const u8) !void {
-    try handleSandboxCommand(app, rest);
-}
-
-fn runInputAppearanceCommandForTest(app: *InputAppearanceCommandFakeApp, rest: []const u8) !void {
-    try handleInputAppearanceCommand(app, rest);
-}
-
-fn runMaxxingCommandForTest(app: *MaxxingCommandFakeApp, rest: []const u8) !void {
-    try handleMaxxingCommand(app, rest);
-}
-
-test "appearance command parses grouped values and compatibility shorthand" {
-    try std.testing.expectEqual(
-        settings_catalog.Change{ .setting = .input_appearance, .value = "lines" },
-        parseAppearanceChange("input lines").?,
-    );
-    try std.testing.expectEqual(
-        settings_catalog.Change{ .setting = .maxxing_mode, .value = "legacy" },
-        parseAppearanceChange("presentation normal").?,
-    );
-    try std.testing.expectEqual(
-        settings_catalog.Change{ .setting = .input_appearance, .value = "tint" },
-        parseAppearanceChange(" tint ").?,
-    );
-    try std.testing.expectEqual(
-        settings_catalog.Change{ .setting = .maxxing_mode, .value = "minimal" },
-        parseAppearanceChange("minimal").?,
-    );
-    try std.testing.expect(parseAppearanceChange("input minimal") == null);
-    try std.testing.expect(parseAppearanceChange("presentation tint") == null);
-    try std.testing.expect(parseAppearanceChange("input lines extra") == null);
-}
-
 fn writeTempSkillFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {
     if (std.fs.path.dirname(sub_path)) |parent| {
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
@@ -4139,13 +3975,6 @@ fn writeTempSkillFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: [
     var file = try tmp.dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), content);
-}
-
-fn expectNoHiddenSandboxLabels(text: []const u8) !void {
-    try std.testing.expect(std.mem.find(u8, text, "macos") == null);
-    try std.testing.expect(std.mem.find(u8, text, "auto") == null);
-    try std.testing.expect(std.mem.find(u8, text, "vercel") == null);
-    try std.testing.expect(std.mem.find(u8, text, "just-bash") == null);
 }
 
 test "trace notice distinguishes Markdown file outcomes without a feedback CTA" {
@@ -4502,16 +4331,24 @@ test "app_commands preserves command display after implicit MCP reload" {
 
     try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), "auth fixture --open");
 
-    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
+    try std.testing.expectEqual(@as(usize, 0), app.reload_count);
     try std.testing.expectEqual(@as(usize, 1), app.notice_count);
     try std.testing.expectEqualStrings("mcp", app.last_topic.?);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
     try std.testing.expectEqualStrings(
-        "Authenticated MCP server 'fixture'.\nMCP reconnection started. Your existing MCP servers will stay active while the new configuration is checked.",
+        "Waiting for MCP authentication for 'fixture'. You can continue using fx while the browser flow completes.",
         app.notice_body.items,
     );
-    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
+    try Handlers(McpCommandFakeApp).collectMcpAuthenticationFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
     try std.testing.expectEqual(@as(usize, 2), app.notice_count);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        app.notice_body.items,
+        "Authenticated MCP server 'fixture'.\nMCP reconnection started. Your existing MCP servers will stay active while the new configuration is checked.",
+    ));
+    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
+    try std.testing.expectEqual(@as(usize, 3), app.notice_count);
 }
 
 test "app_commands warns when implicit MCP reload cannot replace the active servers" {
@@ -4524,13 +4361,16 @@ test "app_commands warns when implicit MCP reload cannot replace the active serv
 
         try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), "auth fixture --open");
 
-        try std.testing.expectEqual(@as(usize, 1), app.reload_count);
+        try std.testing.expectEqual(@as(usize, 0), app.reload_count);
         try std.testing.expectEqual(@as(usize, 1), app.notice_count);
         try std.testing.expectEqualStrings("mcp", app.last_topic.?);
+        try Handlers(McpCommandFakeApp).collectMcpAuthenticationFacts(&app);
+        try std.testing.expectEqual(@as(usize, 1), app.reload_count);
+        try std.testing.expectEqual(@as(usize, 2), app.notice_count);
         if (behavior != .begin_failed) {
             try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
             try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
-            try std.testing.expectEqual(@as(usize, 2), app.notice_count);
+            try std.testing.expectEqual(@as(usize, 3), app.notice_count);
             try std.testing.expectEqual(types.NoticeTone.warning, app.last_tone.?);
             try std.testing.expect(std.mem.find(
                 u8,
@@ -4591,22 +4431,6 @@ test "skills install groups command notice fragments for entry replay" {
     try std.testing.expect(std.mem.startsWith(u8, rendered, "● Skills: Installing from "));
     try std.testing.expect(std.mem.find(u8, rendered, "\n\n● Skills: Installed: root-skill") != null);
     try std.testing.expect(std.mem.endsWith(u8, rendered, "  Installed: nested-skill"));
-}
-
-test "models command opens the catalog without writing transcript output" {
-    const alloc = std.testing.allocator;
-    var app = try ModelCatalogCommandFakeApp.init(alloc);
-    defer app.deinit();
-    app.skills.openMenu();
-
-    try Handlers(ModelCatalogCommandFakeApp).commandShowModels(@ptrCast(&app));
-
-    try std.testing.expectEqual(@as(usize, 1), app.ensure_count);
-    try std.testing.expect(!app.skills.menu.active);
-    try std.testing.expect(app.model_cache.menu.active);
-    try std.testing.expectEqual(model_cache_runtime.ModelMenuLoadState.loading, app.model_cache.menu.load_state);
-    try std.testing.expectEqual(@as(usize, 0), app.shell.entries.items.len);
-    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
 test "help command opens the catalog without writing transcript output" {
@@ -4815,203 +4639,4 @@ test "skills show missing name keeps not found notice" {
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Skill 'missing' not found.") != null);
-}
-
-test "input appearance command without arguments reports session-local options" {
-    var app = InputAppearanceCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try runInputAppearanceCommandForTest(&app, "");
-
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "current: tint") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "available: lines, tint") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "/input lines") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "/input tint") != null);
-    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    try std.testing.expectEqual(@as(usize, 0), app.shell.render_requests.footer_requests);
-}
-
-test "input appearance command switches mode and requests footer redraw" {
-    var app = InputAppearanceCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try runInputAppearanceCommandForTest(&app, "lines");
-
-    try std.testing.expectEqual(InputAppearanceCommandFakeApp.InputAppearance.lines, app.input_runtime.input_appearance);
-    try std.testing.expectEqualStrings("lines", app.persisted_appearance);
-    try std.testing.expect(app.persisted_runtime_changed);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "switched to lines") != null);
-    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    try std.testing.expectEqual(@as(usize, 1), app.shell.render_requests.footer_requests);
-
-    app.transcript.clearRetainingCapacity();
-    try runInputAppearanceCommandForTest(&app, "lines");
-
-    try std.testing.expectEqual(InputAppearanceCommandFakeApp.InputAppearance.lines, app.input_runtime.input_appearance);
-    try std.testing.expectEqual(@as(usize, 2), app.persist_calls);
-    try std.testing.expectEqualStrings("lines", app.persisted_appearance);
-    try std.testing.expect(!app.persisted_runtime_changed);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "already in lines") != null);
-    try std.testing.expectEqual(@as(usize, 1), app.shell.render_requests.footer_requests);
-}
-
-test "input appearance command rejects unknown mode without changing state" {
-    var app = InputAppearanceCommandFakeApp{ .alloc = std.testing.allocator, .input_runtime = .{ .input_appearance = .tint } };
-    defer app.deinit();
-
-    try runInputAppearanceCommandForTest(&app, "card");
-
-    try std.testing.expectEqual(InputAppearanceCommandFakeApp.InputAppearance.tint, app.input_runtime.input_appearance);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Use: lines, tint") != null);
-    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
-    try std.testing.expectEqual(@as(usize, 0), app.shell.render_requests.footer_requests);
-}
-
-test "maxxing command switches presentation without changing input appearance" {
-    var app = MaxxingCommandFakeApp{ .alloc = std.testing.allocator, .shell = .{ .maxxing_mode = .legacy } };
-    defer app.deinit();
-    app.input_runtime.input_appearance = .lines;
-
-    try runMaxxingCommandForTest(&app, "minimal");
-
-    try std.testing.expectEqual(presentation_mode.MaxxingMode.minimal, app.shell.maxxing_mode);
-    try std.testing.expectEqual(input_appearance.InputAppearance.lines, app.input_runtime.input_appearance);
-    try std.testing.expectEqualStrings("minimal", app.persisted_mode);
-    try std.testing.expect(app.shell.render_requests.full_requests > 0);
-}
-
-test "maxxing command reports options and rejects unknown modes" {
-    var app = MaxxingCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try runMaxxingCommandForTest(&app, "");
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "current: minimal") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "/maxxing minimal") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "/maxxing legacy") != null);
-
-    app.transcript.clearRetainingCapacity();
-    try runMaxxingCommandForTest(&app, "bare");
-    try std.testing.expectEqual(presentation_mode.MaxxingMode.minimal, app.shell.maxxing_mode);
-    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Use: minimal, legacy") != null);
-}
-
-test "maxxing command switches to legacy with stored input appearance intact" {
-    var app = MaxxingCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-    app.input_runtime.input_appearance = .lines;
-
-    try runMaxxingCommandForTest(&app, "legacy");
-
-    try std.testing.expectEqual(presentation_mode.MaxxingMode.legacy, app.shell.maxxing_mode);
-    try std.testing.expectEqual(input_appearance.InputAppearance.lines, app.input_runtime.input_appearance);
-    try std.testing.expectEqualStrings("legacy", app.persisted_mode);
-}
-
-test "maxxing command accepts normal as a hidden legacy alias" {
-    var app = MaxxingCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try runMaxxingCommandForTest(&app, "normal");
-
-    try std.testing.expectEqual(presentation_mode.MaxxingMode.legacy, app.shell.maxxing_mode);
-    try std.testing.expectEqualStrings("legacy", app.persisted_mode);
-}
-
-test "sandbox command unknown argument prints only public usage" {
-    var app = SandboxCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try runSandboxCommandForTest(&app, "vercel");
-
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Use: os, none") != null);
-    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.sync_count);
-    try expectNoHiddenSandboxLabels(app.transcript.items);
-}
-
-test "sandbox command switches and persists canonical public labels" {
-    var app = SandboxCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    if (@import("builtin").os.tag == .macos) {
-        try runSandboxCommandForTest(&app, "os");
-        try std.testing.expectEqual(sandbox.BackendKind.macos, app.permission_state.sandbox_backend);
-        try std.testing.expectEqual(types.PermissionMode.auto, app.worker.synced.?.mode);
-        try std.testing.expectEqual(sandbox.BackendKind.macos, app.worker.synced.?.sandbox_backend);
-        try std.testing.expectEqualStrings("os", app.persisted.items);
-        try std.testing.expect(std.mem.find(u8, app.transcript.items, "switched to os") != null);
-    } else {
-        try runSandboxCommandForTest(&app, "os");
-        try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-        try std.testing.expectEqual(@as(usize, 0), app.worker.sync_count);
-        try std.testing.expectEqual(@as(usize, 0), app.persist_calls);
-        try std.testing.expect(std.mem.find(u8, app.transcript.items, "operating system sandbox is not available") != null);
-    }
-
-    app.permission_state.sandbox_backend = .macos;
-    app.persisted.clearRetainingCapacity();
-    app.persist_calls = 0;
-    app.transcript.clearRetainingCapacity();
-    try runSandboxCommandForTest(&app, "none");
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-    try std.testing.expectEqual(types.PermissionMode.auto, app.worker.synced.?.mode);
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.worker.synced.?.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.persist_calls);
-    try std.testing.expectEqualStrings("none", app.persisted.items);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "switched to none") != null);
-    try expectNoHiddenSandboxLabels(app.transcript.items);
-}
-
-test "sandbox command persists explicit unchanged public label" {
-    var app = SandboxCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try runSandboxCommandForTest(&app, "none");
-
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.sync_count);
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.worker.synced.?.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.persist_calls);
-    try std.testing.expectEqualStrings("none", app.persisted.items);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "already set to none") != null);
-    try expectNoHiddenSandboxLabels(app.transcript.items);
-}
-
-test "sandbox command reports runtime state when local persistence fails" {
-    var app = SandboxCommandFakeApp{
-        .alloc = std.testing.allocator,
-        .permission_state = .{ .sandbox_backend = .macos },
-        .persist_error = error.AccessDenied,
-    };
-    defer app.deinit();
-
-    try runSandboxCommandForTest(&app, "none");
-
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.sync_count);
-    try std.testing.expectEqual(@as(usize, 1), app.persist_calls);
-    try std.testing.expectEqual(@as(usize, 0), app.persisted.items.len);
-    try std.testing.expect(std.mem.find(
-        u8,
-        app.transcript.items,
-        "active for this process but not saved to local settings (scope=local, error=AccessDenied)",
-    ) != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "switched to none") != null);
-}
-
-test "sandbox unchanged selection stays explicit when persistence fails" {
-    var app = SandboxCommandFakeApp{
-        .alloc = std.testing.allocator,
-        .persist_error = error.AccessDenied,
-    };
-    defer app.deinit();
-
-    try runSandboxCommandForTest(&app, "none");
-
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.sync_count);
-    try std.testing.expectEqual(@as(usize, 1), app.persist_calls);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "active for this process but not saved") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "already set to none") != null);
 }

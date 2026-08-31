@@ -18,12 +18,10 @@ pub fn isReadOnlyCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
 
     const tool = registry.lookup(call.name) orelse return false;
     return switch (tool.executor_kind) {
-        .list_files, .glob_files => tool.activity_kind == .list,
+        .glob_files => tool.activity_kind == .list,
         .read_file,
         .read_tool_result,
-        .semantic_search,
         .grep_files,
-        .file_info,
         .skill,
         .web_fetch,
         .web_search,
@@ -71,6 +69,7 @@ pub const ParallelHookExecContext = struct {
     root_user_intent_context: []const u8,
     current_turn_messages: []const ChatMessage,
     session_grants: []const PermissionGrant,
+    permission_mode: types.PermissionMode,
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
     classification_complete: []const bool = &.{},
@@ -252,6 +251,7 @@ pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, in
         .result_allocator = alloc,
         .call = call,
         .authority = .ordinary,
+        .permission_mode = exec_ctx.permission_mode,
         .root_user_intent_context = exec_ctx.root_user_intent_context,
         .current_turn_messages = exec_ctx.current_turn_messages,
         .session_grants = exec_ctx.session_grants,
@@ -274,12 +274,11 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
     const tool_name = try alloc.dupe(u8, call.name);
     errdefer alloc.free(tool_name);
 
-    if (execution.background_command != null or
-        execution.diff_entry != null or
+    if (execution.diff_entry != null or
         execution.finish_turn or
         execution.selected_dynamic_tool_name != null or
         execution.selected_dynamic_tool_schema_json != null or
-        execution.prepared_result_memory != null or
+        execution.tool_result_memory_prepared or
         execution.committed_file_handoff != null or
         execution.deferred_tool_completion != null)
     {
@@ -302,9 +301,6 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
     errdefer freeOwnedToolExecutionResult(alloc, duplicated_execution);
     if (execution.status_detail) |detail| {
         duplicated_execution.status_detail = try alloc.dupe(u8, detail);
-    }
-    if (execution.display_output) |display| {
-        duplicated_execution.display_output = try alloc.dupe(u8, display);
     }
     if (execution.system_notice) |notice| {
         duplicated_execution.system_notice = try alloc.dupe(u8, notice);
@@ -358,6 +354,7 @@ fn duplicateToolResultMemory(
         .model_view_covers_full_file = memory.model_view_covers_full_file,
         .command_output_replay = command_output_replay,
         .command_process_presentation = memory.command_process_presentation,
+        .terminal_action_presentation = memory.terminal_action_presentation,
     };
 }
 
@@ -376,7 +373,6 @@ fn freeParallelToolResult(alloc: Allocator, result: ParallelToolResult) void {
 fn freeOwnedToolExecutionResult(alloc: Allocator, result: ToolExecutionResult) void {
     alloc.free(result.model_output);
     if (result.status_detail) |value| alloc.free(value);
-    if (result.display_output) |value| alloc.free(value);
     if (result.system_notice) |value| alloc.free(value);
     if (result.interactive_notice) |notice| types.freeSemanticNotice(alloc, notice);
     freeContextNotices(alloc, result.context_notices);
@@ -571,7 +567,7 @@ test "parallel read-only execution preserves order and failure fan-in" {
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
         toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-        toolCall("third", "file_info", "{\"path\":\"c\"}"),
+        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .output = "first output", .delay_ms = 20 },
@@ -600,7 +596,7 @@ test "parallel read-only execution preserves exact cancelled identity and comple
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
         toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-        toolCall("third", "file_info", "{\"path\":\"c\"}"),
+        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .output = "first output", .delay_ms = 10 },
@@ -647,7 +643,7 @@ test "parallel read-only execution does not relabel earlier ordinary cancellatio
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
         toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-        toolCall("third", "file_info", "{\"path\":\"c\"}"),
+        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .err = error.Cancelled, .delay_ms = 1 },
@@ -707,7 +703,6 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
     const execution: ToolExecutionResult = .{
         .model_output = "contents",
         .status_detail = "detail",
-        .display_output = "display",
         .system_notice = "notice",
         .interactive_notice = .{
             .topic = "background",

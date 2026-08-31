@@ -1,4 +1,5 @@
 const std = @import("std");
+const login_flow = @import("../auth/login_flow.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
@@ -40,6 +41,12 @@ const ImagePasteStage = struct {
 
 pub fn PasteEditRuntime(comptime App: type) type {
     return struct {
+        fn authCodeEntryActive(app: *const App) bool {
+            if (comptime !@hasField(App, "auth") or
+                !@hasDecl(@TypeOf(app.auth), "signInCodeEntryActive")) return false;
+            return app.auth.signInCodeEntryActive();
+        }
+
         pub fn beginPaste(app: *App, max_input_len: usize) void {
             const owner: paste_framing.Owner = if (app.question_prompt.isActive())
                 if (app.question_prompt.isFreeformSelected()) .question_freeform else .decision_prompt
@@ -47,10 +54,13 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 .approval_amendment
             else if (app.approval_prompt.isActive())
                 .decision_prompt
+            else if (authCodeEntryActive(app))
+                .auth_code
             else
                 .composer;
             const buffer_limit = switch (owner) {
                 .composer => app.input_runtime.replacementState(&app.pending_images).availableBytesForSelectionOrInsertion(max_input_len),
+                .auth_code => login_flow.max_manual_code_bytes,
                 .none, .decision_prompt, .question_freeform, .approval_amendment => max_input_len,
             };
 
@@ -109,7 +119,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     const render_reason: render_request.Reason = switch (owner) {
                         .composer => .footer,
                         .decision_prompt, .question_freeform, .approval_amendment => .modal,
-                        .none => return false,
+                        .none, .auth_code => .footer,
                     };
                     app.input_runtime.paste.resetWithTrace(.unsafe_suffix);
                     app.shell.render_requests.request(render_reason);
@@ -126,11 +136,21 @@ pub fn PasteEditRuntime(comptime App: type) type {
         pub fn finishPaste(app: *App, max_input_len: usize) !void {
             if (app.input_runtime.paste.overflow_bytes > 0) {
                 const attempted_bytes = app.input_runtime.paste.attemptedBytes();
+                if (app.input_runtime.paste.owner == .auth_code) {
+                    app.input_runtime.paste.resetSecretWithTrace(.{ .input_limit = .auth_code });
+                    app.shell.render_requests.request(.footer);
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "The authorization code is too long.",
+                    }, true);
+                    return;
+                }
                 const owner: text_scalar.Owner = switch (app.input_runtime.paste.owner) {
                     .composer => .composer,
                     .question_freeform => .question_freeform,
                     .approval_amendment => .approval_amendment,
-                    .none, .decision_prompt => unreachable,
+                    .none, .decision_prompt, .auth_code => unreachable,
                 };
                 app.input_runtime.paste.resetWithTrace(.{ .input_limit = switch (owner) {
                     .composer => .composer,
@@ -150,6 +170,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     const normalized = normalizeApprovalAmendmentPasteInPlace(app.input_runtime.paste.buffer.items);
                     app.input_runtime.paste.buffer.items.len = normalized.len;
                 },
+                .auth_code => {},
                 else => {},
             }
 
@@ -242,6 +263,30 @@ pub fn PasteEditRuntime(comptime App: type) type {
                         app.input_runtime.paste.resetWithTrace(.session_reset);
                     }
                 },
+                .auth_code => {
+                    if (comptime @hasField(App, "auth") and
+                        @hasDecl(@TypeOf(app.auth), "replaceSignInCodeInput"))
+                    {
+                        const accepted = try app.auth.replaceSignInCodeInput(
+                            app.alloc,
+                            app.input_runtime.paste.buffer.items,
+                        );
+                        if (!accepted) {
+                            app.input_runtime.paste.resetSecretWithTrace(.session_reset);
+                            try app.writeDomainNotice(.{
+                                .topic = "auth",
+                                .tone = .@"error",
+                                .body = "The authorization code is invalid.",
+                            }, true);
+                            return;
+                        }
+                        app.input_runtime.paste.beginHandling();
+                        app.input_runtime.paste.finishSecretHandled();
+                        app.shell.render_requests.request(.footer);
+                    } else {
+                        app.input_runtime.paste.resetSecretWithTrace(.session_reset);
+                    }
+                },
             }
         }
 
@@ -259,6 +304,14 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 .text => |text| text,
                 .unchanged => app.input_runtime.paste.buffer.items,
             };
+
+            if (comptime @hasField(App, "scripting")) {
+                const app_lua_runtime = @import("app_lua_runtime.zig");
+                if (app_lua_runtime.Runtime(App).dispatchPaste(app, "insert", payload)) {
+                    app.input_runtime.paste.buffer.clearRetainingCapacity();
+                    return;
+                }
+            }
 
             if (paste_decoder.isDropShapedPaste(payload) or
                 image_attachments.hasImagePathToken(payload) or

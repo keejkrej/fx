@@ -134,7 +134,7 @@ Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `backg
 
 Security is permission-first. All sensitive tool behavior must integrate with `src/core/permissions/permissions.zig`.
 
-* `permission_mode` controls baseline (`ask`, `auto`, or `yolo`). Yolo bypasses Fx permission policy and uses an effective sandbox of `none` without rewriting saved sandbox configuration
+* `permission_mode` controls baseline (`ask`, `auto`, or `yolo`). Yolo bypasses fx permission policy and uses an effective sandbox of `none` without rewriting saved sandbox configuration
 
 * Configured denies are evaluated before saved-session rules; an exact saved-session deny can narrow a configured allow, while an exact saved-session allow can satisfy an unresolved configured ask
 
@@ -142,7 +142,11 @@ Security is permission-first. All sensitive tool behavior must integrate with `s
 
 * `/permissions remember allow|deny <tool-name> <arguments-json>` confirms and stores an exact rule only for an active saved session; list and revoke those rules by their stable IDs
 
-* An `auto_denied` result may carry an opaque approval request ID. Only `ask_user_question` with that exact current-turn ID may enter the real permission screen; generic model or user text never authorizes the action, and execution still requires exact live revalidation
+* Routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy. Every remaining unresolved `auto` action receives one review using the current proven root request, the exact action and targets, origin and call identity, optional host-proven current-branch evidence, exact-copy provenance, and bounded masked terminal-safe excerpts of earlier current-turn tool results. Those excerpts are untrusted evidence and never authority; assistant prose, permission feedback, the pending tool group, later results, and historical requests do not enter review
+
+* A `clear` review authorizes only the exact unchanged action. A `caution` or unavailable review holds only that action, returns advice to the agent, and never opens a human permission screen, disables tools, or ends the turn
+
+* Exact cautions are reused only for the current turn. Changed actions receive a new review. Legacy `permission_request_id` input is rejected without prompting
 
 Do not bypass the permission system for new tools.
 
@@ -279,7 +283,7 @@ A Full CI result is valid only when it belongs to the exact current commit and a
 
 ## Reproducing Render Bugs
 
-fx's rendering is inline by default and deliberately emits a small ANSI subset. Six owner classes are the narrow exceptions, and each takes the alternate buffer exclusively through `AlternateScreenOwner` in `src/ui/shell_runtime.zig`: interactive permission review, the full-transcript screen, catalog menus, the ctrl+x subagent manager, a hosted child-terminal takeover, and the read-only code viewer (including view-only diffs). The terminal-session owner is entered only by an explicit manager handoff after the host grants the human write lease; it renders the shared terminal-engine grid without permanent Fx chrome and releases that lease on detach. Only one class may own the buffer at a time, and each must leave it and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes when it closes. Transcript rendering, question prompts, and command-output expansion remain inline. Three tools exist for reproducing and regression-proofing render bugs:
+fx's rendering is inline by default and deliberately emits a small ANSI subset. Five owner classes are the narrow exceptions, and each takes the alternate buffer exclusively through `AlternateScreenOwner` in `src/ui/shell_runtime.zig`: interactive permission review, the full-transcript screen, catalog menus, the ctrl+x subagent manager, and a hosted child-terminal takeover. The terminal-session owner is entered only by an explicit manager handoff after the host grants the human write lease; it renders the shared terminal-engine grid without permanent fx chrome and releases that lease on detach. Only one class may own the buffer at a time, and each must leave it and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes when it closes. Transcript rendering, question prompts, and command-output expansion remain inline. Three tools exist for reproducing and regression-proofing render bugs:
 
 ### tmux (live TTY repros)
 
@@ -332,7 +336,7 @@ Current raw wall-clock contract:
 * Non-Linux local runs: informational raw means
 
 The Linux CI runner is the authoritative product budget. Local macOS process
-and dynamic-loader floors vary enough to exceed 2ms independently of Fx, so
+and dynamic-loader floors vary enough to exceed 2ms independently of fx, so
 local runs report raw means without assigning a substitute product budget. The
 process baseline is diagnostic only and is never subtracted.
 

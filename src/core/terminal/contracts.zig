@@ -28,11 +28,13 @@ pub const protocol_capability_authority_generations: u64 = 1 << 0;
 pub const protocol_capability_screen_checkpoints: u64 = 1 << 1;
 pub const protocol_capability_tmux_recovery: u64 = 1 << 2;
 pub const protocol_capability_path_outside_workspace_error: u64 = 1 << 3;
+pub const protocol_capability_complete_process_tree_signals: u64 = 1 << 4;
 pub const known_protocol_capabilities: u64 =
     protocol_capability_authority_generations |
     protocol_capability_screen_checkpoints |
     protocol_capability_tmux_recovery |
-    protocol_capability_path_outside_workspace_error;
+    protocol_capability_path_outside_workspace_error |
+    protocol_capability_complete_process_tree_signals;
 
 pub const Action = enum {
     start,
@@ -505,6 +507,10 @@ pub const WriteLeaseIntent = enum {
     revoke,
 };
 
+fn write_payload_required(lease: WriteLeaseIntent) bool {
+    return lease == .use;
+}
+
 pub const WriteRequest = struct {
     session_id: []const u8,
     payload: ?WritePayload = null,
@@ -684,16 +690,10 @@ pub const ActionRequest = union(enum) {
             },
             .write => |request| {
                 try validate_session_id(request.session_id);
-                switch (request.lease) {
-                    .acquire, .release, .revoke => if (request.payload != null) {
-                        return error.InvalidWritePayload;
-                    },
-                    .use => if (request.payload) |payload| {
-                        try payload.validate();
-                    } else {
-                        return error.InvalidWritePayload;
-                    },
+                if (write_payload_required(request.lease) != (request.payload != null)) {
+                    return error.InvalidWritePayload;
                 }
+                if (request.payload) |payload| try payload.validate();
                 try validate_optional_authority_claim(request.authority);
             },
             .wait => |request| {
@@ -729,6 +729,36 @@ pub const ActionRequest = union(enum) {
         }
     }
 };
+
+pub fn required_capabilities(request: ActionRequest) u64 {
+    var required = protocol_capability_authority_generations;
+    switch (request) {
+        .start => |start| {
+            required |= protocol_capability_complete_process_tree_signals;
+            if (start.backend == .tmux) {
+                required |= protocol_capability_tmux_recovery;
+            }
+        },
+        .signal => {
+            required |= protocol_capability_complete_process_tree_signals;
+        },
+        .close => |close| {
+            if (close.policy == .force) {
+                required |= protocol_capability_complete_process_tree_signals;
+            }
+        },
+        .read,
+        .screen,
+        .write,
+        .wait,
+        .monitor,
+        .inspect,
+        .list,
+        .resize,
+        => {},
+    }
+    return required;
+}
 
 fn validate_optional_authority_claim(claim: ?AuthorityClaim) error{
     InvalidPrincipal,
@@ -979,7 +1009,6 @@ fn clone_principal(
         .workspace_root = workspace_root,
         .cwd = try alloc.dupe(u8, principal.cwd),
         .transport_role = principal.transport_role,
-        .sandbox_backend = principal.sandbox_backend,
         .backend = principal.backend,
         .lifetime = principal.lifetime,
     };
@@ -1033,7 +1062,6 @@ fn clone_optional_owner_catalog_claim(
                 value.principal.workspace_root,
             ),
             .transport_role = value.principal.transport_role,
-            .sandbox_backend = value.principal.sandbox_backend,
         },
         .actor = value.actor,
         .proof = value.proof,
@@ -1727,7 +1755,6 @@ pub const Principal = struct {
     workspace_root: []const u8,
     cwd: []const u8,
     transport_role: TransportRole,
-    sandbox_backend: types.BackendKind,
     backend: Backend,
     lifetime: TerminalLifetime = .session,
 
@@ -1747,7 +1774,6 @@ pub const Principal = struct {
             std.mem.eql(u8, self.workspace_root, other.workspace_root) and
             std.mem.eql(u8, self.cwd, other.cwd) and
             self.transport_role == other.transport_role and
-            self.sandbox_backend == other.sandbox_backend and
             self.backend == other.backend and
             self.lifetime == other.lifetime;
     }
@@ -1758,7 +1784,6 @@ pub const OwnerCatalogPrincipal = struct {
     durable_session_id: []const u8,
     workspace_root: []const u8,
     transport_role: TransportRole,
-    sandbox_backend: types.BackendKind,
 
     pub fn validate(self: OwnerCatalogPrincipal) error{
         InvalidPrincipal,
@@ -1776,8 +1801,7 @@ pub const OwnerCatalogPrincipal = struct {
         return std.mem.eql(u8, self.profile_user, other.profile_user) and
             std.mem.eql(u8, self.durable_session_id, other.durable_session_id) and
             std.mem.eql(u8, self.workspace_root, other.workspace_root) and
-            self.transport_role == other.transport_role and
-            self.sandbox_backend == other.sandbox_backend;
+            self.transport_role == other.transport_role;
     }
 };
 
@@ -1911,6 +1935,7 @@ pub fn lifecycle_controls(lifecycle: Lifecycle) AllowedControls {
             .screen = true,
             .write = true,
             .wait = true,
+            .monitor = true,
             .inspect = true,
             .list = true,
             .resize = true,
@@ -2378,6 +2403,7 @@ pub const StructuredErrorCode = enum {
     session_not_found,
     invalid_lifecycle,
     authority_denied,
+    authority_retired,
     lease_conflict,
     cursor_gap,
     screen_unavailable,
@@ -3347,6 +3373,36 @@ test "action request validation enforces binding and bounded input rules" {
     );
 }
 
+test "write payload presence follows the lease intent" {
+    const cases = [_]struct {
+        lease: WriteLeaseIntent,
+        payload_present: bool,
+        accepted: bool,
+    }{
+        .{ .lease = .acquire, .payload_present = false, .accepted = true },
+        .{ .lease = .acquire, .payload_present = true, .accepted = false },
+        .{ .lease = .use, .payload_present = false, .accepted = false },
+        .{ .lease = .use, .payload_present = true, .accepted = true },
+        .{ .lease = .release, .payload_present = false, .accepted = true },
+        .{ .lease = .release, .payload_present = true, .accepted = false },
+        .{ .lease = .revoke, .payload_present = false, .accepted = true },
+        .{ .lease = .revoke, .payload_present = true, .accepted = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.accepted, write_payload_required(case.lease) == case.payload_present);
+        const request = ActionRequest{ .write = .{
+            .session_id = "terminal-1",
+            .lease = case.lease,
+            .payload = if (case.payload_present) .{ .text = "input" } else null,
+        } };
+        if (case.accepted) {
+            try request.validate();
+        } else {
+            try std.testing.expectError(error.InvalidWritePayload, request.validate());
+        }
+    }
+}
+
 test "start persistence binds authority to cwd backend and a nonzero proof" {
     const persistence = StartPersistence{
         .grant = .{
@@ -3356,7 +3412,6 @@ test "start persistence binds authority to cwd backend and a nonzero proof" {
                 .workspace_root = "/workspace",
                 .cwd = "/workspace",
                 .transport_role = .interactive,
-                .sandbox_backend = .none,
                 .backend = .native,
             },
             .actor = .agent,
@@ -3417,7 +3472,6 @@ fn check_owned_action_request_allocation_failures(alloc: Allocator) !void {
                     .workspace_root = "/workspace",
                     .cwd = "/workspace",
                     .transport_role = .interactive,
-                    .sandbox_backend = .none,
                     .backend = .native,
                 },
                 .actor = .agent,
@@ -3977,7 +4031,6 @@ fn test_principal() Principal {
         .workspace_root = "/workspace",
         .cwd = "/workspace/src",
         .transport_role = .interactive,
-        .sandbox_backend = .macos,
         .backend = .native,
     };
 }
@@ -4055,6 +4108,26 @@ test "next actions are the pure lifecycle authority and lease intersection" {
         .{},
     );
     try std.testing.expectEqual(AllowedControls.observer(), observer);
+
+    const lifecycle_cases = [_]struct {
+        lifecycle: Lifecycle,
+        monitor: bool,
+    }{
+        .{ .lifecycle = .starting, .monitor = true },
+        .{ .lifecycle = .running, .monitor = true },
+        .{ .lifecycle = .exited, .monitor = false },
+        .{ .lifecycle = .lost, .monitor = false },
+        .{ .lifecycle = .closed, .monitor = false },
+    };
+    for (lifecycle_cases) |case| {
+        const projected = project_next_actions(
+            case.lifecycle,
+            .full(),
+            .agent,
+            .{},
+        );
+        try std.testing.expectEqual(case.monitor, projected.monitor);
+    }
 
     const leased = project_next_actions(
         .running,
@@ -4141,6 +4214,111 @@ test "protocol negotiates current and previous revisions without destructive fal
             .required_capabilities = 1 << 63,
         }).validate(),
     );
+}
+
+test "protocol accepts complete process tree signal capability" {
+    const complete_process_tree_signals: u64 = 1 << 4;
+    try (ProtocolHello{
+        .range = local_protocol_range,
+        .capabilities = complete_process_tree_signals,
+        .required_capabilities = complete_process_tree_signals,
+    }).validate();
+}
+
+test "durable actions derive policy specific protocol capabilities" {
+    const authority = protocol_capability_authority_generations;
+    const complete_signals = protocol_capability_complete_process_tree_signals;
+    const tmux_recovery = protocol_capability_tmux_recovery;
+    const cases = [_]struct {
+        request: ActionRequest,
+        expected: u64,
+    }{
+        .{
+            .request = .{ .start = .{ .cwd = "/" } },
+            .expected = authority | complete_signals,
+        },
+        .{
+            .request = .{ .start = .{ .cwd = "/", .backend = .tmux } },
+            .expected = authority | complete_signals | tmux_recovery,
+        },
+        .{
+            .request = .{ .read = .{
+                .session_id = "terminal-a",
+                .cursor = .{ .segment = 1, .offset = 0 },
+            } },
+            .expected = authority,
+        },
+        .{
+            .request = .{ .screen = .{ .session_id = "terminal-a" } },
+            .expected = authority,
+        },
+        .{
+            .request = .{ .write = .{
+                .session_id = "terminal-a",
+                .lease = .acquire,
+            } },
+            .expected = authority,
+        },
+        .{
+            .request = .{ .wait = .{
+                .session_id = "terminal-a",
+                .return_when = .exit,
+                .safety_ceiling_ms = 1,
+            } },
+            .expected = authority,
+        },
+        .{
+            .request = .{ .monitor = .{
+                .session_id = "terminal-a",
+                .operation = .{ .pause = "monitor-a" },
+            } },
+            .expected = authority,
+        },
+        .{
+            .request = .{ .inspect = .{ .session_id = "terminal-a" } },
+            .expected = authority,
+        },
+        .{
+            .request = .{ .list = .{} },
+            .expected = authority,
+        },
+        .{
+            .request = .{ .resize = .{
+                .session_id = "terminal-a",
+                .dimensions = .{ .rows = 24, .columns = 80 },
+            } },
+            .expected = authority,
+        },
+        .{
+            .request = .{ .signal = .{
+                .session_id = "terminal-a",
+                .signal = .interrupt,
+            } },
+            .expected = authority | complete_signals,
+        },
+        .{
+            .request = .{ .close = .{
+                .session_id = "terminal-a",
+                .policy = .graceful,
+            } },
+            .expected = authority,
+        },
+        .{
+            .request = .{ .close = .{
+                .session_id = "terminal-a",
+                .policy = .force,
+            } },
+            .expected = authority | complete_signals,
+        },
+    };
+
+    for (cases) |case| {
+        try case.request.validate();
+        try std.testing.expectEqual(
+            case.expected,
+            required_capabilities(case.request),
+        );
+    }
 }
 
 test "hello envelopes bridge older incompatible ranges without admitting old actions" {

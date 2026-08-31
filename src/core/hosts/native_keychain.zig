@@ -7,12 +7,14 @@ const secret = @import("../auth/secret.zig");
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
 pub const openai_api_key_service_name = "FX_OPENAI_API_KEY";
 const mcp_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V1";
+pub const oauth_session_service_name = "FX_OAUTH_SESSION_V1";
 
 /// Backing store for a resolved account name. Must outlive any argv built from it.
 pub const AccountBuffer = [256]u8;
 
 const passwd_scratch_bytes = 2048;
 const max_mcp_credentials_bytes: usize = 1024 * 1024;
+const max_oauth_session_bytes: usize = 64 * 1024;
 const keychain_process_timeout: std.Io.Timeout = .{
     .duration = .{
         .raw = .{ .nanoseconds = 10 * std.time.ns_per_s },
@@ -37,6 +39,58 @@ pub fn isAvailable() bool {
 pub fn isDisabled() bool {
     const value = io_mod.getenv("FX_DISABLE_KEYCHAIN") orelse return false;
     return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true");
+}
+
+pub fn userDefaultKeychainAvailable(alloc: std.mem.Allocator) Error!bool {
+    return userDefaultKeychainAvailableControlled(alloc, null);
+}
+
+pub fn userDefaultKeychainAvailableCancellable(
+    alloc: std.mem.Allocator,
+    cancel_flag: *const std.atomic.Value(bool),
+) Error!bool {
+    return userDefaultKeychainAvailableControlled(alloc, cancel_flag);
+}
+
+fn userDefaultKeychainAvailableControlled(
+    alloc: std.mem.Allocator,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) Error!bool {
+    if (!isAvailable()) return false;
+    return userDefaultKeychainAvailableForCommand(
+        alloc,
+        &.{ "/usr/bin/security", "default-keychain", "-d", "user" },
+        cancel_flag,
+    );
+}
+
+fn userDefaultKeychainAvailableForCommand(
+    alloc: std.mem.Allocator,
+    argv: []const []const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) Error!bool {
+    const result = runMcpKeychainProcess(
+        alloc,
+        argv,
+        cancel_flag,
+        .limited(4096),
+    ) catch |err| {
+        if (err == error.Cancelled) return error.Cancelled;
+        debug_trace.logf("keychain", "availability failed step=spawn err={s}", .{@errorName(err)});
+        return error.KeychainReadFailed;
+    };
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| {
+            if (code == 0) return true;
+            debug_trace.logf("keychain", "availability unavailable exit_code={d}", .{code});
+            return false;
+        },
+        else => {},
+    }
+    debug_trace.logf("keychain", "availability failed step=default term={t}", .{result.term});
+    return error.KeychainReadFailed;
 }
 
 /// Returns a slice borrowing `buf`. `USER` stays authoritative when set, because it
@@ -87,6 +141,10 @@ pub fn loadNamed(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
 
 pub fn loadMcpCredentials(alloc: std.mem.Allocator) !?[]u8 {
     return loadMcpValueMacControlled(alloc, mcp_credentials_service_name, null);
+}
+
+pub fn loadOAuthSession(alloc: std.mem.Allocator) !?[]u8 {
+    return loadMcpValueMacControlled(alloc, oauth_session_service_name, null);
 }
 
 pub fn loadMcpCredentialsCancellable(
@@ -268,6 +326,14 @@ pub fn storeMcpCredentials(value: []const u8) Error!void {
     return storeMcpCredentialsControlled(value, null);
 }
 
+pub fn storeOAuthSession(value: []const u8) Error!void {
+    if (!isAvailable()) return error.UnsupportedPlatform;
+    if (value.len == 0 or value.len > max_oauth_session_bytes) {
+        return error.KeychainWriteFailed;
+    }
+    return storeMcpValueMac(oauth_session_service_name, value);
+}
+
 pub fn storeMcpCredentialsCancellable(
     value: []const u8,
     cancel_flag: *const std.atomic.Value(bool),
@@ -296,6 +362,10 @@ fn storeMcpCredentialsControlled(
 
 pub fn deleteMcpCredentials(alloc: std.mem.Allocator) Error!bool {
     return deleteMcpValueMac(alloc, mcp_credentials_service_name);
+}
+
+pub fn deleteOAuthSession(alloc: std.mem.Allocator) Error!bool {
+    return deleteMcpValueMac(alloc, oauth_session_service_name);
 }
 
 fn writeFailed(step: []const u8, err: anyerror) Error {
@@ -734,6 +804,35 @@ test "cancellable MCP Keychain runner interrupts and reaps a stalled child" {
             &.{ "/bin/sh", "-c", "exec sleep 60" },
             &cancel,
             .limited(16),
+        ),
+    );
+    thread.join();
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+}
+
+test "default Keychain availability probe is cancellable" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const Canceller = struct {
+        flag: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            io_mod.sleep(25 * std.time.ns_per_ms);
+            self.flag.store(true, .release);
+        }
+    };
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var canceller = Canceller{ .flag = &cancel };
+    const thread = try std.Thread.spawn(.{}, Canceller.run, .{&canceller});
+    const started_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.Cancelled,
+        userDefaultKeychainAvailableForCommand(
+            std.testing.allocator,
+            &.{ "/bin/sh", "-c", "exec sleep 60" },
+            &cancel,
         ),
     );
     thread.join();

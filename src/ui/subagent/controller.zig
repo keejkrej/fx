@@ -26,6 +26,10 @@ pub const Controller = struct {
     view_active: bool = false,
     last_refresh_ms: i64 = 0,
 
+    pub noinline fn init() Controller {
+        return .{ .runtime = subagent_runtime.Runtime.init() };
+    }
+
     pub fn deinit(self: *Controller, alloc: Allocator) void {
         self.runtime.deinit(alloc);
         self.view_active = false;
@@ -135,6 +139,13 @@ pub const Controller = struct {
         prompt_id: u64,
     ) ?subagent_runtime.MainApprovalBinding {
         return self.runtime.mainApprovalBinding(prompt_id);
+    }
+
+    pub fn mainApprovalCardBinding(
+        self: *const Controller,
+        prompt_id: u64,
+    ) ?subagent_runtime.MainApprovalBinding {
+        return self.runtime.mainApprovalCardBinding(prompt_id);
     }
 
     pub fn dismissMainApproval(self: *Controller) void {

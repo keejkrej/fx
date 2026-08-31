@@ -9,10 +9,16 @@ const types = @import("../shared/types.zig");
 const pathing = @import("../workspace/pathing.zig");
 
 pub const max_image_bytes: usize = 20 * 1024 * 1024;
+const max_encoded_image_bytes: usize = 5 * 1024 * 1024;
 pub const image_too_large_notice = "image exceeds the 20 MiB limit";
+pub const image_preparation_failed_notice = "Unable to prepare this image for upload. Use a smaller image.";
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const snapshot_digest_hex_len = Sha256.digest_length * 2;
 const transfer_buffer_bytes = 64 * 1024;
+const image_normalization_timeout = std.Io.Clock.Duration{
+    .clock = .awake,
+    .raw = .fromSeconds(5),
+};
 
 pub fn findById(
     attachments: []const types.ImageAttachment,
@@ -237,6 +243,7 @@ pub const CaptureAdmissionResult = enum {
 fn captureRejectionNotice(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.ImageTooLarge => image_too_large_notice,
+        error.ImagePreparationFailed => image_preparation_failed_notice,
         else => null,
     };
 }
@@ -487,7 +494,7 @@ fn captureImageSnapshotFromOpenFileWithBudget(
         deleteSnapshotFile(snapshot_dir_handle, source_temp_name, "capture_source_temp");
     };
 
-    const metadata = try streamSourceToFile(
+    const source_metadata = try streamSourceToFile(
         source,
         snapshot_dir_handle,
         source_temp_name,
@@ -495,6 +502,65 @@ fn captureImageSnapshotFromOpenFileWithBudget(
         budget,
     );
     try budget.check();
+
+    var selected_temp_name: []const u8 = source_temp_name;
+    var metadata = source_metadata;
+    var candidate_temp_name: ?[]u8 = null;
+    defer if (candidate_temp_name) |name| alloc.free(name);
+    var cleanup_candidate_temp = false;
+    defer if (cleanup_candidate_temp) {
+        deleteSnapshotFile(
+            snapshot_dir_handle,
+            candidate_temp_name.?,
+            "capture_candidate_temp",
+        );
+    };
+
+    if (!fitsEncodedLimit(source_metadata.size_bytes)) {
+        if (comptime builtin.os.tag != .macos) return error.ImagePreparationFailed;
+
+        var candidate_suffix: u64 = undefined;
+        io_mod.getIo().random(std.mem.asBytes(&candidate_suffix));
+        candidate_temp_name = try std.fmt.allocPrint(
+            alloc,
+            "image-{d}.candidate.{x}",
+            .{ attachment.id, candidate_suffix },
+        );
+        cleanup_candidate_temp = true;
+        var candidate_placeholder = try snapshot_dir_handle.createFile(
+            io_mod.getIo(),
+            candidate_temp_name.?,
+            .{
+                .truncate = false,
+                .exclusive = true,
+                .permissions = std.Io.File.Permissions.fromMode(0o600),
+                .resolve_beneath = true,
+            },
+        );
+        candidate_placeholder.close(io_mod.getIo());
+
+        const source_temp_path = try std.fs.path.join(
+            alloc,
+            &.{ snapshot_dir, source_temp_name },
+        );
+        defer alloc.free(source_temp_path);
+        const candidate_temp_path = try std.fs.path.join(
+            alloc,
+            &.{ snapshot_dir, candidate_temp_name.? },
+        );
+        defer alloc.free(candidate_temp_path);
+
+        prepareImageCandidate(source_temp_path, candidate_temp_path, budget) catch |err| switch (err) {
+            error.FileNotFound => return error.ImagePreparationFailed,
+            else => return err,
+        };
+        metadata = try inspectImageCandidate(
+            snapshot_dir_handle,
+            candidate_temp_name.?,
+            budget,
+        );
+        selected_temp_name = candidate_temp_name.?;
+    }
 
     const media_type = try alloc.dupe(u8, metadata.media_type);
     errdefer alloc.free(media_type);
@@ -509,12 +575,16 @@ fn captureImageSnapshotFromOpenFileWithBudget(
     errdefer alloc.free(final_path);
     try budget.check();
     try snapshot_dir_handle.rename(
-        source_temp_name,
+        selected_temp_name,
         snapshot_dir_handle,
         final_name,
         io_mod.getIo(),
     );
-    cleanup_source_temp = false;
+    if (std.mem.eql(u8, selected_temp_name, source_temp_name)) {
+        cleanup_source_temp = false;
+    } else {
+        cleanup_candidate_temp = false;
+    }
     var cleanup_final = true;
     errdefer if (cleanup_final) {
         deleteSnapshotFile(snapshot_dir_handle, final_name, "capture_final");
@@ -589,13 +659,203 @@ fn streamSourceToFile(
     return .{
         .digest_hex = std.fmt.bytesToHex(digest, .lower),
         .media_type = media_type,
+        .size_bytes = written,
     };
 }
 
 const SnapshotMetadata = struct {
     digest_hex: [snapshot_digest_hex_len]u8,
     media_type: []const u8,
+    size_bytes: usize,
 };
+
+fn fitsEncodedLimit(raw_bytes: usize) bool {
+    const rounded = std.math.add(usize, raw_bytes, 2) catch return false;
+    const groups = @divTrunc(rounded, 3);
+    const encoded_bytes = std.math.mul(usize, groups, 4) catch return false;
+    return encoded_bytes <= max_encoded_image_bytes;
+}
+
+const ImageNormalizerEvent = union(enum) {
+    wait: anyerror!std.process.Child.Term,
+    timeout: anyerror!void,
+    cancelled: anyerror!void,
+};
+
+fn waitForImageNormalizerChild(child: *std.process.Child) anyerror!std.process.Child.Term {
+    return child.wait(io_mod.getIo());
+}
+
+fn waitForImageNormalizerTimeout(deadline: std.Io.Clock.Timestamp) anyerror!void {
+    return std.Io.Timeout.sleep(.{ .deadline = deadline }, io_mod.getIo());
+}
+
+fn waitForImageNormalizerCancellation(
+    cancel_flag: *const std.atomic.Value(bool),
+) anyerror!void {
+    while (!cancel_flag.load(.acquire)) {
+        try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
+fn waitForImageNormalizer(
+    child: *std.process.Child,
+    deadline: std.Io.Clock.Timestamp,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !std.process.Child.Term {
+    var select_buffer: [3]ImageNormalizerEvent = undefined;
+    var select: std.Io.Select(ImageNormalizerEvent) = .init(
+        io_mod.getIo(),
+        &select_buffer,
+    );
+    select.concurrent(.wait, waitForImageNormalizerChild, .{child}) catch |err|
+        return err;
+    select.concurrent(
+        .timeout,
+        waitForImageNormalizerTimeout,
+        .{deadline},
+    ) catch |err| {
+        select.cancelDiscard();
+        return err;
+    };
+    if (cancel_flag) |flag| {
+        select.concurrent(
+            .cancelled,
+            waitForImageNormalizerCancellation,
+            .{flag},
+        ) catch |err| {
+            select.cancelDiscard();
+            return err;
+        };
+    }
+
+    const event = select.await() catch |err| {
+        select.cancelDiscard();
+        return err;
+    };
+    return switch (event) {
+        .wait => |result| blk: {
+            select.cancelDiscard();
+            break :blk result catch |err| return err;
+        },
+        .timeout => |result| {
+            result catch |err| {
+                select.cancelDiscard();
+                return err;
+            };
+            select.cancelDiscard();
+            return error.TimedOut;
+        },
+        .cancelled => |result| {
+            result catch |err| {
+                select.cancelDiscard();
+                return err;
+            };
+            select.cancelDiscard();
+            return error.Cancelled;
+        },
+    };
+}
+
+fn runImageNormalizerProcess(
+    argv: []const []const u8,
+    budget: CaptureBudget,
+) !void {
+    try budget.check();
+    var child = try std.process.spawn(io_mod.getIo(), .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(io_mod.getIo());
+
+    const deadline = budget.deadline orelse
+        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), image_normalization_timeout);
+    const term = try waitForImageNormalizer(&child, deadline, budget.cancel_flag);
+    switch (term) {
+        .exited => |code| if (code != 0) return error.ImagePreparationFailed,
+        .signal, .stopped, .unknown => return error.ImagePreparationFailed,
+    }
+}
+
+fn prepareImageCandidate(
+    source_path: []const u8,
+    candidate_path: []const u8,
+    budget: CaptureBudget,
+) !void {
+    const argv = [_][]const u8{
+        "/usr/bin/sips",
+        "-s",
+        "format",
+        "jpeg",
+        "-s",
+        "formatOptions",
+        "85",
+        "-Z",
+        "2000",
+        source_path,
+        "--out",
+        candidate_path,
+    };
+    try runImageNormalizerProcess(&argv, budget);
+}
+
+fn inspectImageCandidate(
+    snapshot_dir: std.Io.Dir,
+    candidate_name: []const u8,
+    budget: CaptureBudget,
+) !SnapshotMetadata {
+    try budget.check();
+    var candidate = snapshot_dir.openFile(io_mod.getIo(), candidate_name, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound, error.IsDir, error.NotDir, error.SymLinkLoop => return error.ImagePreparationFailed,
+        else => return err,
+    };
+    defer candidate.close(io_mod.getIo());
+    const stat = try candidate.stat(io_mod.getIo());
+    if (stat.kind != .file or stat.nlink != 1) return error.ImagePreparationFailed;
+    const size_bytes = std.math.cast(usize, stat.size) orelse
+        return error.ImagePreparationFailed;
+    if (size_bytes > max_image_bytes or !fitsEncodedLimit(size_bytes)) {
+        return error.ImagePreparationFailed;
+    }
+
+    var hasher = Sha256.init(.{});
+    var header: [64]u8 = undefined;
+    var header_len: usize = 0;
+    var read_buffer: [8192]u8 = undefined;
+    var reader = candidate.readerStreaming(io_mod.getIo(), &read_buffer);
+    var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
+    var read_bytes: usize = 0;
+    while (true) {
+        try budget.check();
+        const n = try reader.interface.readSliceShort(&transfer_buffer);
+        if (n == 0) break;
+        if (n > max_image_bytes - read_bytes) return error.ImagePreparationFailed;
+        const header_bytes = @min(n, header.len - header_len);
+        @memcpy(header[header_len..][0..header_bytes], transfer_buffer[0..header_bytes]);
+        header_len += header_bytes;
+        hasher.update(transfer_buffer[0..n]);
+        read_bytes += n;
+    }
+    if (read_bytes != size_bytes or !fitsEncodedLimit(read_bytes)) {
+        return error.ImagePreparationFailed;
+    }
+
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const media_type = detectMediaTypeFromBytes(header[0..header_len]) orelse
+        return error.ImagePreparationFailed;
+    return .{
+        .digest_hex = std.fmt.bytesToHex(digest, .lower),
+        .media_type = media_type,
+        .size_bytes = read_bytes,
+    };
+}
 
 fn syncSnapshotDirectory(snapshot_dir: std.Io.Dir) !void {
     io_mod.syncVerifiedDir(snapshot_dir) catch |err| switch (err) {
@@ -1454,6 +1714,10 @@ pub const ClipboardImageAttachment = struct {
     }
 };
 
+/// Persist clipboard image *bytes* as a normal file under `/tmp/fx-image-snapshots-*`
+/// (for example `clipboard.png`), then load it with `loadImageAttachment`.
+/// That temp path is the only bridge from screenshot clipboard buffers into the
+/// existing `[Image N]` attach pipeline. Do not add a parallel vision channel.
 pub fn persistImageBytes(alloc: std.mem.Allocator, bytes: []const u8) !ClipboardImageAttachment {
     if (bytes.len > max_image_bytes) return error.ImageTooLarge;
     const media_type = detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType;
@@ -1493,10 +1757,282 @@ fn clipboardFileName(media_type: []const u8) []const u8 {
         "clipboard.png";
 }
 
+fn clipboardPasteSentinel(which: u8) error{
+    Unsupported,
+    NoClipboardImage,
+    ClipboardToolMissing,
+    ImageTooLarge,
+    UnsupportedImageType,
+} {
+    return switch (which) {
+        0 => error.Unsupported,
+        1 => error.NoClipboardImage,
+        2 => error.ClipboardToolMissing,
+        3 => error.ImageTooLarge,
+        else => error.UnsupportedImageType,
+    };
+}
+
 pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
+    if (false) return clipboardPasteSentinel(0);
+    // Upstream first-class path: macOS osascript PNGf. Linux/Windows are
+    // error.Unsupported here; the Lua paste plugin fills that gap.
     if (builtin.os.tag != .macos) return error.Unsupported;
     return loadMacosClipboardImageAttachment(alloc);
 }
+
+/// Linux/Windows plugin helper: snapshot screenshot clipboard bytes to
+/// `/tmp/fx-image-snapshots-*/clipboard.png` (or jpeg/gif/webp) and return
+/// that path. macOS returns null so first-class `attachClipboard` owns paste.
+pub fn takeClipboardImagePath(alloc: std.mem.Allocator) !?[]u8 {
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows) return null;
+    var loaded = (if (builtin.os.tag == .linux)
+        loadLinuxClipboardImageAttachment(alloc)
+    else
+        loadWindowsClipboardImageAttachment(alloc)) catch |err| switch (err) {
+        error.NoClipboardImage => return null,
+        else => return err,
+    };
+    const attachment = loaded.takeAttachment();
+    defer types.freeImageAttachment(alloc, attachment);
+    const path = try alloc.dupe(u8, attachment.path);
+    alloc.free(loaded.source_dir);
+    return path;
+}
+
+pub fn clipboardToolMissingNotice() []const u8 {
+    return switch (builtin.os.tag) {
+        .linux => "install wl-paste (wl-clipboard) or xclip to paste screenshot images",
+        .windows => "clipboard image paste needs a PNG or bitmap screenshot on the clipboard",
+        else => "clipboard image paste is unavailable",
+    };
+}
+
+const clipboard_image_mime_types = [_][]const u8{
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp",
+    "image/x-png",
+    "PNG",
+};
+
+const ClipboardFetch = union(enum) {
+    bytes: []u8,
+    missing_tool,
+    no_image,
+};
+
+fn envPresent(key: []const u8) bool {
+    const value = io_mod.getenv(key) orelse return false;
+    return value.len > 0;
+}
+
+fn loadLinuxClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
+    const backends: [3]LinuxClipboardBackend = if (envPresent("WAYLAND_DISPLAY"))
+        .{ .wayland, .x11, .xsel }
+    else
+        .{ .x11, .wayland, .xsel };
+
+    var saw_tool = false;
+    for (backends) |backend| {
+        switch (try fetchLinuxClipboardImage(alloc, backend)) {
+            .bytes => |bytes| {
+                defer alloc.free(bytes);
+                // Bytes from wl-paste/xclip/xsel become a temp file, then a
+                // normal ImageAttachment. The Lua paste hook consumes that path.
+                return persistImageBytes(alloc, bytes);
+            },
+            .missing_tool => {},
+            .no_image => saw_tool = true,
+        }
+    }
+    return if (saw_tool) error.NoClipboardImage else error.ClipboardToolMissing;
+}
+
+const LinuxClipboardBackend = enum { wayland, x11, xsel };
+
+fn fetchLinuxClipboardImage(alloc: std.mem.Allocator, backend: LinuxClipboardBackend) !ClipboardFetch {
+    switch (backend) {
+        .xsel => {
+            var argv_buf: [6][]const u8 = undefined;
+            const argv = linuxClipboardPasteArgv(.xsel, "", &argv_buf);
+            return runClipboardImageCommand(alloc, argv);
+        },
+        .wayland, .x11 => {
+            for (clipboard_image_mime_types) |mime| {
+                var argv_buf: [6][]const u8 = undefined;
+                const argv = linuxClipboardPasteArgv(backend, mime, &argv_buf);
+                switch (try runClipboardImageCommand(alloc, argv)) {
+                    .bytes => |bytes| return .{ .bytes = bytes },
+                    .missing_tool => return .missing_tool,
+                    .no_image => {},
+                }
+            }
+            if (backend == .x11) return fetchX11OfferedImageMimes(alloc);
+            return .no_image;
+        },
+    }
+}
+
+fn isKnownClipboardImageMime(mime: []const u8) bool {
+    for (clipboard_image_mime_types) |known| {
+        if (std.mem.eql(u8, known, mime)) return true;
+    }
+    return false;
+}
+
+fn fetchX11OfferedImageMimes(alloc: std.mem.Allocator) !ClipboardFetch {
+    var argv_buf: [6][]const u8 = undefined;
+    const argv = linuxClipboardPasteArgv(.x11, "TARGETS", &argv_buf);
+    const listed = switch (try runClipboardStdoutCommand(alloc, argv)) {
+        .bytes => |text| text,
+        .missing_tool => return .missing_tool,
+        .no_image => return .no_image,
+    };
+    defer alloc.free(listed);
+
+    var rest = listed;
+    while (rest.len > 0) {
+        const line_end = std.mem.findScalar(u8, rest, '\n') orelse rest.len;
+        const target = std.mem.trim(u8, rest[0..line_end], " \t\r");
+        rest = if (line_end < rest.len) rest[line_end + 1 ..] else rest[rest.len..];
+        if (!std.mem.startsWith(u8, target, "image/")) continue;
+        if (isKnownClipboardImageMime(target)) continue;
+        var fetch_buf: [6][]const u8 = undefined;
+        const fetch_argv = linuxClipboardPasteArgv(.x11, target, &fetch_buf);
+        switch (try runClipboardImageCommand(alloc, fetch_argv)) {
+            .bytes => |bytes| return .{ .bytes = bytes },
+            .missing_tool => return .missing_tool,
+            .no_image => {},
+        }
+    }
+    return .no_image;
+}
+
+fn linuxClipboardPasteArgv(
+    backend: LinuxClipboardBackend,
+    mime: []const u8,
+    buf: *[6][]const u8,
+) []const []const u8 {
+    switch (backend) {
+        .wayland => {
+            buf[0] = "wl-paste";
+            buf[1] = "--type";
+            buf[2] = mime;
+            return buf[0..3];
+        },
+        .x11 => {
+            buf[0] = "xclip";
+            buf[1] = "-selection";
+            buf[2] = "clipboard";
+            buf[3] = "-t";
+            buf[4] = mime;
+            buf[5] = "-o";
+            return buf[0..6];
+        },
+        .xsel => {
+            buf[0] = "xsel";
+            buf[1] = "--clipboard";
+            buf[2] = "--output";
+            return buf[0..3];
+        },
+    }
+}
+
+fn runClipboardStdoutCommand(alloc: std.mem.Allocator, argv: []const []const u8) !ClipboardFetch {
+    const result = std.process.run(alloc, io_mod.getIo(), .{
+        .argv = argv,
+        .stdout_limit = .limited(max_image_bytes + 1),
+        .stderr_limit = .limited(4096),
+        .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(3) } },
+    }) catch |err| switch (err) {
+        error.FileNotFound,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.IsDir,
+        error.NotDir,
+        => return .missing_tool,
+        error.StreamTooLong => return error.ImageTooLarge,
+        else => return err,
+    };
+    errdefer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code == 0 and result.stdout.len > 0) return .{ .bytes = result.stdout },
+        else => {},
+    }
+    alloc.free(result.stdout);
+    return .no_image;
+}
+
+fn runClipboardImageCommand(alloc: std.mem.Allocator, argv: []const []const u8) !ClipboardFetch {
+    switch (try runClipboardStdoutCommand(alloc, argv)) {
+        .bytes => |bytes| {
+            if (detectMediaTypeFromBytes(bytes) != null) return .{ .bytes = bytes };
+            alloc.free(bytes);
+            return .no_image;
+        },
+        .missing_tool => return .missing_tool,
+        .no_image => return .no_image,
+    }
+}
+
+fn loadWindowsClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
+    return windows_clipboard.load(alloc);
+}
+
+const windows_clipboard = if (builtin.os.tag == .windows) struct {
+    const w = std.os.windows;
+    const cf_dib: w.UINT = 8;
+
+    extern "user32" fn OpenClipboard(hWndNewOwner: ?w.HWND) callconv(.winapi) w.BOOL;
+    extern "user32" fn CloseClipboard() callconv(.winapi) w.BOOL;
+    extern "user32" fn GetClipboardData(uFormat: w.UINT) callconv(.winapi) ?w.HANDLE;
+    extern "user32" fn RegisterClipboardFormatW(lpszFormat: [*:0]const u16) callconv(.winapi) w.UINT;
+    extern "kernel32" fn GlobalLock(hMem: w.HANDLE) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn GlobalUnlock(hMem: w.HANDLE) callconv(.winapi) w.BOOL;
+    extern "kernel32" fn GlobalSize(hMem: w.HANDLE) callconv(.winapi) usize;
+
+    fn load(alloc: std.mem.Allocator) !ClipboardImageAttachment {
+        const bytes = try readBytes(alloc);
+        defer alloc.free(bytes);
+        return persistImageBytes(alloc, bytes);
+    }
+
+    fn readBytes(alloc: std.mem.Allocator) ![]u8 {
+        if (OpenClipboard(null) == 0) return error.NoClipboardImage;
+        defer _ = CloseClipboard();
+
+        const png_name = std.unicode.utf8ToUtf16LeStringLiteral("PNG");
+        const png_format = RegisterClipboardFormatW(png_name);
+        if (png_format != 0) {
+            if (copyHandle(alloc, png_format)) |bytes| {
+                if (detectMediaTypeFromBytes(bytes) != null) return bytes;
+                alloc.free(bytes);
+            } else |_| {}
+        }
+
+        const dib = copyHandle(alloc, cf_dib) catch return error.NoClipboardImage;
+        defer alloc.free(dib);
+        return pngFromDib(alloc, dib);
+    }
+
+    fn copyHandle(alloc: std.mem.Allocator, format: w.UINT) ![]u8 {
+        const handle = GetClipboardData(format) orelse return error.NoClipboardImage;
+        const locked = GlobalLock(handle) orelse return error.NoClipboardImage;
+        defer _ = GlobalUnlock(handle);
+        const size = GlobalSize(handle);
+        if (size == 0 or size > max_image_bytes) return error.ImageTooLarge;
+        const src: [*]const u8 = @ptrCast(locked);
+        return try alloc.dupe(u8, src[0..size]);
+    }
+} else struct {
+    fn load(_: std.mem.Allocator) !ClipboardImageAttachment {
+        return error.Unsupported;
+    }
+};
 
 fn loadMacosClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
     const source_dir = try createTempSnapshotDir(alloc);
@@ -1540,6 +2076,127 @@ fn loadMacosClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAt
     }
 
     return error.NoClipboardImage;
+}
+
+fn pngFromDib(alloc: std.mem.Allocator, dib: []const u8) ![]u8 {
+    if (dib.len < 40) return error.UnsupportedImageType;
+    const header_size = std.mem.readInt(u32, dib[0..4], .little);
+    if (header_size < 40 or header_size > dib.len) return error.UnsupportedImageType;
+    const width_i = std.mem.readInt(i32, dib[4..8], .little);
+    const height_i = std.mem.readInt(i32, dib[8..12], .little);
+    const planes = std.mem.readInt(u16, dib[12..14], .little);
+    const bit_count = std.mem.readInt(u16, dib[14..16], .little);
+    const compression = std.mem.readInt(u32, dib[16..20], .little);
+    if (planes != 1) return error.UnsupportedImageType;
+    if (bit_count != 24 and bit_count != 32) return error.UnsupportedImageType;
+    if (!(compression == 0 or (compression == 3 and bit_count == 32))) return error.UnsupportedImageType;
+    if (width_i <= 0 or height_i == 0) return error.UnsupportedImageType;
+
+    const width: u32 = @intCast(width_i);
+    const top_down = height_i < 0;
+    const height: u32 = @intCast(if (top_down) -height_i else height_i);
+    if (width > 16384 or height > 16384) return error.ImageTooLarge;
+
+    var pixel_offset: usize = header_size;
+    if (compression == 3) {
+        pixel_offset = std.math.add(usize, pixel_offset, 12) catch return error.UnsupportedImageType;
+    }
+    const row_bytes: usize = ((@as(usize, width) * bit_count + 31) / 32) * 4;
+    const pixels_len = std.math.mul(usize, row_bytes, height) catch return error.ImageTooLarge;
+    const pixels_end = std.math.add(usize, pixel_offset, pixels_len) catch return error.UnsupportedImageType;
+    if (pixels_end > dib.len) return error.UnsupportedImageType;
+    const pixels = dib[pixel_offset..pixels_end];
+
+    const rgba_len = std.math.mul(usize, std.math.mul(usize, width, height) catch return error.ImageTooLarge, 4) catch return error.ImageTooLarge;
+    const rgba = try alloc.alloc(u8, rgba_len);
+    defer alloc.free(rgba);
+
+    var y: u32 = 0;
+    while (y < height) : (y += 1) {
+        const src_y: u32 = if (top_down) y else height - 1 - y;
+        const src_row = pixels[@as(usize, src_y) * row_bytes ..][0..row_bytes];
+        const dst_row = rgba[(@as(usize, y) * width) * 4 ..];
+        var x: u32 = 0;
+        while (x < width) : (x += 1) {
+            const dst = dst_row[@as(usize, x) * 4 ..][0..4];
+            if (bit_count == 32) {
+                const src = src_row[@as(usize, x) * 4 ..][0..4];
+                dst[0] = src[2];
+                dst[1] = src[1];
+                dst[2] = src[0];
+                dst[3] = src[3];
+            } else {
+                const src = src_row[@as(usize, x) * 3 ..][0..3];
+                dst[0] = src[2];
+                dst[1] = src[1];
+                dst[2] = src[0];
+                dst[3] = 255;
+            }
+        }
+    }
+    return encodePngRgba(alloc, width, height, rgba);
+}
+
+fn encodePngRgba(alloc: std.mem.Allocator, width: u32, height: u32, rgba: []const u8) ![]u8 {
+    const expected = std.math.mul(usize, std.math.mul(usize, width, height) catch return error.ImageTooLarge, 4) catch return error.ImageTooLarge;
+    if (rgba.len != expected) return error.UnsupportedImageType;
+
+    const stride = std.math.add(usize, @as(usize, width) * 4, 1) catch return error.ImageTooLarge;
+    const raw_len = std.math.mul(usize, stride, height) catch return error.ImageTooLarge;
+    const raw = try alloc.alloc(u8, raw_len);
+    defer alloc.free(raw);
+    var y: u32 = 0;
+    while (y < height) : (y += 1) {
+        const row_start = @as(usize, y) * stride;
+        raw[row_start] = 0;
+        const src = rgba[(@as(usize, y) * width) * 4 ..][0 .. @as(usize, width) * 4];
+        @memcpy(raw[row_start + 1 ..][0..src.len], src);
+    }
+
+    const deflated = try deflateZlib(alloc, raw);
+    defer alloc.free(deflated);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll("\x89PNG\r\n\x1a\n");
+
+    var ihdr: [13]u8 = undefined;
+    std.mem.writeInt(u32, ihdr[0..4], width, .big);
+    std.mem.writeInt(u32, ihdr[4..8], height, .big);
+    ihdr[8] = 8;
+    ihdr[9] = 6;
+    ihdr[10] = 0;
+    ihdr[11] = 0;
+    ihdr[12] = 0;
+    try writePngChunk(&out.writer, "IHDR", &ihdr);
+    try writePngChunk(&out.writer, "IDAT", deflated);
+    try writePngChunk(&out.writer, "IEND", &.{});
+    return try out.toOwnedSlice();
+}
+
+fn deflateZlib(alloc: std.mem.Allocator, plain: []const u8) ![]u8 {
+    var output = try std.Io.Writer.Allocating.initCapacity(alloc, 64);
+    errdefer output.deinit();
+    var scratch: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&output.writer, &scratch, .zlib, .fastest);
+    try compressor.writer.writeAll(plain);
+    try compressor.finish();
+    return output.toOwnedSlice();
+}
+
+fn writePngChunk(writer: *std.Io.Writer, tag: []const u8, data: []const u8) !void {
+    if (tag.len != 4) return error.UnsupportedImageType;
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
+    try writer.writeAll(&len_buf);
+    try writer.writeAll(tag);
+    try writer.writeAll(data);
+    var crc = std.hash.Crc32.init();
+    crc.update(tag);
+    crc.update(data);
+    var crc_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &crc_buf, crc.final(), .big);
+    try writer.writeAll(&crc_buf);
 }
 
 fn readImageHeaderBytes(path: []const u8, out: []u8) ![]const u8 {
@@ -2130,6 +2787,12 @@ test "persistImageBytes writes a snapshot source for png jpeg gif and webp" {
         const attachment = persisted.attachment orelse return error.TestExpectedEqual;
         try std.testing.expectEqualStrings(case.media_type, attachment.media_type);
         try std.testing.expect(std.fs.path.isAbsolute(attachment.path));
+        try std.testing.expect(std.mem.find(u8, attachment.path, "fx-image-snapshots-") != null);
+        try std.testing.expectEqualStrings(clipboardFileName(case.media_type), std.fs.path.basename(attachment.path));
+        const reloaded = try loadImageAttachment(alloc, attachment.path);
+        defer types.freeImageAttachment(alloc, reloaded);
+        try std.testing.expectEqualStrings(case.media_type, reloaded.media_type);
+        try std.testing.expectEqualStrings(attachment.path, reloaded.path);
     }
 
     try std.testing.expectError(error.UnsupportedImageType, persistImageBytes(alloc, "not-an-image"));
@@ -2139,6 +2802,157 @@ test "persistImageBytes writes a snapshot source for png jpeg gif and webp" {
     @memset(huge, 'x');
     @memcpy(huge[0..8], "\x89PNG\r\n\x1a\n");
     try std.testing.expectError(error.ImageTooLarge, persistImageBytes(alloc, huge));
+}
+
+test "linux clipboard paste argv requests image mime types" {
+    var buf: [6][]const u8 = undefined;
+    const wayland = linuxClipboardPasteArgv(.wayland, "image/png", &buf);
+    try std.testing.expectEqualStrings("wl-paste", wayland[0]);
+    try std.testing.expectEqualStrings("--type", wayland[1]);
+    try std.testing.expectEqualStrings("image/png", wayland[2]);
+
+    const x11 = linuxClipboardPasteArgv(.x11, "image/jpeg", &buf);
+    try std.testing.expectEqualStrings("xclip", x11[0]);
+    try std.testing.expectEqualStrings("-selection", x11[1]);
+    try std.testing.expectEqualStrings("clipboard", x11[2]);
+    try std.testing.expectEqualStrings("-t", x11[3]);
+    try std.testing.expectEqualStrings("image/jpeg", x11[4]);
+    try std.testing.expectEqualStrings("-o", x11[5]);
+
+    const xsel = linuxClipboardPasteArgv(.xsel, "image/png", &buf);
+    try std.testing.expectEqualStrings("xsel", xsel[0]);
+    try std.testing.expectEqualStrings("--clipboard", xsel[1]);
+    try std.testing.expectEqualStrings("--output", xsel[2]);
+}
+
+test "clipboardToolMissingNotice names linux screenshot paste tools" {
+    if (builtin.os.tag != .linux) return;
+    try std.testing.expect(std.mem.find(u8, clipboardToolMissingNotice(), "wl-paste") != null);
+    try std.testing.expect(std.mem.find(u8, clipboardToolMissingNotice(), "xclip") != null);
+}
+
+test "pngFromDib encodes a 1x1 32-bit BGRA screenshot buffer as png" {
+    const alloc = std.testing.allocator;
+    var dib: [44]u8 = undefined;
+    @memset(&dib, 0);
+    std.mem.writeInt(u32, dib[0..4], 40, .little);
+    std.mem.writeInt(i32, dib[4..8], 1, .little);
+    std.mem.writeInt(i32, dib[8..12], 1, .little);
+    std.mem.writeInt(u16, dib[12..14], 1, .little);
+    std.mem.writeInt(u16, dib[14..16], 32, .little);
+    dib[40] = 0x11;
+    dib[41] = 0x22;
+    dib[42] = 0x33;
+    dib[43] = 0x44;
+    const png = try pngFromDib(alloc, &dib);
+    defer alloc.free(png);
+    try std.testing.expectEqualStrings("image/png", detectMediaTypeFromBytes(png).?);
+
+    var persisted = try persistImageBytes(alloc, png);
+    defer persisted.deinit(alloc);
+    const attachment = persisted.attachment orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("image/png", attachment.media_type);
+}
+
+test "pngFromDib encodes a 1x1 24-bit BGR screenshot buffer as png" {
+    const alloc = std.testing.allocator;
+    var dib: [44]u8 = undefined;
+    @memset(&dib, 0);
+    std.mem.writeInt(u32, dib[0..4], 40, .little);
+    std.mem.writeInt(i32, dib[4..8], 1, .little);
+    std.mem.writeInt(i32, dib[8..12], 1, .little);
+    std.mem.writeInt(u16, dib[12..14], 1, .little);
+    std.mem.writeInt(u16, dib[14..16], 24, .little);
+    dib[40] = 0x10;
+    dib[41] = 0x20;
+    dib[42] = 0x30;
+    const png = try pngFromDib(alloc, &dib);
+    defer alloc.free(png);
+    try std.testing.expectEqualStrings("image/png", detectMediaTypeFromBytes(png).?);
+}
+
+test "linux clipboard image buffer paste reads png bytes from xclip" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const png = try encodePngRgba(alloc, 1, 1, &.{ 0x33, 0x22, 0x11, 0xff });
+    defer alloc.free(png);
+    copyLinuxClipboardImageForTest(png) catch |err| switch (err) {
+        error.ClipboardToolMissing => return error.SkipZigTest,
+        else => return err,
+    };
+    var loaded = loadLinuxClipboardImageAttachment(alloc) catch |err| switch (err) {
+        error.ClipboardToolMissing => return error.SkipZigTest,
+        else => return err,
+    };
+    defer loaded.deinit(alloc);
+    const attachment = loaded.attachment orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("image/png", attachment.media_type);
+    try std.testing.expect(std.mem.find(u8, attachment.path, "fx-image-snapshots-") != null);
+    try std.testing.expectEqualStrings("clipboard.png", std.fs.path.basename(attachment.path));
+    const reloaded = try loadImageAttachment(alloc, attachment.path);
+    defer types.freeImageAttachment(alloc, reloaded);
+    try std.testing.expectEqualStrings(attachment.path, reloaded.path);
+    var header: [16]u8 = undefined;
+    const stored = try readImageHeaderBytes(attachment.path, &header);
+    try std.testing.expectEqualStrings("image/png", detectMediaTypeFromBytes(stored).?);
+}
+
+test "takeClipboardImagePath leaves a snapshot file for the image pipeline" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const png = try encodePngRgba(alloc, 1, 1, &.{ 0x33, 0x22, 0x11, 0xff });
+    defer alloc.free(png);
+    copyLinuxClipboardImageForTest(png) catch |err| switch (err) {
+        error.ClipboardToolMissing => return error.SkipZigTest,
+        else => return err,
+    };
+    const path = takeClipboardImagePath(alloc) catch |err| switch (err) {
+        error.ClipboardToolMissing => return error.SkipZigTest,
+        else => return err,
+    } orelse return error.TestExpectedEqual;
+    defer alloc.free(path);
+    try std.testing.expect(std.mem.find(u8, path, "fx-image-snapshots-") != null);
+    try std.testing.expectEqualStrings("clipboard.png", std.fs.path.basename(path));
+    const reloaded = try loadImageAttachment(alloc, path);
+    defer types.freeImageAttachment(alloc, reloaded);
+    try std.testing.expectEqualStrings("image/png", reloaded.media_type);
+    try std.testing.expectEqualStrings(path, reloaded.path);
+}
+
+test "loadClipboardImageAttachment is first-class macos only" {
+    if (builtin.os.tag == .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.Unsupported, loadClipboardImageAttachment(alloc));
+}
+
+test "takeClipboardImagePath is a no-op outside linux and windows" {
+    if (builtin.os.tag == .linux or builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(?[]u8, null), try takeClipboardImagePath(alloc));
+}
+
+fn copyLinuxClipboardImageForTest(png: []const u8) !void {
+    const io = io_mod.getIo();
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "xclip", "-selection", "clipboard", "-t", "image/png", "-i" },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.ClipboardToolMissing;
+    defer child.kill(io);
+
+    if (child.stdin) |*stdin| {
+        stdin.writeStreamingAll(io, png) catch return error.ClipboardToolMissing;
+        stdin.close(io);
+        child.stdin = null;
+    } else {
+        return error.ClipboardToolMissing;
+    }
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code != 0) return error.ClipboardToolMissing,
+        else => return error.ClipboardToolMissing,
+    }
 }
 
 test "loadImageAttachment accepts files larger than header length" {
@@ -2504,7 +3318,63 @@ test "snapshot directory handle syncs after create and after reopen" {
     try syncSnapshotDirectory(reopened);
 }
 
-test "capture rejects provider limit plus one without snapshot residue" {
+test "encoded image limit uses exact padded base64 length" {
+    const largest_fitting_raw_image = (max_encoded_image_bytes / 4) * 3;
+
+    try std.testing.expect(fitsEncodedLimit(largest_fitting_raw_image));
+    try std.testing.expect(!fitsEncodedLimit(largest_fitting_raw_image + 1));
+}
+
+test "capture rejection distinguishes source size from preparation failure" {
+    try std.testing.expectEqualStrings(
+        image_too_large_notice,
+        captureRejectionNotice(error.ImageTooLarge).?,
+    );
+    try std.testing.expectEqualStrings(
+        image_preparation_failed_notice,
+        captureRejectionNotice(error.ImagePreparationFailed).?,
+    );
+    try std.testing.expect(captureRejectionNotice(error.Cancelled) == null);
+    try std.testing.expect(captureRejectionNotice(error.TimedOut) == null);
+}
+
+test "image normalizer process requires success and preserves operational errors" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const success_argv = [_][]const u8{ "/bin/sh", "-c", "exit 0" };
+    try runImageNormalizerProcess(&success_argv, .{});
+
+    const failure_argv = [_][]const u8{ "/bin/sh", "-c", "exit 7" };
+    try std.testing.expectError(
+        error.ImagePreparationFailed,
+        runImageNormalizerProcess(&failure_argv, .{}),
+    );
+
+    const signaled_argv = [_][]const u8{ "/bin/sh", "-c", "kill -TERM $$" };
+    try std.testing.expectError(
+        error.ImagePreparationFailed,
+        runImageNormalizerProcess(&signaled_argv, .{}),
+    );
+
+    const sleeping_argv = [_][]const u8{ "/bin/sh", "-c", "sleep 10" };
+    try std.testing.expectError(
+        error.TimedOut,
+        runImageNormalizerProcess(&sleeping_argv, .{
+            .deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(10),
+            }),
+        }),
+    );
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Cancelled,
+        runImageNormalizerProcess(&sleeping_argv, .{ .cancel_flag = &cancelled }),
+    );
+}
+
+test "capture rejects source limit plus one without snapshot residue" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2531,7 +3401,7 @@ test "capture rejects provider limit plus one without snapshot residue" {
     try std.testing.expectEqual(@as(usize, 0), try countSnapshotFiles(snapshot_dir));
 }
 
-test "attachment admission rejects provider limit plus one" {
+test "attachment admission rejects source limit plus one" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2634,15 +3504,16 @@ test "cancelled capture removes every partial artifact" {
     try std.testing.expect(attachment.snapshot_path == null);
 }
 
-test "capture accepts the exact serialized byte limit" {
+test "capture preserves a source at the exact encoded byte limit" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    const largest_fitting_raw_image = (max_encoded_image_bytes / 4) * 3;
     {
         var file = try tmp.dir.createFile(std.testing.io, "exact.png", .{});
         defer file.close(std.testing.io);
         try file.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\n");
-        try file.setLength(std.testing.io, max_image_bytes);
+        try file.setLength(std.testing.io, largest_fitting_raw_image);
     }
     const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "exact.png");
     defer alloc.free(image_path);
@@ -2663,10 +3534,94 @@ test "capture accepts the exact serialized byte limit" {
         .{},
     );
     defer snapshot.close(std.testing.io);
-    try std.testing.expectEqual(@as(u64, max_image_bytes), (try snapshot.stat(std.testing.io)).size);
+    try std.testing.expectEqual(
+        @as(u64, largest_fitting_raw_image),
+        (try snapshot.stat(std.testing.io)).size,
+    );
 }
 
-test "capture rejects a file that grows past the provider limit while streaming" {
+test "capture normalizes an oversized encoded image on macOS or rejects locally" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const largest_fitting_raw_image = (max_encoded_image_bytes / 4) * 3;
+    const source_size = largest_fitting_raw_image + 1;
+    const encoded_png = "iVBORw0KGgoAAAANSUhEUgAAAQAAAACQBAMAAAAVTaiiAAAAMFBMVEUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABaPxwLAAAAD3RSTlMA3yCAQMAQ759gUDBwkK/koHcMAAABqElEQVR42u3YvUozURAG4Dcnuvoln3w/hSAWuxaCnQFFywRsBYM34IIXoChY2ETtBMGAjY2od2DuwMLCW/AqdP3HwvFEg6ybbUSYAX0fmOY0Oww77J4XREREREREREREREREXxOcX8Sw1BIZhiHXEHmIYKdfvDrs9Im3DDt/xLvCJ3y3CQyItwE7LhRJIhgaEZmHqZkzGCo14fWcwErhMQLcwiCsVKUCFOUGRgJJ4IUJrIw9wZsz3IMavDJ+qmIFHYunsDCeHOFVOVyBhV3pNNAjdzDgwkd0XCYxDBTfBz8yBRMxLAXWzfRvIWW0Dm2H0sS7UuMW2sL0hcQ11Pcg2L1BSvU5grJSHSm9NfwwLkZGEEFTYQgZx4PQVJUjfPBL98/QSZK3loqmn5AxtwpNromM3xH0zE4ix8wklIyK/EeXVvtUhQvbyVReXqXzQegkU7mnFWgoiLeWGxf9hYK3R11jbyJK17heXtUn3j0WpJauJb0JDIhXzzbQq5dXtd93qWHz34cqi15e1RJZR5djxdz6YCdGF7e/HYOIiIiIiIiIiIiIiOjzXgA1X7Msl1OuJQAAAABJRU5ErkJggg==";
+    const png = try alloc.alloc(
+        u8,
+        try std.base64.standard.Decoder.calcSizeForSlice(encoded_png),
+    );
+    defer alloc.free(png);
+    try std.base64.standard.Decoder.decode(png, encoded_png);
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "normalize.png", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, png);
+        try file.setLength(std.testing.io, source_size);
+    }
+    const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "normalize.png");
+    defer alloc.free(image_path);
+    const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+    var attachment = types.ImageAttachment{
+        .id = 1,
+        .path = try alloc.dupe(u8, image_path),
+        .media_type = try alloc.dupe(u8, "image/png"),
+    };
+    defer types.freeImageAttachment(alloc, attachment);
+
+    if (comptime builtin.os.tag != .macos) {
+        try std.testing.expectError(
+            error.ImagePreparationFailed,
+            captureImageSnapshot(alloc, &attachment, snapshot_dir),
+        );
+        try std.testing.expectEqual(@as(usize, 0), try countSnapshotFiles(snapshot_dir));
+        try std.testing.expect(attachment.snapshot_path == null);
+        return;
+    }
+
+    try captureImageSnapshot(alloc, &attachment, snapshot_dir);
+    try std.testing.expectEqualStrings("image/jpeg", attachment.media_type);
+    var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+    defer verified.deinit(alloc);
+    try std.testing.expect(fitsEncodedLimit(verified.bytes.len));
+    try std.testing.expectEqual(
+        @as(u64, source_size),
+        (try std.Io.Dir.cwd().statFile(std.testing.io, image_path, .{})).size,
+    );
+    try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+}
+
+test "capture rejects invalid normalization output without snapshot residue" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const largest_fitting_raw_image = (max_encoded_image_bytes / 4) * 3;
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "invalid-large.png", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\n");
+        try file.setLength(std.testing.io, largest_fitting_raw_image + 1);
+    }
+    const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "invalid-large.png");
+    defer alloc.free(image_path);
+    const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+    var attachment = types.ImageAttachment{
+        .id = 1,
+        .path = @constCast(image_path),
+        .media_type = @constCast("image/png"),
+    };
+
+    try std.testing.expectError(
+        error.ImagePreparationFailed,
+        captureImageSnapshot(alloc, &attachment, snapshot_dir),
+    );
+    try std.testing.expectEqual(@as(usize, 0), try countSnapshotFiles(snapshot_dir));
+    try std.testing.expect(attachment.snapshot_path == null);
+}
+
+test "capture rejects a file that grows past the source limit while streaming" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

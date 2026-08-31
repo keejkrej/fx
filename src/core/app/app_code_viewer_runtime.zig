@@ -17,6 +17,7 @@ const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
 
 pub const max_view_file_bytes: usize = 2 * 1024 * 1024;
 const max_highlight_bytes: usize = 256 * 1024;
+const max_comment_bytes: usize = 400;
 
 pub const Kind = code_viewer_screen.Kind;
 pub const Mode = code_viewer_screen.Mode;
@@ -26,6 +27,20 @@ pub const OpenSpec = struct {
     path: []const u8 = "",
     line: ?u32 = null,
     want_diff: bool = false,
+};
+
+pub const DiffFile = struct {
+    path: []const u8,
+    old_text: []const u8,
+    new_text: []const u8,
+};
+
+const StoredFile = struct {
+    path: []u8,
+    old_text: []u8,
+    new_text: []u8,
+    added: u32 = 0,
+    removed: u32 = 0,
 };
 
 pub const Session = struct {
@@ -41,6 +56,9 @@ pub const Session = struct {
     diff_lines: []diff_mod.DiffLine = &.{},
     hunks: std.ArrayList(code_viewer_layout.Hunk) = .empty,
     pairs: std.ArrayList(code_viewer_layout.Pair) = .empty,
+    files: std.ArrayList(StoredFile) = .empty,
+    file_index: usize = 0,
+    show_file_list: bool = false,
     cursor: usize = 0,
     scroll: usize = 0,
     mode: Mode = .browse,
@@ -51,6 +69,7 @@ pub const Session = struct {
     hunk_index: usize = 0,
     diff_layout: DiffLayout = .unified,
     language: []const u8 = "",
+    comment_buf: std.ArrayList(u8) = .empty,
 
     pub fn init(alloc: Allocator) Session {
         return .{ .alloc = alloc };
@@ -62,9 +81,11 @@ pub const Session = struct {
         self.highlighted_lines.deinit(self.alloc);
         self.hunks.deinit(self.alloc);
         self.pairs.deinit(self.alloc);
+        self.files.deinit(self.alloc);
         self.query.deinit(self.alloc);
         self.matches.deinit(self.alloc);
         self.goto_buf.deinit(self.alloc);
+        self.comment_buf.deinit(self.alloc);
         self.* = .{ .alloc = self.alloc };
     }
 
@@ -73,32 +94,11 @@ pub const Session = struct {
     }
 
     pub fn clear(self: *Session) void {
-        if (self.path.len > 0) self.alloc.free(self.path);
-        if (self.source.len > 0) self.alloc.free(self.source);
-        if (self.old_text.len > 0) self.alloc.free(self.old_text);
-        if (self.new_text.len > 0) self.alloc.free(self.new_text);
-        if (self.highlighted.len > 0) self.alloc.free(self.highlighted);
-        if (self.diff_lines.len > 0) self.alloc.free(self.diff_lines);
-        self.path = &.{};
-        self.source = &.{};
-        self.old_text = &.{};
-        self.new_text = &.{};
-        self.highlighted = &.{};
-        self.diff_lines = &.{};
-        self.lines.clearRetainingCapacity();
-        self.highlighted_lines.clearRetainingCapacity();
-        self.hunks.clearRetainingCapacity();
-        self.pairs.clearRetainingCapacity();
-        self.query.clearRetainingCapacity();
-        self.matches.clearRetainingCapacity();
-        self.goto_buf.clearRetainingCapacity();
-        self.cursor = 0;
-        self.scroll = 0;
-        self.mode = .browse;
-        self.match_index = 0;
-        self.hunk_index = 0;
+        self.resetDiffDisplay();
+        self.freeStoredFiles();
+        self.file_index = 0;
+        self.show_file_list = false;
         self.diff_layout = .unified;
-        self.language = "";
         self.kind = .file;
     }
 
@@ -120,21 +120,53 @@ pub const Session = struct {
         new_text: []const u8,
         line: ?u32,
     ) !void {
+        const spec = [_]DiffFile{.{ .path = path, .old_text = old_text, .new_text = new_text }};
+        try self.loadReview(&spec, false, line);
+        self.show_file_list = false;
+    }
+
+    pub fn loadReview(self: *Session, files: []const DiffFile, side_by_side: bool, line: ?u32) !void {
+        if (files.len == 0) return error.EmptyDiffReview;
         self.clear();
         errdefer self.clear();
-        self.kind = .diff;
-        self.path = try self.alloc.dupe(u8, path);
-        self.old_text = try self.alloc.dupe(u8, old_text);
-        self.new_text = try self.alloc.dupe(u8, new_text);
-        self.diff_lines = try diff_mod.compute(self.alloc, self.old_text, self.new_text);
-        try code_viewer_layout.collectHunks(self.diff_lines, &self.hunks, self.alloc);
-        try code_viewer_layout.pairDiffLines(self.diff_lines, &self.pairs, self.alloc);
-        if (line) |target| {
-            self.jumpToNewLine(target);
-        } else if (self.hunks.items.len > 0) {
-            self.hunk_index = 0;
-            self.cursor = self.hunks.items[0].first_change;
+        for (files) |spec| {
+            try self.files.append(self.alloc, try storeFile(self.alloc, spec));
         }
+        self.diff_layout = if (side_by_side) .side_by_side else .unified;
+        self.show_file_list = files.len > 1;
+        try self.reloadCurrentFile(line);
+    }
+
+    pub fn fileList(self: *const Session, buf: []code_viewer_screen.FileListEntry) []code_viewer_screen.FileListEntry {
+        const n = @min(self.files.items.len, buf.len);
+        for (self.files.items[0..n], 0..) |file, i| {
+            buf[i] = .{
+                .path = file.path,
+                .added = file.added,
+                .removed = file.removed,
+            };
+        }
+        return buf[0..n];
+    }
+
+    pub fn nextFile(self: *Session) !void {
+        if (self.files.items.len < 2) return;
+        self.file_index = (self.file_index + 1) % self.files.items.len;
+        try self.reloadCurrentFile(null);
+    }
+
+    pub fn previousFile(self: *Session) !void {
+        if (self.files.items.len < 2) return;
+        self.file_index = if (self.file_index == 0)
+            self.files.items.len - 1
+        else
+            self.file_index - 1;
+        try self.reloadCurrentFile(null);
+    }
+
+    pub fn toggleFileList(self: *Session) void {
+        if (self.files.items.len < 2) return;
+        self.show_file_list = !self.show_file_list;
     }
 
     pub fn displayLineCount(self: *const Session) usize {
@@ -215,15 +247,25 @@ pub const Session = struct {
     pub fn beginGoto(self: *Session) void {
         self.mode = .goto_line;
         self.goto_buf.clearRetainingCapacity();
+        self.comment_buf.clearRetainingCapacity();
+    }
+
+    pub fn beginComment(self: *Session) void {
+        if (self.kind != .diff) return;
+        self.mode = .comment;
+        self.comment_buf.clearRetainingCapacity();
     }
 
     pub fn cancelPrompt(self: *Session) void {
-        if (self.mode == .search) {
-            self.query.clearRetainingCapacity();
-            self.matches.clearRetainingCapacity();
-            self.match_index = 0;
-        } else {
-            self.goto_buf.clearRetainingCapacity();
+        switch (self.mode) {
+            .search => {
+                self.query.clearRetainingCapacity();
+                self.matches.clearRetainingCapacity();
+                self.match_index = 0;
+            },
+            .goto_line => self.goto_buf.clearRetainingCapacity(),
+            .comment => self.comment_buf.clearRetainingCapacity(),
+            .browse => {},
         }
         self.mode = .browse;
     }
@@ -242,6 +284,11 @@ pub const Session = struct {
                     try self.goto_buf.append(self.alloc, byte);
                 }
             },
+            .comment => {
+                if (byte >= 32 and byte < 127 and self.comment_buf.items.len < max_comment_bytes) {
+                    try self.comment_buf.append(self.alloc, byte);
+                }
+            },
             .browse => {},
         }
     }
@@ -256,6 +303,9 @@ pub const Session = struct {
             },
             .goto_line => {
                 if (self.goto_buf.items.len > 0) _ = self.goto_buf.pop();
+            },
+            .comment => {
+                if (self.comment_buf.items.len > 0) _ = self.comment_buf.pop();
             },
             .browse => {},
         }
@@ -273,7 +323,7 @@ pub const Session = struct {
                 self.goto_buf.clearRetainingCapacity();
                 self.mode = .browse;
             },
-            .browse => {},
+            .comment, .browse => {},
         }
     }
 
@@ -320,6 +370,104 @@ pub const Session = struct {
         } else {
             self.cursor = @min(self.cursor, self.diff_lines.len -| 1);
         }
+    }
+
+    pub fn formatDiffComment(self: *const Session, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const path = if (self.path.len == 0) "diff" else self.path;
+        try out.writer.writeAll("Diff comment on ");
+        try out.writer.writeAll(path);
+
+        const range = self.commentRange();
+        switch (range) {
+            .hunk => |hunk| {
+                try out.writer.print(" (hunk {d}", .{hunk.index + 1});
+                try writeLineSpan(&out.writer, "old", hunk.old_start, hunk.old_end);
+                try writeLineSpan(&out.writer, "new", hunk.new_start, hunk.new_end);
+                try out.writer.writeAll("):\n\n```diff\n");
+                for (self.diff_lines[hunk.start..hunk.end]) |line| {
+                    try writeQuotedDiffLine(&out.writer, line);
+                }
+                try out.writer.writeAll("```\n");
+            },
+            .line => |line| {
+                const num = line.new_num orelse line.old_num;
+                if (num) |line_no| {
+                    try out.writer.print(" (line {d}):\n\n```diff\n", .{line_no});
+                } else {
+                    try out.writer.writeAll(":\n\n```diff\n");
+                }
+                try writeQuotedDiffLine(&out.writer, line);
+                try out.writer.writeAll("```\n");
+            },
+            .none => try out.writer.writeAll(":\n"),
+        }
+
+        const note = std.mem.trim(u8, self.comment_buf.items, " \t");
+        if (note.len > 0) {
+            try out.writer.writeAll("\n");
+            try out.writer.writeAll(note);
+            try out.writer.writeAll("\n");
+        }
+        return try out.toOwnedSlice();
+    }
+
+    const CommentRange = union(enum) {
+        hunk: struct {
+            index: usize,
+            start: usize,
+            end: usize,
+            old_start: ?u32,
+            old_end: ?u32,
+            new_start: ?u32,
+            new_end: ?u32,
+        },
+        line: diff_mod.DiffLine,
+        none,
+    };
+
+    fn commentRange(self: *const Session) CommentRange {
+        const diff_index = self.diffIndexForCursor() orelse return .none;
+        if (self.hunkContaining(diff_index)) |hunk_index| {
+            const hunk = self.hunks.items[hunk_index];
+            const slice = self.diff_lines[hunk.start..hunk.end];
+            return .{ .hunk = .{
+                .index = hunk_index,
+                .start = hunk.start,
+                .end = hunk.end,
+                .old_start = firstLineNum(slice, .old),
+                .old_end = lastLineNum(slice, .old),
+                .new_start = firstLineNum(slice, .new),
+                .new_end = lastLineNum(slice, .new),
+            } };
+        }
+        return .{ .line = self.diff_lines[diff_index] };
+    }
+
+    fn diffIndexForCursor(self: *const Session) ?usize {
+        if (self.kind != .diff or self.diff_lines.len == 0) return null;
+        switch (self.diff_layout) {
+            .unified => return @min(self.cursor, self.diff_lines.len - 1),
+            .side_by_side => {
+                if (self.pairs.items.len == 0) return null;
+                const pair = self.pairs.items[@min(self.cursor, self.pairs.items.len - 1)];
+                if (pair.right) |right| {
+                    if (indexOfDiffLine(self.diff_lines, right)) |index| return index;
+                }
+                if (pair.left) |left| {
+                    if (indexOfDiffLine(self.diff_lines, left)) |index| return index;
+                }
+                return @min(self.cursor, self.diff_lines.len - 1);
+            },
+        }
+    }
+
+    fn hunkContaining(self: *const Session, diff_index: usize) ?usize {
+        for (self.hunks.items, 0..) |hunk, i| {
+            if (diff_index >= hunk.start and diff_index < hunk.end) return i;
+        }
+        return null;
     }
 
     fn applyHighlight(self: *Session) !void {
@@ -397,6 +545,65 @@ pub const Session = struct {
         };
     }
 
+    fn freeStoredFiles(self: *Session) void {
+        for (self.files.items) |file| {
+            if (file.path.len > 0) self.alloc.free(file.path);
+            if (file.old_text.len > 0) self.alloc.free(file.old_text);
+            if (file.new_text.len > 0) self.alloc.free(file.new_text);
+        }
+        self.files.clearRetainingCapacity();
+    }
+
+    fn resetDiffDisplay(self: *Session) void {
+        if (self.path.len > 0) self.alloc.free(self.path);
+        if (self.source.len > 0) self.alloc.free(self.source);
+        if (self.old_text.len > 0) self.alloc.free(self.old_text);
+        if (self.new_text.len > 0) self.alloc.free(self.new_text);
+        if (self.highlighted.len > 0) self.alloc.free(self.highlighted);
+        if (self.diff_lines.len > 0) self.alloc.free(self.diff_lines);
+        self.path = &.{};
+        self.source = &.{};
+        self.old_text = &.{};
+        self.new_text = &.{};
+        self.highlighted = &.{};
+        self.diff_lines = &.{};
+        self.lines.clearRetainingCapacity();
+        self.highlighted_lines.clearRetainingCapacity();
+        self.hunks.clearRetainingCapacity();
+        self.pairs.clearRetainingCapacity();
+        self.query.clearRetainingCapacity();
+        self.matches.clearRetainingCapacity();
+        self.goto_buf.clearRetainingCapacity();
+        self.comment_buf.clearRetainingCapacity();
+        self.cursor = 0;
+        self.scroll = 0;
+        self.mode = .browse;
+        self.match_index = 0;
+        self.hunk_index = 0;
+        self.language = "";
+    }
+
+    fn reloadCurrentFile(self: *Session, line: ?u32) !void {
+        if (self.files.items.len == 0) return;
+        const file = self.files.items[self.file_index];
+        self.resetDiffDisplay();
+        errdefer self.resetDiffDisplay();
+        self.kind = .diff;
+        self.path = try self.alloc.dupe(u8, file.path);
+        self.old_text = try self.alloc.dupe(u8, file.old_text);
+        self.new_text = try self.alloc.dupe(u8, file.new_text);
+        self.diff_lines = try diff_mod.compute(self.alloc, self.old_text, self.new_text);
+        try code_viewer_layout.collectHunks(self.diff_lines, &self.hunks, self.alloc);
+        try code_viewer_layout.pairDiffLines(self.diff_lines, &self.pairs, self.alloc);
+        self.language = code_viewer_layout.profileLabelForPath(self.path);
+        if (line) |target| {
+            self.jumpToNewLine(target);
+        } else if (self.hunks.items.len > 0) {
+            self.hunk_index = 0;
+            self.cursorForHunk();
+        }
+    }
+
     fn jumpToNewLine(self: *Session, line: u32) void {
         if (line == 0) {
             self.cursor = 0;
@@ -426,6 +633,94 @@ pub const Session = struct {
         }
     }
 };
+
+pub fn mergeComposerContext(alloc: Allocator, existing: []const u8, snippet: []const u8) ![]u8 {
+    const kept = std.mem.trimEnd(u8, existing, " \t\r\n");
+    if (kept.len == 0) return try alloc.dupe(u8, snippet);
+    return try std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ kept, snippet });
+}
+
+fn writeLineSpan(writer: *std.Io.Writer, label: []const u8, start: ?u32, end: ?u32) !void {
+    const first = start orelse return;
+    const last = end orelse first;
+    if (first == last) {
+        try writer.print(", {s} line {d}", .{ label, first });
+        return;
+    }
+    try writer.print(", {s} lines {d}-{d}", .{ label, first, last });
+}
+
+fn writeQuotedDiffLine(writer: *std.Io.Writer, line: diff_mod.DiffLine) !void {
+    try writer.writeByte(switch (line.op) {
+        .add => '+',
+        .remove => '-',
+        .equal => ' ',
+    });
+    try writer.writeAll(line.text);
+    try writer.writeByte('\n');
+}
+
+fn indexOfDiffLine(lines: []const diff_mod.DiffLine, target: diff_mod.DiffLine) ?usize {
+    for (lines, 0..) |line, i| {
+        if (line.op == target.op and
+            line.old_num == target.old_num and
+            line.new_num == target.new_num)
+        {
+            return i;
+        }
+    }
+    return null;
+}
+
+const LineSide = enum { old, new };
+
+fn firstLineNum(lines: []const diff_mod.DiffLine, side: LineSide) ?u32 {
+    for (lines) |line| {
+        const num = switch (side) {
+            .old => line.old_num,
+            .new => line.new_num,
+        };
+        if (num) |value| return value;
+    }
+    return null;
+}
+
+fn lastLineNum(lines: []const diff_mod.DiffLine, side: LineSide) ?u32 {
+    var found: ?u32 = null;
+    for (lines) |line| {
+        const num = switch (side) {
+            .old => line.old_num,
+            .new => line.new_num,
+        };
+        if (num) |value| found = value;
+    }
+    return found;
+}
+
+fn storeFile(alloc: Allocator, spec: DiffFile) !StoredFile {
+    var stored = StoredFile{
+        .path = try alloc.dupe(u8, spec.path),
+        .old_text = try alloc.dupe(u8, spec.old_text),
+        .new_text = try alloc.dupe(u8, spec.new_text),
+    };
+    errdefer {
+        alloc.free(stored.path);
+        alloc.free(stored.old_text);
+        alloc.free(stored.new_text);
+    }
+    const lines = try diff_mod.compute(alloc, stored.old_text, stored.new_text);
+    defer alloc.free(lines);
+    var added: u32 = 0;
+    var removed: u32 = 0;
+    for (lines) |line| switch (line.op) {
+        .add => added += 1,
+        .remove => removed += 1,
+        .equal => {},
+    };
+    stored.added = added;
+    stored.removed = removed;
+    return stored;
+}
 
 pub const ParsedOpen = struct {
     path: []const u8 = "",
@@ -658,6 +953,9 @@ pub fn Runtime(comptime App: type) type {
                     app_lsp_runtime.Runtime(App).didOpen(app, path, source);
                 }
                 try enterScreen(app);
+                if (comptime @hasField(App, "scripting")) {
+                    app.scripting.activateView("code");
+                }
                 return;
             }
             try writeViewNotice(app, .@"error", "The code viewer is unavailable in this runtime.");
@@ -670,16 +968,30 @@ pub fn Runtime(comptime App: type) type {
             new_text: []const u8,
             line: ?u32,
         ) !void {
+            const spec = [_]DiffFile{.{ .path = path, .old_text = old_text, .new_text = new_text }};
+            try openReview(app, &spec, false, line);
+        }
+
+        pub fn openReview(
+            app: *App,
+            files: []const DiffFile,
+            side_by_side: bool,
+            line: ?u32,
+        ) !void {
             if (comptime @hasField(App, "code_viewer") and @hasField(App, "terminal")) {
+                const label = if (files.len > 0) files[0].path else "diff";
                 prepareScreen(app) catch |err| {
-                    try noticePathError(app, path, err);
+                    try noticePathError(app, label, err);
                     return;
                 };
-                app.code_viewer.loadDiff(path, old_text, new_text, line) catch |err| {
-                    try noticePathError(app, path, err);
+                app.code_viewer.loadReview(files, side_by_side, line) catch |err| {
+                    try noticePathError(app, label, err);
                     return;
                 };
                 try enterScreen(app);
+                if (comptime @hasField(App, "scripting")) {
+                    app.scripting.activateView("diff");
+                }
                 return;
             }
             try writeViewNotice(app, .@"error", "The code viewer is unavailable in this runtime.");
@@ -698,6 +1010,9 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
                 app.code_viewer.clear();
+            }
+            if (comptime @hasField(App, "scripting")) {
+                app.scripting.clearActiveView();
             }
         }
 
@@ -871,6 +1186,52 @@ test "session search goto and hunk navigation stay in range" {
     diff_session.toggleDiffLayout();
     try std.testing.expectEqual(DiffLayout.side_by_side, diff_session.diff_layout);
     try std.testing.expectEqual(@as(usize, 1), diff_session.cursor);
+
+    var review = Session.init(alloc);
+    defer review.deinit();
+    const files = [_]DiffFile{
+        .{ .path = "a.lua", .old_text = "old-a\n", .new_text = "new-a\n" },
+        .{ .path = "b.md", .old_text = "keep\n", .new_text = "keep\nchanged\n" },
+    };
+    try review.loadReview(&files, true, null);
+    try std.testing.expect(review.show_file_list);
+    try std.testing.expectEqual(DiffLayout.side_by_side, review.diff_layout);
+    try std.testing.expectEqualStrings("a.lua", review.path);
+    try review.nextFile();
+    try std.testing.expectEqualStrings("b.md", review.path);
+    try review.previousFile();
+    try std.testing.expectEqualStrings("a.lua", review.path);
+    review.toggleFileList();
+    try std.testing.expect(!review.show_file_list);
+}
+
+test "diff comment formats the hunk range note and quoted lines" {
+    const alloc = std.testing.allocator;
+    var session = Session.init(alloc);
+    defer session.deinit();
+    try session.loadDiff("demo.lua", "keep\nold\n", "keep\nnew\n", null);
+    session.beginComment();
+    try std.testing.expectEqual(Mode.comment, session.mode);
+    try session.appendPromptByte('f');
+    try session.appendPromptByte('i');
+    try session.appendPromptByte('x');
+    const snippet = try session.formatDiffComment(alloc);
+    defer alloc.free(snippet);
+    try std.testing.expect(std.mem.find(u8, snippet, "Diff comment on demo.lua") != null);
+    try std.testing.expect(std.mem.find(u8, snippet, "hunk 1") != null);
+    try std.testing.expect(std.mem.find(u8, snippet, "```diff") != null);
+    try std.testing.expect(std.mem.find(u8, snippet, "-old") != null);
+    try std.testing.expect(std.mem.find(u8, snippet, "+new") != null);
+    try std.testing.expect(std.mem.find(u8, snippet, "fix") != null);
+
+    const merged = try mergeComposerContext(alloc, "please review", snippet);
+    defer alloc.free(merged);
+    try std.testing.expect(std.mem.startsWith(u8, merged, "please review\n\nDiff comment on demo.lua"));
+    try std.testing.expect(std.mem.find(u8, merged, "fix") != null);
+
+    const empty = try mergeComposerContext(alloc, "  \n", "only");
+    defer alloc.free(empty);
+    try std.testing.expectEqualStrings("only", empty);
 }
 
 test "last viewable tool prefers a completed read_file" {

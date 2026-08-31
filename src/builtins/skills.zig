@@ -4,15 +4,17 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const skill_commands = @import("../core/skills/skill_commands.zig");
 const skill_contract = @import("../core/skills/skill_contract.zig");
+const skill_runtime = @import("../core/skills/skill_runtime.zig");
 
 const Allocator = std.mem.Allocator;
 
 const RootSpec = skill_contract.RootSpec;
 
 /// Roots scanned at the workspace root and each ancestor directory below
-/// home, in precedence order. `skills/` belongs to the product; the rest are
-/// compatibility roots for other agent installs.
+/// home, in precedence order. `.fx/skills` and `skills/` belong to the product;
+/// the rest are compatibility roots for other agent installs.
 const workspace_roots = [_]RootSpec{
+    .{ .source = .workspace_fx, .path = ".fx/skills" },
     .{ .source = .workspace_shared, .path = "skills" },
     .{ .source = .workspace_opencode, .path = ".opencode/skills" },
     .{ .source = .workspace_codex, .path = ".codex/skills" },
@@ -35,6 +37,27 @@ pub const root_policy: skill_contract.RootPolicy = .{
     .managed_root_source = .global_fx,
     .global_roots = &global_roots,
 };
+
+pub fn loadVisibleSkillsForTool(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    skills_dir: []const u8,
+) !skill_runtime.SkillDiscovery {
+    const home = io_mod.getenv("HOME") orelse homeFromSkillsDir(skills_dir);
+    return skill_runtime.loadVisibleSkills(
+        alloc,
+        workspace_root,
+        home,
+        skills_dir,
+        root_policy,
+    );
+}
+
+fn homeFromSkillsDir(skills_dir: []const u8) ?[]const u8 {
+    const suffix = "/.fx/skills";
+    if (!std.mem.endsWith(u8, skills_dir, suffix)) return null;
+    return skills_dir[0 .. skills_dir.len - suffix.len];
+}
 
 pub const InstallResult = skill_commands.InstallResult;
 
@@ -107,7 +130,14 @@ fn executeCommand(alloc: Allocator, command: Command, request: CommandRequest) !
         .install => |install| installCommandResult(alloc, request.skills_dir, install),
         .create => |name| createCommandResult(alloc, request.skills_dir, name),
         .remove => |name| removeCommandResult(alloc, request, name),
-        .path => noticeFmt(alloc, "fx managed install root: {s}\ncompatibility roots are auto-discovered from workspace and home (.opencode/.codex/.claude/.agents/.claw).", .{request.skills_dir}, false),
+        .path => noticeFmt(
+            alloc,
+            "fx workspace roots are auto-discovered from .fx/skills and skills/.\n" ++
+                "fx managed install root: {s}\n" ++
+                "compatibility roots are auto-discovered from workspace and home (.opencode/.codex/.claude/.agents/.claw).",
+            .{request.skills_dir},
+            false,
+        ),
         .usage => noticeLiteral(alloc, "Usage: /skills [list|add|install|show|create|remove|path] [name|url|path]", false),
     };
 }
@@ -1142,6 +1172,7 @@ test "copySkillDir preserves the installed skill across allocation failures" {
 
 test "workspace skill roots scan the product root before compatibility roots" {
     const expected = [_]RootSpec{
+        .{ .source = .workspace_fx, .path = ".fx/skills" },
         .{ .source = .workspace_shared, .path = "skills" },
         .{ .source = .workspace_opencode, .path = ".opencode/skills" },
         .{ .source = .workspace_codex, .path = ".codex/skills" },
@@ -1935,6 +1966,23 @@ test "built-in skills command parses install aliases and filters" {
             try std.testing.expectEqualStrings("vercel-labs/agent-skills", install.source);
             try std.testing.expectEqualStrings("workflow", install.filter.?);
         },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "built-in skills path reports native workspace roots" {
+    const alloc = std.testing.allocator;
+    var static_ctx = StaticSkillCtx{ .skills = &.{} };
+    var result = try executeCommand(alloc, parseCommand("path"), staticCommandRequest("/tmp/skills", &static_ctx));
+    defer result.deinit(alloc);
+
+    switch (result) {
+        .notice => |notice| try std.testing.expectEqualStrings(
+            "fx workspace roots are auto-discovered from .fx/skills and skills/.\n" ++
+                "fx managed install root: /tmp/skills\n" ++
+                "compatibility roots are auto-discovered from workspace and home (.opencode/.codex/.claude/.agents/.claw).",
+            notice.text,
+        ),
         else => return error.TestExpectedEqual,
     }
 }

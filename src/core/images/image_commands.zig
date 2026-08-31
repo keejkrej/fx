@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const image_attachments = @import("image_attachments.zig");
 const types = @import("../shared/types.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
@@ -84,13 +85,28 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn attachClipboard(app: *App) !void {
+            // First-class macOS path (upstream): osascript PNGf → tmp snapshot →
+            // [Image N]. Linux/Windows screenshot buffers are the Lua paste plugin;
+            // loadClipboardImageAttachment returns error.Unsupported there.
             var loaded = image_attachments.loadClipboardImageAttachment(app.alloc) catch |err| {
                 if (err == error.NoClipboardImage) {
-                    try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "no image found on clipboard" }, true);
+                    try app.writeDomainNotice(.{
+                        .topic = "images",
+                        .tone = .neutral,
+                        .body = "no image found on clipboard",
+                    }, true);
                 } else if (err != error.Unsupported) {
-                    const line = try std.fmt.allocPrint(app.alloc, "failed to paste clipboard image: {s}", .{@errorName(err)});
+                    const line = try std.fmt.allocPrint(
+                        app.alloc,
+                        "failed to paste clipboard image: {s}",
+                        .{@errorName(err)},
+                    );
                     defer app.alloc.free(line);
-                    try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = line }, true);
+                    try app.writeDomainNotice(.{
+                        .topic = "images",
+                        .tone = .@"error",
+                        .body = line,
+                    }, true);
                 }
                 return;
             };
@@ -776,6 +792,46 @@ test "temporary image source is removed after insertion and remapped to its snap
     defer verified.deinit(alloc);
 }
 
+test "clipboard buffer paste attaches a temp snapshot file through the image pipeline" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try realTmpPath(alloc, &tmp, ".");
+    defer alloc.free(root);
+    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    defer alloc.free(snapshot_dir);
+
+    var persisted = try image_attachments.persistImageBytes(alloc, "\x89PNG\r\n\x1a\nclipboard-buffer");
+    const source_path = try alloc.dupe(u8, persisted.attachment.?.path);
+    defer alloc.free(source_path);
+    try std.testing.expect(std.mem.find(u8, source_path, "fx-image-snapshots-") != null);
+    try std.testing.expectEqualStrings("clipboard.png", std.fs.path.basename(source_path));
+
+    var app = FakeApp{
+        .alloc = alloc,
+        .snapshot_dir = snapshot_dir,
+    };
+    defer app.deinit();
+    const result = try Commands(FakeApp).insertImageAtCursor(
+        FakeApp,
+        &app,
+        persisted.takeAttachment(),
+        .temporary,
+    );
+    persisted.deinit(alloc);
+
+    try std.testing.expectEqual(InsertImageResult.inserted, result);
+    try std.testing.expectEqualStrings("[Image #1]", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    const pending = app.pending_images.items[0];
+    try std.testing.expectEqualStrings("image/png", pending.media_type);
+    try std.testing.expectEqualStrings(pending.snapshot_path.?, pending.path);
+    try std.testing.expect(std.fs.path.isAbsolute(pending.path));
+    const agent_path = try image_attachments.loadImageAttachment(alloc, pending.path);
+    defer types.freeImageAttachment(alloc, agent_path);
+    try std.testing.expectEqualStrings("image/png", agent_path.media_type);
+}
+
 test "temporary image source is removed on input full rejection and capture failure" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -974,7 +1030,7 @@ test "managePending reports empty lists populated lists and clear" {
 }
 
 test "attachClipboard is silent on unsupported platforms" {
-    if (@import("builtin").os.tag == .macos) return;
+    if (builtin.os.tag == .macos) return;
 
     const alloc = std.testing.allocator;
     var app = FakeApp{ .alloc = alloc };

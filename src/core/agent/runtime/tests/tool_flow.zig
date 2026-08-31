@@ -15,6 +15,7 @@ const diff = @import("../../../output/diff.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
 const command_result_mapping = @import("../../../tooling/command_result_mapping.zig");
 const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
+const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
 const tool_specs = @import("../../../tooling/tool_specs.zig");
 const tool_result_errors = @import("../../../tooling/tool_result_errors.zig");
 const context_contract = @import("../../../workspace/context_contract.zig");
@@ -63,8 +64,23 @@ const toolCall = test_support.toolCall;
 const vision_agent_test_tools = test_support.vision_agent_test_tools;
 const VisionAgentToolRuntime = test_support.VisionAgentToolRuntime;
 
-const fixture_tools_json =
-    "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read a file\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
+const PostEffectTerminalFailure = struct {
+    effect_count: usize = 0,
+
+    fn execute(
+        raw: *anyopaque,
+        _: runtime_tool_contracts.ToolExecutionRequest,
+    ) !runtime_tool_contracts.ToolExecutionResult {
+        const self: *PostEffectTerminalFailure = @ptrCast(@alignCast(raw));
+        self.effect_count += 1;
+        return error.OutOfMemory;
+    }
+};
+
+const read_file_advertised_names = [_][]const u8{"read_file"};
+const terminal_advertised_names = [_][]const u8{"terminal"};
+const read_file_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.read_file.model_schema};
+const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.terminal.model_schema};
 
 fn makeOwnedVisionCatalog(
     alloc: std.mem.Allocator,
@@ -122,20 +138,6 @@ fn executedToolCount(hooks: *FakeAgentRuntimeDeps) usize {
     hooks.execute_mutex.lockUncancelable(io_mod.getIo());
     defer hooks.execute_mutex.unlock(io_mod.getIo());
     return hooks.executed_names.items.len;
-}
-
-fn restrictedCommandFingerprint(
-    command: []const u8,
-    cwd: []const u8,
-) command_admission.AdmissionFingerprint {
-    return .{
-        .command = command,
-        .resolved_cwd = cwd,
-        .background = false,
-        .resolved_backend = .none,
-        .target_os = builtin.os.tag,
-        .scope = .restricted,
-    };
 }
 
 fn expectGrantListsEqual(
@@ -469,11 +471,14 @@ fn expectPermissionDeniedToolResult(gateway: *const FakeGateway, index: usize, t
             if (part_tool_name != .string or !std.mem.eql(u8, part_tool_name.string, tool_name)) continue;
             const output = part.object.get("output") orelse continue;
             if (output != .object) continue;
-            const value = output.object.get("value") orelse continue;
-            if (value != .string) continue;
+            const output_type = output.object.get("type") orelse continue;
+            if (output_type != .string or !std.mem.eql(u8, output_type.string, "execution-denied")) continue;
+            try std.testing.expect(output.object.get("value") == null);
+            const reason_value = output.object.get("reason") orelse continue;
+            if (reason_value != .string) continue;
 
-            try std.testing.expect(tool_result_errors.isToolPermissionDeniedOutput(value.string));
-            var payload = try std.json.parseFromSlice(std.json.Value, alloc, value.string, .{});
+            try std.testing.expect(tool_result_errors.isToolPermissionDeniedOutput(reason_value.string));
+            var payload = try std.json.parseFromSlice(std.json.Value, alloc, reason_value.string, .{});
             defer payload.deinit();
             const error_obj = payload.value.object.get("error").?.object;
             try std.testing.expectEqualStrings("tool_permission_denied", error_obj.get("type").?.string);
@@ -494,7 +499,9 @@ fn expectPermissionDeniedToolResult(gateway: *const FakeGateway, index: usize, t
 fn expectedPermissionDeniedMessage(reason: types.ToolPermissionDenialReason) ?[]const u8 {
     return switch (reason) {
         .user_denied => "Permission denied by user",
-        .auto_denied => "Permission denied by auto mode classifier",
+        .auto_denied => "Blocked by automatic safety policy",
+        .review_caution => "Action held after safety review",
+        .review_unavailable => "Safety reviewer unavailable; action held",
         .policy_denied, .permission_required => null,
     };
 }
@@ -997,8 +1004,7 @@ test "accepted automatic review remains internal before ordinary tool execution"
     hooks.permission_decisions = &.{.once};
     hooks.permission_auto_review_results = &.{.{
         .risk = .low,
-        .authorization = .high,
-        .decision = .allow,
+        .decision = .clear,
         .rationale = "bounded safe action",
     }};
     defer hooks.deinit();
@@ -1019,6 +1025,237 @@ test "accepted automatic review remains internal before ordinary tool execution"
     );
 }
 
+test "borrowed nested terminal completion is flat before authority execution and memory" {
+    const alloc = std.testing.allocator;
+    const flat_arguments = "{\"action\":\"exec\",\"command\":\"printf done\"}";
+    const calls = [_]ToolCall{toolCall(
+        "call_nested_terminal",
+        "terminal",
+        "{\"request\":{\"action\":\"exec\",\"command\":\"printf done\"}}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{.once};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.advertised_tool_names = &terminal_advertised_names;
+    config.advertised_functions = &terminal_advertised_functions;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("terminal", hooks.executed_names.items[0]);
+    try std.testing.expectEqualStrings(flat_arguments, hooks.last_validated_arguments.?);
+    try std.testing.expectEqualStrings(flat_arguments, hooks.last_permission_arguments.?);
+    try std.testing.expectEqualStrings(flat_arguments, hooks.last_executed_arguments.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    try std.testing.expectEqualStrings(
+        flat_arguments,
+        execution.tool_steps[0].tool_calls[0].arguments_json,
+    );
+}
+
+test "terminal acquire stays tracked when execution fails after its effect" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(session_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        session_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+
+    const calls = [_]ToolCall{toolCall(
+        "terminal_acquire",
+        "terminal",
+        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"write\":null,\"lease\":\"acquire\"}",
+    )};
+    var gateway = FakeGateway.init(alloc, &.{.{ .tool_calls = &calls }});
+    defer gateway.deinit();
+    var post_effect = PostEffectTerminalFailure{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.permission_decisions = &.{.once};
+    hooks.tool_execution_override = .{
+        .context = &post_effect,
+        .execute_fn = PostEffectTerminalFailure.execute,
+    };
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.session_child_capability = &capability;
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        runFakePrompt(&gateway, &hooks, config, fixture.job()),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), post_effect.effect_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.terminal_lease_cleanup_ids.items.len);
+    try std.testing.expectEqualStrings(
+        "terminal-one",
+        hooks.terminal_lease_cleanup_ids.items[0],
+    );
+}
+
+test "terminal lifecycle resolves one display target before execution" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall(
+        "inspect_call",
+        "terminal",
+        "{\"action\":\"inspect\",\"session_id\":\"terminal-cold-session\"}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.tool_display_target = "session terminal-cold-session";
+    hooks.tool_display_target_after_execute = "npm run dev";
+    hooks.exec_plans = &.{.{ .result = .{
+        .status = .success,
+        .model_output = "{}",
+    } }};
+    const PermissionFixture = struct {
+        fn request(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: ToolCall,
+            _: permission_auto_classifier.ReviewTurnContext,
+            _: types.PermissionMode,
+            _: []const PermissionGrant,
+            _: ?runtime_tool_contracts.LiveToolAuthority,
+            _: ?runtime_tool_contracts.LivePermissionRevalidation,
+            _: []const []const u8,
+        ) !command_admission.PermissionOutcome {
+            return .{
+                .decision = .once,
+                .execution_authority = .ordinary,
+                .human_approval = .once,
+            };
+        }
+    };
+    var permission_fixture = PermissionFixture{};
+    hooks.permission_request_override = .{
+        .context = &permission_fixture,
+        .request_fn = PermissionFixture.request,
+    };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.advertised_tool_names = &terminal_advertised_names;
+    config.advertised_functions = &terminal_advertised_functions;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.tool_display_target_resolve_count);
+    var active_count: usize = 0;
+    var completed_count: usize = 0;
+    for (hooks.lifecycle_events.items) |event| switch (event) {
+        .progress => |progress| {
+            if (!std.mem.eql(u8, progress.id.call_id, "inspect_call")) continue;
+            try std.testing.expectEqualStrings(
+                "start terminal session terminal-cold-session",
+                progress.text,
+            );
+            active_count += 1;
+        },
+        .terminal => |terminal| {
+            if (!std.mem.eql(u8, terminal.id.call_id, "inspect_call")) continue;
+            try std.testing.expectEqualStrings(
+                "done terminal session terminal-cold-session",
+                terminal.outcome.summary,
+            );
+            completed_count += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), active_count);
+    try std.testing.expectEqual(@as(usize, 1), completed_count);
+    try std.testing.expectEqualStrings("npm run dev", hooks.tool_display_target.?);
+}
+
+test "processQueuedPrompt keeps sampled root mode through permission and execution" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall(
+        "sampled_mode_read",
+        "read_file",
+        "{\"path\":\"README.md\"}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.root_permission_mode = .auto;
+    const PermissionFixture = struct {
+        hooks: *FakeAgentRuntimeDeps,
+
+        fn request(
+            raw: *anyopaque,
+            _: std.mem.Allocator,
+            _: ToolCall,
+            _: permission_auto_classifier.ReviewTurnContext,
+            permission_mode: types.PermissionMode,
+            _: []const PermissionGrant,
+            _: ?runtime_tool_contracts.LiveToolAuthority,
+            _: ?runtime_tool_contracts.LivePermissionRevalidation,
+            _: []const []const u8,
+        ) !command_admission.PermissionOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(types.PermissionMode.auto, permission_mode);
+            self.hooks.root_permission_mode = .ask;
+            return .{
+                .decision = .once,
+                .execution_authority = .ordinary,
+            };
+        }
+    };
+    var permission_fixture = PermissionFixture{ .hooks = &hooks };
+    hooks.permission_request_override = .{
+        .context = &permission_fixture,
+        .request_fn = PermissionFixture.request,
+    };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(types.PermissionMode.ask, hooks.root_permission_mode.?);
+    try std.testing.expectEqual(
+        @as(?types.PermissionMode, .auto),
+        hooks.last_execute_permission_mode,
+    );
+}
+
 test "automatic review does not reposition deferred web fetch lifecycle" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "web_fetch", "{\"url\":\"https://example.com\"}")};
@@ -1032,8 +1269,7 @@ test "automatic review does not reposition deferred web fetch lifecycle" {
     hooks.permission_decisions = &.{.once};
     hooks.permission_auto_review_results = &.{.{
         .risk = .low,
-        .authorization = .high,
-        .decision = .allow,
+        .decision = .clear,
         .rationale = "bounded safe action",
     }};
     defer hooks.deinit();
@@ -1089,8 +1325,7 @@ test "automatic ask permission_required does not emit auto-deny notice or ration
     hooks.permission_denial_reasons = &.{.permission_required};
     hooks.permission_auto_review_results = &.{.{
         .risk = .high,
-        .authorization = .unknown,
-        .decision = .ask,
+        .decision = .caution,
         .rationale = "the destination needs review",
     }};
     defer hooks.deinit();
@@ -1204,7 +1439,7 @@ test "parallel streamed cancellation closes every concrete tool action" {
     const calls = [_]ToolCall{
         toolCall("call_read", "read_file", "{\"path\":\"README.md\"}"),
         toolCall("call_fetch", "web_fetch", "{\"url\":\"https://example.com\"}"),
-        toolCall("call_info", "file_info", "{\"path\":\"README.md\"}"),
+        toolCall("call_glob", "glob_files", "{\"pattern\":\"README.md\"}"),
     };
     const cancellation_points = [_][]const u8{ "read_file", "web_fetch" };
 
@@ -1280,6 +1515,47 @@ test "selected dynamic MCP allow returned after cancellation never executes" {
     try std.testing.expectEqualStrings("mcp_select_tool", hooks.executed_names.items[0]);
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
     try std.testing.expectEqual(@as(usize, 0), hooks.rejected_names.items.len);
+}
+
+test "selected dynamic MCP execution carries its validation generation" {
+    const alloc = std.testing.allocator;
+    const select_calls = [_]ToolCall{
+        toolCall("select", "mcp_select_tool", "{\"name\":\"mcp_fixture_echo\"}"),
+    };
+    const dynamic_calls = [_]ToolCall{
+        toolCall("dynamic", "mcp_fixture_echo", "{}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &select_calls },
+        .{ .tool_calls = &dynamic_calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{ .once, .once };
+    hooks.validation_mcp_tool_name = "mcp_fixture_echo";
+    hooks.validation_mcp_runtime_generation = 41;
+    hooks.exec_plans = &.{
+        .{ .result = .{
+            .model_output = "selected",
+            .selected_dynamic_tool_name = "mcp_fixture_echo",
+            .selected_dynamic_tool_schema_json = "{\"type\":\"function\",\"name\":\"mcp_fixture_echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}",
+        } },
+        .{ .result = .{ .model_output = "called" } },
+    };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqualSlices(
+        ?u64,
+        &.{ null, 41 },
+        hooks.execution_mcp_runtime_generations.items,
+    );
 }
 
 test "resumed persistent child review rejects child-authored authority provenance" {
@@ -1392,701 +1668,6 @@ test "compacted historical root authority stays out of tool execution" {
         hooks.last_execute_root_user_messages.items.len,
     );
     try std.testing.expect(hooks.last_execute_root_user_evidence_complete);
-}
-
-test "sandbox widening allow mints broader authority and retries exactly once" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("command", "terminal", "{\"action\":\"exec\",\"command\":\"npm test\"}")};
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "Final" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.permission_decisions = &.{.once};
-    hooks.sandbox_widening_decisions = &.{.once};
-    hooks.exec_plans = &.{
-        .{ .result = .{
-            .status = .failure,
-            .model_output = "",
-            .sandbox_scope_required = .{
-                .phase = .preflight,
-                .restricted_fingerprint = restrictedCommandFingerprint(
-                    "npm test",
-                    "/tmp/workspace",
-                ),
-                .command_timeout_started_ms = 1234,
-            },
-        } },
-        .{ .result = .{ .model_output = "tests passed" } },
-    };
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.permission_mode = .auto;
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-    try std.testing.expectEqual(@as(usize, 1), hooks.sandbox_widening_index);
-    try std.testing.expectEqual(@as(usize, 1), hooks.permission_user_intent_contexts.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.sandbox_widening_user_intent_contexts.items.len);
-    try std.testing.expectEqualStrings(
-        hooks.permission_user_intent_contexts.items[0],
-        hooks.sandbox_widening_user_intent_contexts.items[0],
-    );
-    try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.rejected_names.items.len);
-    try std.testing.expectEqual(@as(usize, 2), hooks.execute_authority_scopes.items.len);
-    try std.testing.expectEqual(.restricted, hooks.execute_authority_scopes.items[0]);
-    try std.testing.expectEqual(.broader, hooks.execute_authority_scopes.items[1]);
-    try std.testing.expectEqual(@as(?i64, null), hooks.execute_timeout_started_ms.items[0]);
-    try std.testing.expectEqual(@as(?i64, 1234), hooks.execute_timeout_started_ms.items[1]);
-    try expectBodyContains(&gateway, 1, "tests passed");
-}
-
-test "child live authority revalidates after sandbox widening approval" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall(
-        "widening-recheck",
-        "terminal",
-        "{\"action\":\"exec\",\"command\":\"npm test\"}",
-    )};
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "Final" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.permission_decisions = &.{.once};
-    hooks.sandbox_widening_decisions = &.{.once};
-    hooks.exec_plans = &.{
-        .{ .result = .{
-            .status = .failure,
-            .model_output = "",
-            .sandbox_scope_required = .{
-                .phase = .preflight,
-                .restricted_fingerprint = restrictedCommandFingerprint(
-                    "npm test",
-                    "/tmp/workspace",
-                ),
-            },
-        } },
-        .{ .result = .{ .model_output = "must not execute" } },
-    };
-    const Provider = struct {
-        calls: usize = 0,
-        const tools = [_][]const u8{"terminal"};
-
-        fn resolve(
-            raw: *anyopaque,
-            _: std.mem.Allocator,
-            _: ToolCall,
-            _: []const u8,
-            _: []const u8,
-            _: tool_dispatch.PermissionTargetKind,
-        ) !runtime_deps.ResolvedLiveToolAuthority {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-            return .{
-                .authority = .{
-                    .generation = if (self.calls <= 2) 1 else 2,
-                    .root_id = "root",
-                    .tools = if (self.calls <= 2) &tools else &.{},
-                    .sandbox_backend = if (self.calls <= 2) .macos else .none,
-                    .integrations = &.{},
-                    .rules = .{},
-                    .grants = &.{},
-                    .permission_mode = .auto,
-                },
-                .decision = if (self.calls <= 2) .ask else .unavailable,
-            };
-        }
-    };
-    var provider = Provider{};
-    hooks.live_tool_authority = .{
-        .context = &provider,
-        .resolve_fn = Provider.resolve,
-    };
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.permission_mode = .auto;
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-    try std.testing.expectEqual(@as(usize, 4), provider.calls);
-    try std.testing.expectEqual(@as(usize, 1), hooks.sandbox_widening_index);
-    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
-    try std.testing.expectEqual(.restricted, hooks.execute_authority_scopes.items[0]);
-    try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
-}
-
-test "child live authority allow to ask requires current approval before sandbox widening effect" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall(
-        "widening-allow-to-ask",
-        "terminal",
-        "{\"action\":\"exec\",\"command\":\"npm test\"}",
-    )};
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "done" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.permission_decisions = &.{ .once, .once };
-    hooks.permission_human_approvals = &.{ .none, .once };
-    hooks.permission_wait_index = 1;
-    hooks.sandbox_widening_decisions = &.{.once};
-    hooks.sandbox_widening_human_approvals = &.{.none};
-    hooks.exec_plans = &.{
-        .{ .result = .{
-            .status = .failure,
-            .model_output = "",
-            .sandbox_scope_required = .{
-                .phase = .preflight,
-                .restricted_fingerprint = restrictedCommandFingerprint(
-                    "npm test",
-                    "/tmp/workspace",
-                ),
-            },
-        } },
-        .{ .result = .{ .model_output = "approved broader result" } },
-    };
-
-    const Provider = struct {
-        calls: usize = 0,
-        const tools = [_][]const u8{"terminal"};
-        var allow_rules = [_]types.PermissionRule{.{
-            .permission = @constCast("bash"),
-            .pattern = @constCast("*"),
-            .action = .allow,
-        }};
-        var ask_rules = [_]types.PermissionRule{.{
-            .permission = @constCast("bash"),
-            .pattern = @constCast("*"),
-            .action = .ask,
-        }};
-
-        fn resolve(
-            raw: *anyopaque,
-            _: std.mem.Allocator,
-            _: ToolCall,
-            _: []const u8,
-            _: []const u8,
-            _: tool_dispatch.PermissionTargetKind,
-        ) !runtime_deps.ResolvedLiveToolAuthority {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-            const ask = self.calls >= 3;
-            return .{
-                .authority = .{
-                    .generation = if (ask) 2 else 1,
-                    .root_id = "root",
-                    .tools = &tools,
-                    .sandbox_backend = .macos,
-                    .integrations = &.{},
-                    .rules = .{ .rules = if (ask) &ask_rules else &allow_rules },
-                    .grants = &.{},
-                    .permission_mode = .auto,
-                },
-                .decision = if (ask) .ask else .allow,
-            };
-        }
-    };
-    var provider = Provider{};
-    hooks.live_tool_authority = .{
-        .context = &provider,
-        .resolve_fn = Provider.resolve,
-    };
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.permission_mode = .auto;
-    var waiting = std.atomic.Value(bool).init(false);
-    var release = std.atomic.Value(bool).init(false);
-    var finished = std.atomic.Value(bool).init(false);
-    hooks.permission_waiting = &waiting;
-    hooks.permission_release = &release;
-    var run = BlockingPromptRun{
-        .gateway = &gateway,
-        .hooks = &hooks,
-        .config = fixture.config(),
-        .job = job,
-        .finished = &finished,
-    };
-    var joined = false;
-    const thread = try std.Thread.spawn(.{}, BlockingPromptRun.run, .{&run});
-    defer {
-        release.store(true, .seq_cst);
-        if (!joined) thread.join();
-    }
-
-    try std.testing.expect(waitForPermissionBarrier(&waiting, &finished));
-    try std.testing.expectEqual(@as(usize, 1), executedToolCount(&hooks));
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-    release.store(true, .seq_cst);
-    thread.join();
-    joined = true;
-    if (run.failure) |err| return err;
-
-    try std.testing.expectEqual(@as(usize, 4), provider.calls);
-    try std.testing.expectEqual(@as(usize, 2), hooks.permission_index);
-    try std.testing.expectEqual(@as(usize, 1), hooks.sandbox_widening_index);
-    try std.testing.expectEqual(@as(usize, 2), executedToolCount(&hooks));
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-    try std.testing.expectEqual(.restricted, hooks.execute_authority_scopes.items[0]);
-    try std.testing.expectEqual(.broader, hooks.execute_authority_scopes.items[1]);
-}
-
-test "initial always command approval still requires a fresh sandbox widening decision" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("command", "terminal", "{\"action\":\"exec\",\"command\":\"npm test\"}")};
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "Final" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.permission_decisions = &.{.always};
-    hooks.sandbox_widening_decisions = &.{.once};
-    hooks.exec_plans = &.{
-        .{ .result = .{
-            .status = .failure,
-            .model_output = "",
-            .sandbox_scope_required = .{
-                .phase = .preflight,
-                .restricted_fingerprint = restrictedCommandFingerprint(
-                    "npm test",
-                    "/tmp/workspace",
-                ),
-            },
-        } },
-        .{ .result = .{ .model_output = "tests passed" } },
-    };
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.permission_mode = .ask;
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-    try std.testing.expectEqual(@as(usize, 1), hooks.sandbox_widening_index);
-    try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.propagated_grants.items.len);
-    try std.testing.expectEqualStrings("bash", hooks.propagated_grants.items[0].tool_name);
-    try std.testing.expectEqual(.restricted, hooks.execute_authority_scopes.items[0]);
-    try std.testing.expectEqual(.broader, hooks.execute_authority_scopes.items[1]);
-}
-
-test "reactive sandbox ask preserves restricted result and suppresses broader retry" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("command", "terminal", "{\"action\":\"exec\",\"command\":\"touch local && touch /outside\"}")};
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "Final" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.permission_decisions = &.{.once};
-    hooks.sandbox_widening_decisions = &.{.permission_required};
-    hooks.sandbox_widening_denial_reasons = &.{.permission_required};
-    hooks.sandbox_widening_auto_review_results = &.{.{
-        .risk = .high,
-        .authorization = .unknown,
-        .decision = .ask,
-        .rationale = "outside write is not authorized",
-    }};
-    hooks.exec_plans = &.{.{ .result = .{
-        .status = .failure,
-        .model_output = "workspace marker created; outside write blocked",
-        .command_result_json = "{\"exit_code\":1}",
-        .sandbox_scope_required = .{
-            .phase = .reactive,
-            .restricted_fingerprint = restrictedCommandFingerprint(
-                "touch local && touch /outside",
-                "/tmp/workspace",
-            ),
-            .restricted_model_output = "workspace marker created; outside write blocked",
-            .restricted_command_result_json = "{\"exit_code\":1}",
-        },
-    } }};
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.permission_mode = .auto;
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-    try std.testing.expectEqual(@as(usize, 1), hooks.sandbox_widening_index);
-    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try expectBodyContainsInOrder(&gateway, 1, &.{
-        "restricted_attempt_ran",
-        "workspace marker created; outside write blocked",
-    });
-    try std.testing.expect(std.mem.find(
-        u8,
-        gateway.request_bodies.items[1],
-        "Untrusted automatic-review evidence",
-    ) == null);
-    const result = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results[0];
-    try std.testing.expect(std.mem.find(u8, result.output, "restricted_attempt_ran") != null);
-    try std.testing.expect(std.mem.find(u8, result.output, "workspace marker created") != null);
-    try std.testing.expect(std.mem.find(u8, result.output, "outside write is not authorized") == null);
-}
-
-test "reactive sandbox widening failure preserves the restricted result" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(
-        io_mod.getIo(),
-        "session",
-        std.Io.File.Permissions.fromMode(0o700),
-    );
-    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
-        .iterate = true,
-        .follow_symlinks = false,
-    });
-    defer session_dir.close(io_mod.getIo());
-    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
-    defer alloc.free(session_path);
-    var capability = try session_child_store.SessionChildCapability.initForTesting(
-        alloc,
-        session_dir,
-        session_path,
-        .writable,
-        .{},
-    );
-    defer capability.deinit();
-
-    const calls = [_]ToolCall{toolCall("command", "terminal", "{\"action\":\"exec\",\"command\":\"touch local && touch /outside\"}")};
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "Final" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.permission_decisions = &.{.once};
-    hooks.sandbox_widening_tool_failures = &.{"restricted command context changed"};
-    hooks.command_replay_output = "  workspace marker created; outside write blocked\n";
-    hooks.command_replay_capability = &capability;
-    hooks.exec_plans = &.{.{ .result = .{
-        .status = .failure,
-        .model_output = "workspace marker created; outside write blocked",
-        .command_result_json = "{\"exit_code\":1}",
-        .sandbox_scope_required = .{
-            .phase = .reactive,
-            .restricted_fingerprint = restrictedCommandFingerprint(
-                "touch local && touch /outside",
-                "/tmp/workspace",
-            ),
-            .restricted_model_output = "workspace marker created; outside write blocked",
-            .restricted_command_result_json = "{\"exit_code\":1}",
-        },
-    } }};
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.permission_mode = .auto;
-    var config = fixture.config();
-    config.session_child_capability = &capability;
-
-    try runFakePrompt(&gateway, &hooks, config, job);
-
-    try std.testing.expectEqual(@as(usize, 1), hooks.sandbox_widening_index);
-    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
-    const result = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results[0];
-    try std.testing.expect(std.mem.find(u8, result.output, "restricted_attempt_ran") != null);
-    try std.testing.expect(std.mem.find(u8, result.output, "workspace marker created") != null);
-    try std.testing.expect(std.mem.find(u8, result.output, "restricted command context changed") != null);
-    const persisted_replay = switch (result.command_output_replay orelse
-        return error.TestExpectedReplay) {
-        .available => |descriptor| descriptor,
-        .unavailable => return error.TestExpectedReplay,
-    };
-    const terminal = hooks.lifecycle_events.items[2].terminal;
-    const terminal_replay = switch (terminal.result_memory.?.command_output_replay.?) {
-        .available => |descriptor| descriptor,
-        .unavailable => return error.TestExpectedReplay,
-    };
-    try std.testing.expectEqualStrings(persisted_replay.handle, terminal_replay.handle);
-    try std.testing.expectEqual(persisted_replay.framed_bytes, terminal_replay.framed_bytes);
-    try std.testing.expect(persisted_replay.framed_bytes > 0);
-}
-
-test "preflight sandbox prompt cancellation remains an interrupted active tool" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{
-        toolCall("command", "terminal", "{\"action\":\"exec\",\"command\":\"npm test\"}"),
-        toolCall("later_read", "read_file", "{\"path\":\"README.md\"}"),
-        toolCall("later_info", "file_info", "{\"path\":\"README.md\"}"),
-    };
-    const completions = [_]FakeCompletion{.{
-        .tool_calls = &calls,
-        .streamed_tool_starts = &calls,
-    }};
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-    hooks.permission_decisions = &.{.once};
-    hooks.sandbox_widening_decisions = &.{.deny};
-    hooks.cancel_on_sandbox_widening = &fixture.cancel_flag;
-    hooks.exec_plans = &.{.{ .result = .{
-        .status = .failure,
-        .model_output = "",
-        .sandbox_scope_required = .{
-            .phase = .preflight,
-            .restricted_fingerprint = restrictedCommandFingerprint(
-                "npm test",
-                "/tmp/workspace",
-            ),
-        },
-    } }};
-    var job = fixture.job();
-    job.permission_mode = .ask;
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
-    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
-    const interrupted = hooks.history_turns.items[0].interrupted;
-    try std.testing.expect(interrupted.tool_call != null);
-    try std.testing.expectEqualStrings("terminal", interrupted.tool_call.?.name);
-    try std.testing.expectEqual(@as(usize, 0), interrupted.execution.tool_steps.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
-    for (calls) |call| {
-        try expectSingleTerminalOutcome(
-            hooks.lifecycle_events.items,
-            call.id,
-            .cancelled,
-        );
-    }
-}
-
-test "reactive sandbox prompt cancellation persists restricted result as interrupted history" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("command", "terminal", "{\"action\":\"exec\",\"command\":\"touch local && touch /outside\"}")};
-    const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-    hooks.permission_decisions = &.{.once};
-    hooks.sandbox_widening_decisions = &.{.deny};
-    hooks.cancel_on_sandbox_widening = &fixture.cancel_flag;
-    hooks.exec_plans = &.{.{ .result = .{
-        .status = .failure,
-        .model_output = "workspace marker created; outside write blocked",
-        .sandbox_scope_required = .{
-            .phase = .reactive,
-            .restricted_fingerprint = restrictedCommandFingerprint(
-                "touch local && touch /outside",
-                "/tmp/workspace",
-            ),
-            .restricted_model_output = "workspace marker created; outside write blocked",
-            .restricted_command_result_json = "{\"exit_code\":1}",
-        },
-    } }};
-    var job = fixture.job();
-    job.permission_mode = .auto;
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
-    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
-    const interrupted = hooks.history_turns.items[0].interrupted;
-    try std.testing.expectEqual(@as(usize, 1), interrupted.execution.tool_steps.len);
-    const result = interrupted.execution.tool_steps[0].tool_results[0];
-    try std.testing.expect(std.mem.find(u8, result.output, "restricted_attempt_ran") != null);
-    try std.testing.expect(std.mem.find(u8, result.output, "workspace marker created") != null);
-    try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
-}
-
-test "reactive sandbox broader retry cancellation cleans replay captures" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(
-        io_mod.getIo(),
-        "session",
-        std.Io.File.Permissions.fromMode(0o700),
-    );
-    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
-        .iterate = true,
-        .follow_symlinks = false,
-    });
-    defer session_dir.close(io_mod.getIo());
-    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
-    defer alloc.free(session_path);
-    var capability = try session_child_store.SessionChildCapability.initForTesting(
-        alloc,
-        session_dir,
-        session_path,
-        .writable,
-        .{},
-    );
-    defer capability.deinit();
-    for ([_]bool{ false, true }) |fail_terminal_publication| {
-        const calls = [_]ToolCall{toolCall("command", "terminal", "{\"action\":\"exec\",\"command\":\"touch local && touch /outside\"}")};
-        const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
-        var gateway = FakeGateway.init(alloc, &completions);
-        defer gateway.deinit();
-        var hooks = FakeAgentRuntimeDeps.init(alloc);
-        defer hooks.deinit();
-        hooks.command_replay_output = "reactive capture candidate\n";
-        hooks.command_replay_capability = &capability;
-        hooks.fail_status_finished = fail_terminal_publication;
-        var fixture = PromptFixture{};
-        hooks.permission_decisions = &.{.once};
-        hooks.sandbox_widening_decisions = &.{.once};
-        hooks.cancel_on_execute = &fixture.cancel_flag;
-        hooks.cancel_on_execute_name = "terminal";
-        hooks.cancel_on_execute_index = 1;
-        hooks.exec_plans = &.{
-            .{ .result = .{
-                .status = .failure,
-                .model_output = "restricted marker created; outside write blocked",
-                .command_result_json = "{\"exit_code\":1,\"attempt\":\"restricted\"}",
-                .sandbox_scope_required = .{
-                    .phase = .reactive,
-                    .restricted_fingerprint = restrictedCommandFingerprint(
-                        "touch local && touch /outside",
-                        "/tmp/workspace",
-                    ),
-                    .restricted_model_output = "restricted marker created; outside write blocked",
-                    .restricted_command_result_json = "{\"exit_code\":1,\"attempt\":\"restricted\"}",
-                },
-            } },
-            .{ .result = .{
-                .status = .failure,
-                .cancelled = true,
-                .model_output = "broader partial output",
-                .command_result_json = "{\"cancelled\":true,\"attempt\":\"broader\"}",
-            } },
-        };
-        var job = fixture.job();
-        job.permission_mode = .auto;
-
-        if (fail_terminal_publication) {
-            try std.testing.expectError(
-                error.TestStatusPublicationFailure,
-                runFakePrompt(&gateway, &hooks, fixture.config(), job),
-            );
-        } else {
-            try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-            try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
-            try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
-            const interrupted = hooks.history_turns.items[0].interrupted;
-            try std.testing.expect(interrupted.tool_call == null);
-            try std.testing.expect(interrupted.cancelled_command == null);
-            try std.testing.expectEqual(@as(usize, 1), interrupted.execution.tool_steps.len);
-            const result = interrupted.execution.tool_steps[0].tool_results[0];
-            try std.testing.expect(std.mem.find(u8, result.output, "\"broader_retry_ran\":true") != null);
-            try std.testing.expect(std.mem.find(u8, result.output, "restricted marker created") != null);
-            try std.testing.expect(std.mem.find(u8, result.output, "broader partial output") != null);
-            try std.testing.expect(std.mem.find(u8, result.output, "restricted_command_result") != null);
-            try std.testing.expect(std.mem.find(u8, result.output, "broader_command_result") != null);
-            try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
-        }
-        var artifacts = try capability.iterate(alloc, .command_artifacts);
-        defer artifacts.deinit();
-        try std.testing.expectEqual(@as(usize, 0), artifacts.names.len);
-    }
-}
-
-test "reactive sandbox raw cancellation preserves retry phase truth" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct {
-        err: anyerror,
-        expected_ran: []const u8,
-        expected_message: []const u8,
-        expect_broader_result: bool,
-    }{
-        .{
-            .err = error.CancelledBeforeExecution,
-            .expected_ran = "\"broader_retry_ran\":false",
-            .expected_message = "broader retry did not run",
-            .expect_broader_result = false,
-        },
-        .{
-            .err = error.Cancelled,
-            .expected_ran = "\"broader_retry_ran\":true",
-            .expected_message = "broader retry started before cancellation",
-            .expect_broader_result = true,
-        },
-    };
-    for (cases) |case| {
-        const calls = [_]ToolCall{toolCall("command", "terminal", "{\"action\":\"exec\",\"command\":\"touch local && touch /outside\"}")};
-        const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
-        var gateway = FakeGateway.init(alloc, &completions);
-        defer gateway.deinit();
-        var hooks = FakeAgentRuntimeDeps.init(alloc);
-        defer hooks.deinit();
-        var fixture = PromptFixture{};
-        hooks.permission_decisions = &.{.once};
-        hooks.sandbox_widening_decisions = &.{.once};
-        hooks.cancel_on_execute = &fixture.cancel_flag;
-        hooks.cancel_on_execute_name = "terminal";
-        hooks.cancel_on_execute_index = 1;
-        const exec_plans = [_]test_support.FakeExecPlan{
-            .{ .result = .{
-                .status = .failure,
-                .model_output = "restricted marker created; outside write blocked",
-                .command_result_json = "{\"exit_code\":1,\"attempt\":\"restricted\"}",
-                .sandbox_scope_required = .{
-                    .phase = .reactive,
-                    .restricted_fingerprint = restrictedCommandFingerprint(
-                        "touch local && touch /outside",
-                        "/tmp/workspace",
-                    ),
-                    .restricted_model_output = "restricted marker created; outside write blocked",
-                    .restricted_command_result_json = "{\"exit_code\":1,\"attempt\":\"restricted\"}",
-                },
-            } },
-            .{ .err = case.err },
-        };
-        hooks.exec_plans = &exec_plans;
-        var job = fixture.job();
-        job.permission_mode = .auto;
-
-        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-        try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
-        try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
-        const interrupted = hooks.history_turns.items[0].interrupted;
-        try std.testing.expect(interrupted.tool_call == null);
-        try std.testing.expectEqual(@as(usize, 1), interrupted.execution.tool_steps.len);
-        const result = interrupted.execution.tool_steps[0].tool_results[0];
-        try std.testing.expect(std.mem.find(u8, result.output, case.expected_ran) != null);
-        try std.testing.expect(std.mem.find(u8, result.output, case.expected_message) != null);
-        try std.testing.expect(std.mem.find(u8, result.output, "restricted marker created") != null);
-        try std.testing.expectEqual(
-            case.expect_broader_result,
-            std.mem.find(u8, result.output, "broader_result") != null,
-        );
-        try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
-    }
 }
 
 test "malformed TUI web_search is presented without permission grant or backend work" {
@@ -2709,7 +2290,7 @@ test "modern serial preparation classifies once and disabled context keeps legac
     }
 }
 
-test "modern directory file_info executes while nested project instructions load" {
+test "modern directory glob executes while nested project instructions load" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2735,8 +2316,8 @@ test "modern directory file_info executes while nested project instructions load
 
     const first_calls = [_]ToolCall{toolCall(
         "inspect_directory_a",
-        "file_info",
-        "{\"path\":\"nested\"}",
+        "glob_files",
+        "{\"pattern\":\"*\",\"path\":\"nested\"}",
     )};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &first_calls },
@@ -2858,9 +2439,9 @@ test "same-batch retarget defers stale scoped call before permission and reloads
     defer alloc.free(link_path);
 
     const first_calls = [_]ToolCall{
-        toolCall("retarget", "create_folder", "{\"path\":\"noop\"}"),
+        toolCall("retarget", "terminal", "{\"action\":\"exec\",\"command\":\"true\"}"),
         toolCall("stale_read", "read_file", "{\"path\":\"link/secret.txt\"}"),
-        toolCall("stable_info", "file_info", "{\"path\":\"stable.txt\"}"),
+        toolCall("stable_info", "read_file", "{\"path\":\"stable.txt\"}"),
     };
     const scoped_reissue_calls = [_]ToolCall{
         toolCall("scoped_reissue", "read_file", "{\"path\":\"link/secret.txt\"}"),
@@ -2876,7 +2457,7 @@ test "same-batch retarget defers stale scoped call before permission and reloads
     defer hooks.deinit();
     hooks.context_enabled = true;
     hooks.context_registry = FreshnessApplicableContext.registry;
-    hooks.swap_link_on_execute_name = "create_folder";
+    hooks.swap_link_on_execute_name = "terminal";
     hooks.swap_link_on_execute = link_path;
     hooks.swap_link_target_on_execute = new_directory;
     hooks.exec_plans = &.{
@@ -2968,7 +2549,7 @@ test "same-batch file mutation retarget stops before permission and execution" {
     defer alloc.free(new_output);
 
     const calls = [_]ToolCall{
-        toolCall("retarget", "create_folder", "{\"path\":\"noop\"}"),
+        toolCall("retarget", "terminal", "{\"action\":\"exec\",\"command\":\"true\"}"),
         toolCall("stale_write", "write_file", "{\"path\":\"link/proof.txt\",\"content\":\"blocked\"}"),
     };
     const completions = [_]FakeCompletion{
@@ -2981,7 +2562,7 @@ test "same-batch file mutation retarget stops before permission and execution" {
     defer hooks.deinit();
     hooks.context_enabled = true;
     hooks.context_registry = EmptyApplicableContext.registry;
-    hooks.swap_link_on_execute_name = "create_folder";
+    hooks.swap_link_on_execute_name = "terminal";
     hooks.swap_link_on_execute = link_path;
     hooks.swap_link_target_on_execute = new_directory;
     hooks.exec_plans = &.{.{ .result = .{ .model_output = "retargeted" } }};
@@ -3036,7 +2617,7 @@ test "same-batch missing target defers newly resolvable scope until reissue" {
     defer alloc.free(link_path);
 
     const first_calls = [_]ToolCall{
-        toolCall("resolve_scope", "create_folder", "{\"path\":\"noop\"}"),
+        toolCall("resolve_scope", "terminal", "{\"action\":\"exec\",\"command\":\"true\"}"),
         toolCall("initial_missing", "read_file", "{\"path\":\"link/secret.txt\"}"),
     };
     const scoped_reissue_calls = [_]ToolCall{
@@ -3053,7 +2634,7 @@ test "same-batch missing target defers newly resolvable scope until reissue" {
     defer hooks.deinit();
     hooks.context_enabled = true;
     hooks.context_registry = FreshnessApplicableContext.registry;
-    hooks.swap_link_on_execute_name = "create_folder";
+    hooks.swap_link_on_execute_name = "terminal";
     hooks.swap_link_on_execute = link_path;
     hooks.swap_link_target_on_execute = new_directory;
     hooks.exec_plans = &.{
@@ -3175,126 +2756,6 @@ test "modern mixed batch materializes unsupported terminal before admission" {
     try std.testing.expectEqual(types.PersistedToolStatus.success, results[0].status);
     try std.testing.expectEqualStrings("Unsupported tool: missing_tool", results[1].output);
     try std.testing.expectEqual(types.PersistedToolStatus.failure, results[1].status);
-}
-
-test "modern mixed batch preserves explicit legacy target-resolution candidate" {
-    const alloc = std.testing.allocator;
-    defer EmptyApplicableContext.reset();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "workspace/nested");
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-
-    const calls = [_]ToolCall{
-        toolCall("candidate_create", "create_folder", "{\"path\":\"nested/new\"}"),
-        toolCall("legacy_missing", "list_files", "{\"path\":\"missing\"}"),
-    };
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "Final" },
-    };
-    const legacy_output = "Unable to resolve list root: missing (FileNotFound)";
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.context_enabled = true;
-    hooks.context_registry = EmptyApplicableContext.registry;
-    hooks.exec_plans = &.{
-        .{ .result = .{ .model_output = "candidate output" } },
-        .{ .result = .{ .status = .failure, .model_output = legacy_output } },
-    };
-    var fixture = PromptFixture{ .workspace_root = workspace };
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
-
-    try std.testing.expectEqual(@as(usize, 1), EmptyApplicableContext.select_calls);
-    try std.testing.expectEqual(@as(usize, 2), EmptyApplicableContext.last_target_count);
-    try std.testing.expectEqual(@as(usize, 3), hooks.validated_names.items.len);
-    try std.testing.expectEqualStrings("list_files", hooks.validated_names.items[2]);
-    try std.testing.expectEqual(@as(usize, 3), hooks.availability_checked_names.items.len);
-    try std.testing.expectEqualStrings("list_files", hooks.availability_checked_names.items[2]);
-    try std.testing.expectEqual(@as(usize, 2), hooks.permission_names.items.len);
-    try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 2), hooks.execution_classification_complete.items.len);
-    try std.testing.expect(hooks.execution_classification_complete.items[0]);
-    try std.testing.expect(!hooks.execution_classification_complete.items[1]);
-    try expectLifecycleCallIds(
-        hooks.lifecycle_events.items,
-        &.{
-            "candidate_create",
-            "candidate_create",
-            "candidate_create",
-            "legacy_missing",
-            "legacy_missing",
-            "legacy_missing",
-        },
-    );
-
-    const results = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results;
-    try std.testing.expectEqual(@as(usize, 2), results.len);
-    try std.testing.expectEqualStrings("candidate output", results[0].output);
-    try std.testing.expectEqual(types.PersistedToolStatus.success, results[0].status);
-    try std.testing.expectEqualStrings(legacy_output, results[1].output);
-    try std.testing.expectEqual(types.PersistedToolStatus.failure, results[1].status);
-}
-
-test "modern parallel legacy target resolution retains unclassified execution" {
-    const alloc = std.testing.allocator;
-    defer EmptyApplicableContext.reset();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "workspace/nested");
-    {
-        var file = try tmp.dir.createFile(std.testing.io, "workspace/nested/input.txt", .{});
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, "unchanged");
-    }
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-
-    const calls = [_]ToolCall{
-        toolCall("candidate_read", "read_file", "{\"path\":\"nested/input.txt\"}"),
-        toolCall("legacy_missing", "list_files", "{\"path\":\"missing\"}"),
-    };
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "Final" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.context_enabled = true;
-    hooks.context_registry = EmptyApplicableContext.registry;
-    var fixture = PromptFixture{ .workspace_root = workspace };
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
-
-    try std.testing.expectEqual(@as(usize, 1), EmptyApplicableContext.select_calls);
-    try std.testing.expectEqual(@as(usize, 1), EmptyApplicableContext.last_target_count);
-    try std.testing.expectEqual(@as(usize, 3), hooks.validated_names.items.len);
-    try std.testing.expectEqual(@as(usize, 3), hooks.availability_checked_names.items.len);
-    try std.testing.expectEqual(@as(usize, 2), hooks.permission_names.items.len);
-    try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
-    try std.testing.expectEqual(
-        hooks.executed_names.items.len,
-        hooks.execution_classification_complete.items.len,
-    );
-    var saw_candidate = false;
-    var saw_legacy = false;
-    for (hooks.executed_names.items, hooks.execution_classification_complete.items) |name, complete| {
-        if (std.mem.eql(u8, name, "read_file")) {
-            try std.testing.expect(complete);
-            saw_candidate = true;
-        } else if (std.mem.eql(u8, name, "list_files")) {
-            try std.testing.expect(!complete);
-            saw_legacy = true;
-        }
-    }
-    try std.testing.expect(saw_candidate);
-    try std.testing.expect(saw_legacy);
 }
 
 test "modern cancellation during later context selection stops before context or tool history commit" {
@@ -3457,8 +2918,8 @@ test "modern context delta does not defer unrelated effectful call" {
         ),
         toolCall(
             "root_create",
-            "create_folder",
-            "{\"path\":\"root-output\"}",
+            "terminal",
+            "{\"action\":\"exec\",\"command\":\"mkdir -p root-output\"}",
         ),
     };
     const completions = [_]FakeCompletion{
@@ -4493,7 +3954,7 @@ test "processQueuedPrompt denied registered run command compatibility never reac
     try expectPermissionDeniedToolResult(&gateway, 1, "terminal", .user_denied);
 }
 
-test "processQueuedPrompt auto permission denial labels lifecycle source" {
+test "processQueuedPrompt legacy auto denial retains lifecycle source" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
@@ -4523,57 +3984,11 @@ test "processQueuedPrompt auto permission denial labels lifecycle source" {
     try expectPermissionDeniedToolResult(&gateway, 1, "write_file", .auto_denied);
 }
 
-test "three automatic permission blocks route the next action through approval" {
+test "exact caution is reused while the agent continues to a normal completion" {
     const alloc = std.testing.allocator;
-    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
-    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
-    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch three\"}")};
-    const approved = [_]ToolCall{toolCall("approved-4", "run_command", "{\"command\":\"touch approved\"}")};
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &first },
-        .{ .tool_calls = &second },
-        .{ .tool_calls = &third },
-        .{ .tool_calls = &approved },
-        .{ .content = "Approved action completed." },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.permission_decisions = &.{ .deny, .deny, .deny, .once };
-    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied };
-    hooks.permission_human_approvals = &.{ .none, .none, .none, .once };
-    var fixture = PromptFixture{};
-    var config = fixture.config();
-    config.agent_step_limit = 5;
-    config.gateway_tools_json = fixture_tools_json;
-    var job = fixture.job();
-    job.permission_mode = .auto;
-
-    try runFakePrompt(&gateway, &hooks, config, job);
-
-    try std.testing.expectEqual(@as(usize, 5), gateway.request_bodies.items.len);
-    try expectBodyNotContains(&gateway, 3, "\"toolChoice\":{\"type\":\"none\"}");
-    try expectBodyNotContains(&gateway, 3, "\"tools\":[]");
-    try std.testing.expectEqualStrings(
-        "Approved action completed.",
-        hooks.history_assistant_text.?,
-    );
-    try std.testing.expectEqual(@as(usize, 4), hooks.permission_names.items.len);
-    try std.testing.expectEqualSlices(
-        permission_auto_classifier.AutoPermissionPhase,
-        &.{ .automatic_review, .automatic_review, .automatic_review, .human_approval },
-        hooks.permission_review_phases.items,
-    );
-    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
-    try std.testing.expectEqualStrings("run_command", hooks.executed_names.items[0]);
-}
-
-test "human approval phase permits a normal text completion" {
-    const alloc = std.testing.allocator;
-    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
-    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
-    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch three\"}")};
+    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch blocked\"}")};
+    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch blocked\"}")};
+    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch blocked\"}")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &first },
         .{ .tool_calls = &second },
@@ -4584,8 +3999,13 @@ test "human approval phase permits a normal text completion" {
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
-    hooks.permission_decisions = &.{ .deny, .deny, .deny };
-    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied };
+    hooks.permission_decisions = &.{.deny};
+    hooks.permission_denial_reasons = &.{.review_caution};
+    hooks.permission_auto_review_results = &.{.{
+        .risk = .high,
+        .decision = .caution,
+        .rationale = "The requested action needs a safer alternative.",
+    }};
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.agent_step_limit = 4;
@@ -4595,61 +4015,19 @@ test "human approval phase permits a normal text completion" {
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
-    try std.testing.expectEqual(@as(usize, 3), hooks.permission_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    for (gateway.request_bodies.items[1..]) |body| {
+        try std.testing.expect(std.mem.find(u8, body, "tool_review_held") != null);
+        try std.testing.expect(std.mem.find(u8, body, "approval_request_id") == null);
+    }
     try std.testing.expectEqualStrings(
         "No further action is needed.",
         hooks.history_assistant_text.?,
     );
 }
 
-test "human approval phase reaches every call in a parallel response group" {
-    const alloc = std.testing.allocator;
-    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
-    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
-    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch three\"}")};
-    const parallel = [_]ToolCall{
-        toolCall("approved-4a", "run_command", "{\"command\":\"touch approved-a\"}"),
-        toolCall("approved-4b", "run_command", "{\"command\":\"touch approved-b\"}"),
-    };
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &first },
-        .{ .tool_calls = &second },
-        .{ .tool_calls = &third },
-        .{ .tool_calls = &parallel },
-        .{ .content = "Parallel approved actions completed." },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.permission_decisions = &.{ .deny, .deny, .deny, .once, .once };
-    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied };
-    hooks.permission_human_approvals = &.{ .none, .none, .none, .once, .once };
-    var fixture = PromptFixture{};
-    var config = fixture.config();
-    config.agent_step_limit = 5;
-    var job = fixture.job();
-    job.permission_mode = .auto;
-
-    try runFakePrompt(&gateway, &hooks, config, job);
-
-    try std.testing.expectEqual(@as(usize, 5), hooks.permission_names.items.len);
-    try std.testing.expectEqualSlices(
-        permission_auto_classifier.AutoPermissionPhase,
-        &.{
-            .automatic_review,
-            .automatic_review,
-            .automatic_review,
-            .human_approval,
-            .human_approval,
-        },
-        hooks.permission_review_phases.items,
-    );
-    try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
-}
-
-test "three automatic permission blocks preserve an exhausted positive step cap" {
+test "three distinct review cautions preserve an exhausted positive step cap" {
     const alloc = std.testing.allocator;
     const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
     const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
@@ -4665,7 +4043,12 @@ test "three automatic permission blocks preserve an exhausted positive step cap"
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     hooks.permission_decisions = &.{ .deny, .deny, .deny };
-    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied };
+    hooks.permission_denial_reasons = &.{ .review_caution, .review_caution, .review_caution };
+    hooks.permission_auto_review_results = &.{
+        .{ .risk = .high, .decision = .caution, .rationale = "First action needs a safer alternative." },
+        .{ .risk = .high, .decision = .caution, .rationale = "Second action needs a safer alternative." },
+        .{ .risk = .high, .decision = .caution, .rationale = "Third action needs a safer alternative." },
+    };
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.agent_step_limit = 3;
@@ -4680,7 +4063,7 @@ test "three automatic permission blocks preserve an exhausted positive step cap"
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
 
-test "permission review receives bounded proven root request context" {
+test "permission review receives only the current proven root request" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
@@ -4742,9 +4125,9 @@ test "permission review receives bounded proven root request context" {
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_user_intent_contexts.items.len);
     const context = hooks.permission_user_intent_contexts.items[0];
     try std.testing.expect(std.mem.find(u8, context, "Go ahead.") != null);
-    try std.testing.expect(std.mem.find(u8, context, "Inspect the final state before continuing.") != null);
-    try std.testing.expect(std.mem.find(u8, context, "true first root request") != null);
-    try std.testing.expect(std.mem.find(u8, context, "Create a.txt in the workspace.") != null);
+    try std.testing.expect(std.mem.find(u8, context, "Inspect the final state before continuing.") == null);
+    try std.testing.expect(std.mem.find(u8, context, "true first root request") == null);
+    try std.testing.expect(std.mem.find(u8, context, "Create a.txt in the workspace.") == null);
     try std.testing.expect(std.mem.find(u8, context, "surviving recent assistant") == null);
     try std.testing.expect(std.mem.find(u8, context, "excluded older assistant") == null);
     try std.testing.expect(std.mem.find(u8, context, "Do not make any more file changes.") == null);
@@ -4954,10 +4337,10 @@ test "initial session grants follow active registry metadata" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var provider_list = builtin_tools.list_files;
-    provider_list.name = "provider_list";
-    provider_list.gateway_schema.name = "provider_list";
-    const tools = [_]tool_dispatch.Tool{provider_list};
+    var provider_glob = builtin_tools.glob_files;
+    provider_glob.name = "provider_glob";
+    provider_glob.model_schema.name = "provider_glob";
+    const tools = [_]tool_dispatch.Tool{provider_glob};
 
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.tool_registry = .{ .tools = tools[0..] };
@@ -4971,11 +4354,11 @@ test "initial session grants follow active registry metadata" {
         arena,
         &local_grants,
         "/tmp/workspace",
-        .{ .id = "provider-list", .name = "provider_list", .arguments_json = "{}" },
+        .{ .id = "provider-glob", .name = "provider_glob", .arguments_json = "{\"pattern\":\"*\"}" },
         "/tmp/workspace/src",
     );
 
-    try std.testing.expectEqual(@as(usize, 9), local_grants.items.len);
+    try std.testing.expectEqual(@as(usize, 4), local_grants.items.len);
     try expectGrantListsEqual(local_grants.items, hooks.propagated_grants.items);
 }
 
@@ -5344,31 +4727,6 @@ test "processQueuedPrompt includes structured failure detail in tool status" {
     try expectBodyContains(&gateway, 1, "browser_cdp_error");
 }
 
-test "processQueuedPrompt pushes display output but returns only masked model output to model" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "Final" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.exec_plans = &.{.{ .result = .{
-        .model_output = "TOKEN=abcdefghijklmnop",
-        .display_output = "DISPLAY ONLY",
-    } }};
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
-
-    try std.testing.expect(textContains(&hooks, "DISPLAY ONLY"));
-    try expectBodyContains(&gateway, 1, "TOKEN=[redacted]");
-    try expectBodyNotContains(&gateway, 1, "TOKEN=abcdefghijklmnop");
-    try expectBodyNotContains(&gateway, 1, "DISPLAY ONLY");
-}
-
 test "processQueuedPrompt caps chatty grep_files model output" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "grep_files", "{\"pattern\":\"x\"}")};
@@ -5434,7 +4792,6 @@ test "processQueuedPrompt forwards diff payload instead of display text" {
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.exec_plans = &.{.{ .result = .{
         .model_output = "patched",
-        .display_output = "SHOULD NOT PUSH",
         .diff_entry = .{
             .preview = @constCast("diff preview"),
         },
@@ -5446,7 +4803,6 @@ test "processQueuedPrompt forwards diff payload instead of display text" {
 
     try std.testing.expectEqual(@as(usize, 1), hooks.diff_count);
     try std.testing.expectEqualStrings("diff preview", hooks.diff_preview.?);
-    try std.testing.expect(!textContains(&hooks, "SHOULD NOT PUSH"));
 }
 
 test "processQueuedPrompt records permission preflight failures as denied tool calls" {
@@ -5474,7 +4830,7 @@ test "parallel permission preflight failure terminalizes its started lifecycle" 
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("call_search", "web_search", "{\"query\":\"current news\"}"),
-        toolCall("call_info", "file_info", "{\"path\":\"/outside\"}"),
+        toolCall("call_read", "read_file", "{\"path\":\"/outside\"}"),
     };
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls, .streamed_tool_starts = &calls },
@@ -5484,7 +4840,7 @@ test "parallel permission preflight failure terminalizes its started lifecycle" 
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.permission_decisions = &.{.deny};
-    hooks.permission_failure_names = &.{"file_info"};
+    hooks.permission_failure_names = &.{"read_file"};
     defer hooks.deinit();
     var fixture = PromptFixture{};
     var job = fixture.job();
@@ -5497,14 +4853,14 @@ test "parallel permission preflight failure terminalizes its started lifecycle" 
     try expectLifecycleCallIds(hooks.lifecycle_events.items, &.{
         "call_search",
         "call_search",
-        "call_info",
-        "call_info",
+        "call_read",
+        "call_read",
         "call_search",
         "call_search",
         "call_search",
-        "call_info",
-        "call_info",
-        "call_info",
+        "call_read",
+        "call_read",
+        "call_read",
     });
     const terminal = hooks.lifecycle_events.items[9].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
@@ -6572,7 +5928,6 @@ test "child live authority refresh denies the next tool action before execution"
                     .generation = if (self.calls <= 2) 1 else 2,
                     .root_id = "root",
                     .tools = if (self.calls <= 2) &allowed_tools else &.{},
-                    .sandbox_backend = if (self.calls <= 2) .macos else .none,
                     .integrations = &integrations,
                     .rules = .{ .rules = if (self.calls <= 2) &allow_rules else &deny_rules },
                     .grants = &grants,
@@ -6662,7 +6017,6 @@ test "child live authority revalidates after permission before effect" {
                     .generation = if (self.calls == 1) 1 else 2,
                     .root_id = "root",
                     .tools = if (self.calls == 1) &tools else &.{},
-                    .sandbox_backend = if (self.calls == 1) .macos else .none,
                     .integrations = &.{},
                     .rules = .{ .rules = if (self.calls == 1) &allow_rules else &deny_rules },
                     .grants = &.{},
@@ -6735,7 +6089,6 @@ test "child live authority allow to ask requires current approval before effect"
                     .generation = if (ask) 2 else 1,
                     .root_id = "root",
                     .tools = &tools,
-                    .sandbox_backend = .macos,
                     .integrations = &.{},
                     .rules = .{ .rules = if (ask) &ask_rules else &allow_rules },
                     .grants = &.{},
