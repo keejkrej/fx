@@ -93,12 +93,7 @@ jobs:
           cp "zig-out/bin/${{ matrix.binary }}" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
           archive="fx-${{ matrix.name }}.${{ matrix.archive }}"
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            python3 -c 'import pathlib, sys, zipfile
-root = pathlib.Path(sys.argv[1])
-with zipfile.ZipFile(sys.argv[2], "w", zipfile.ZIP_DEFLATED) as zf:
-    for path in sorted(root.iterdir()):
-        zf.write(path, path.name)
-' "$package_dir" "$archive"
+            python3 -c 'import pathlib, sys, zipfile; root = pathlib.Path(sys.argv[1]); zf = zipfile.ZipFile(sys.argv[2], "w", zipfile.ZIP_DEFLATED); [zf.write(path, path.name) for path in sorted(root.iterdir())]; zf.close()' "$package_dir" "$archive"
           else
             tar -czf "$archive" -C "$package_dir" ${{ matrix.binary }} LICENSE THIRD_PARTY_NOTICES.md
           fi
