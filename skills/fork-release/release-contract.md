@@ -8,7 +8,7 @@ Load this when Ship needs to verify or repair how binaries get published and fet
 
 - `release_repo = "keejkrej/fx"`
 - latest pointer: `https://github.com/keejkrej/fx/releases/latest/download/latest.txt`
-- archives: `https://github.com/keejkrej/fx/releases/download/<artifact_ref>/fx-<platform>.tar.gz`
+- archives: `https://github.com/keejkrej/fx/releases/download/<artifact_ref>/fx-<platform>.tar.gz` on Unix, or `fx-<platform>.zip` on Windows
 - checksums: the same URL with `.sha256`
 
 `<artifact_ref>` is the exact `latest.txt` body, not the normalized version. `latest.txt` must be `vX.Y.Z` so it matches the git tag `release.yml` creates.
@@ -17,7 +17,7 @@ Stable installs only when `compareVersions(latest, current) == .gt`. Shipping th
 
 ## GitHub Release assets
 
-`release.yml` attaches `latest.txt` (body `v<version>`) plus the four `fx-*.tar.gz` archives and `.sha256` files on the GitHub Release, then tries Vercel Blob. The fork has no official CDN. Blob publish is skipped when `BLOB_READ_WRITE_TOKEN` is empty so the GitHub Release still succeeds.
+`release.yml` attaches `latest.txt` (body `v<version>`), `install`, `install.ps1`, the four `fx-*.tar.gz` archives, the Windows `fx-*.zip` archives, and `.sha256` files on the GitHub Release, then tries Vercel Blob. The fork has no official CDN. Blob publish is skipped when `BLOB_READ_WRITE_TOKEN` is empty so the GitHub Release still succeeds. Users install with `curl .../install | bash` or `irm .../install.ps1 | iex`.
 
 macOS arm64 uses the same ReleaseSafe cross-compile as the other platforms. The upstream PGSO qualifier is not required for this fork's upgrade assets.
 

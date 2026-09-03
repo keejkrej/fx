@@ -295,20 +295,22 @@ pub fn Runtime(comptime App: type) type {
 
         fn clipboardImagePath(raw: *anyopaque, alloc: Allocator) anyerror!?[]u8 {
             const image_attachments = @import("../images/image_attachments.zig");
-            return image_attachments.takeClipboardImagePath(alloc) catch |err| switch (err) {
-                error.ClipboardToolMissing => {
+            return image_attachments.takeClipboardImagePath(alloc) catch |err| {
+                if (std.mem.eql(u8, @errorName(err), "ClipboardToolMissing")) {
                     notify(raw, image_attachments.clipboardToolMissingNotice(), .@"error");
                     return null;
-                },
-                error.ImageTooLarge => {
-                    notify(raw, image_attachments.image_too_large_notice, .@"error");
-                    return null;
-                },
-                error.UnsupportedImageType => {
-                    notify(raw, "clipboard did not contain a PNG, JPEG, GIF, or WebP image", .@"error");
-                    return null;
-                },
-                else => return err,
+                }
+                return switch (err) {
+                    error.ImageTooLarge => {
+                        notify(raw, image_attachments.image_too_large_notice, .@"error");
+                        return null;
+                    },
+                    error.UnsupportedImageType => {
+                        notify(raw, "clipboard did not contain a PNG, JPEG, GIF, or WebP image", .@"error");
+                        return null;
+                    },
+                    else => return err,
+                };
             };
         }
 

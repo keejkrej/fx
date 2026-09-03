@@ -1248,24 +1248,24 @@ fn waitForForegroundSessionReady(
 
         const remaining_ms = foreground_session_setup_timeout_ms - setup_elapsed_ms;
         const poll_timeout_ms: i32 = @intCast(@min(@as(i64, 50), remaining_ms));
-        var poll_fds = [_]std.posix.pollfd{.{
+        var poll_fds = [_]io_mod.PollFd{.{
             .fd = ready_read.handle,
-            .events = std.posix.POLL.IN,
+            .events = io_mod.POLL.IN,
             .revents = 0,
         }};
-        if (try std.posix.poll(&poll_fds, poll_timeout_ms) == 0) continue;
+        if (try io_mod.poll(&poll_fds, poll_timeout_ms) == 0) continue;
 
         const revents = poll_fds[0].revents;
-        if ((revents & std.posix.POLL.IN) != 0) {
+        if ((revents & io_mod.POLL.IN) != 0) {
             var marker: [1]u8 = undefined;
-            const marker_len = try std.posix.read(ready_read.handle, &marker);
+            const marker_len = try io_mod.readFd(ready_read.handle, &marker);
             if (marker_len == 0) return error.ForegroundSessionSetupFailed;
             if (marker[0] != foreground_session_ready_byte) {
                 return error.InvalidForegroundSessionReady;
             }
             return;
         }
-        if ((revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) {
+        if ((revents & (io_mod.POLL.HUP | io_mod.POLL.ERR | io_mod.POLL.NVAL)) != 0) {
             return error.ForegroundSessionSetupFailed;
         }
     }
@@ -1526,6 +1526,7 @@ fn fallbackCommandArtifactDir(alloc: Allocator) ![]u8 {
 }
 
 fn currentProcessId() u64 {
+    if (comptime builtin.os.tag == .windows) return @intFromPtr(std.c.getpid());
     return @intCast(std.c.getpid());
 }
 
@@ -1701,7 +1702,7 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
         try wrapper.writeStreamingAll(io_mod.getIo(), source);
         try wrapper.setPermissions(
             io_mod.getIo(),
-            std.Io.File.Permissions.fromMode(0o700),
+            io_mod.permissionsFromUnixMode(0o700),
         );
     }
 
@@ -2587,17 +2588,28 @@ fn signalProcess(pid: std.posix.pid_t, signal: std.posix.SIG) !void {
 }
 
 fn signalProcessGroup(pid: std.posix.pid_t, signal: std.posix.SIG) !void {
-    return signalProcess(-pid, signal);
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        _ = @TypeOf(pid);
+        _ = @TypeOf(signal);
+        return error.ProcessNotFound;
+    } else {
+        return signalProcess(-pid, signal);
+    }
 }
 
 fn terminateRemainingProcessGroup(pid: std.posix.pid_t) void {
-    signalProcessGroup(pid, std.posix.SIG.KILL) catch |err| {
-        debug_trace.logf(
-            "core",
-            "remaining captured process group cleanup failed err={s}",
-            .{@errorName(err)},
-        );
-    };
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        _ = @TypeOf(pid);
+        return;
+    } else {
+        signalProcessGroup(pid, std.posix.SIG.KILL) catch |err| {
+            debug_trace.logf(
+                "core",
+                "remaining captured process group cleanup failed err={s}",
+                .{@errorName(err)},
+            );
+        };
+    }
 }
 
 fn remainingProcessGroupAlive(process_group_id: ?std.posix.pid_t) bool {
@@ -2748,7 +2760,7 @@ const foreground_session_test_nonce = "00000000000000000000000000000000";
 fn expectForegroundSessionReadyForTest(child: *std.process.Child) !void {
     const ready_read = child.stderr orelse return error.TestUnexpectedResult;
     var ready: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.read(ready_read.handle, &ready));
+    try std.testing.expectEqual(@as(usize, 1), try io_mod.readFd(ready_read.handle, &ready));
     try std.testing.expectEqual(foreground_session_ready_byte, ready[0]);
 }
 
@@ -3186,7 +3198,7 @@ test "managed command artifact confirms an indeterminate rename target" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(
         alloc,
@@ -3266,7 +3278,7 @@ test "managed command artifact rejects an unconfirmed rename target" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(
         alloc,
@@ -3570,7 +3582,7 @@ test "cancellation preserves the termination grace in an invoked script" {
         );
         try script.setPermissions(
             io_mod.getIo(),
-            std.Io.File.Permissions.fromMode(0o700),
+            io_mod.permissionsFromUnixMode(0o700),
         );
     }
 
@@ -3646,7 +3658,7 @@ test "cancelled managed command confirms an indeterminate artifact target" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(
         alloc,

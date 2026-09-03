@@ -6,6 +6,16 @@ const url_policy = @import("url_policy.zig");
 const Allocator = std.mem.Allocator;
 const IpAddress = std.Io.net.IpAddress;
 const posix = std.posix;
+const builtin = @import("builtin");
+
+const pollfd = if (builtin.os.tag == .windows)
+    extern struct {
+        fd: posix.fd_t,
+        events: i16,
+        revents: i16,
+    }
+else
+    posix.pollfd;
 
 pub const max_body_bytes: usize = 10 * 1024 * 1024;
 const max_redirect_hops: usize = 10;
@@ -450,6 +460,9 @@ fn isRetryableConnectError(err: anyerror) bool {
 }
 
 fn connectDefault(_: *anyopaque, alloc: Allocator, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
+    if (comptime builtin.os.tag == .windows) {
+        return connectDefaultWindows(alloc, target, options);
+    }
     const effective = normalizedOptions(options);
     const dialer: Dialer = .{
         .ctx = @ptrCast(&default_connector_ctx),
@@ -464,6 +477,91 @@ fn connectDefault(_: *anyopaque, alloc: Allocator, target: PinnedTarget, options
     return switch (target.url.scheme) {
         .http => try fetchPlain(alloc, fd, target, effective),
         .https => try fetchTls(alloc, fd, target, effective),
+    };
+}
+
+fn connectDefaultWindows(alloc: Allocator, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
+    try checkControl(options);
+    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    defer client.deinit();
+
+    const uri = std.Uri.parse(target.url.retrieval_url) catch {
+        traceFailure(.connect, error.ConnectionFailed);
+        return error.ConnectionFailed;
+    };
+    var req = client.request(.GET, uri, .{
+        .headers = .{
+            .user_agent = .{ .override = "fx (web_fetch; +https://github.com/keejkrej/fx)" },
+            .accept_encoding = .omit,
+        },
+        .keep_alive = false,
+        .redirect_behavior = .unhandled,
+    }) catch |err| {
+        traceFailure(.connect, err);
+        return err;
+    };
+    defer req.deinit();
+
+    req.sendBodiless() catch |err| {
+        traceFailure(.request_write, err);
+        return err;
+    };
+
+    var redirect_buf: [8192]u8 = undefined;
+    var response = req.receiveHead(&redirect_buf) catch |err| {
+        traceFailure(.response_head, err);
+        return err;
+    };
+
+    var location: ?[]u8 = null;
+    errdefer if (location) |value| alloc.free(value);
+    var content_encoding: ?[]u8 = null;
+    errdefer if (content_encoding) |value| alloc.free(value);
+    var content_type: ?[]u8 = null;
+    errdefer if (content_type) |value| alloc.free(value);
+    var content_encoding_count: usize = 0;
+
+    var it = response.head.iterateHeaders();
+    while (it.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "location")) {
+            if (location == null) location = try alloc.dupe(u8, header.value);
+        } else if (std.ascii.eqlIgnoreCase(header.name, "content-encoding")) {
+            content_encoding_count += 1;
+            if (content_encoding == null) content_encoding = try alloc.dupe(u8, header.value);
+        } else if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
+            if (content_type == null) content_type = try alloc.dupe(u8, header.value);
+        }
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var transfer_buf: [4096]u8 = undefined;
+    const body_reader = response.reader(&transfer_buf);
+    var chunk: [1024]u8 = undefined;
+    while (true) {
+        try checkControl(options);
+        const n = body_reader.readSliceShort(&chunk) catch |err| {
+            traceFailure(.response_body, err);
+            return err;
+        };
+        if (n == 0) break;
+        if (n > options.max_body_bytes -| out.writer.buffered().len) {
+            return error.BodyTooLarge;
+        }
+        out.writer.writeAll(chunk[0..n]) catch |err| {
+            traceFailure(.response_body, err);
+            return err;
+        };
+    }
+
+    const body = out.toOwnedSlice() catch return error.OutOfMemory;
+    return .{
+        .status = response.head.status,
+        .body = body,
+        .location = location,
+        .content_encoding = content_encoding,
+        .content_encoding_count = content_encoding_count,
+        .content_type = content_type,
     };
 }
 
@@ -1222,29 +1320,35 @@ fn readChunkedTrailers(reader: *BodyReader, alloc: Allocator) !void {
 }
 
 fn connectPinned(address: IpAddress, options: FetchOptions) !posix.fd_t {
-    try checkControl(options);
-    const family: posix.sa_family_t = switch (address) {
-        .ip4 => posix.AF.INET,
-        .ip6 => posix.AF.INET6,
-    };
-    const fd = try openSocket(family);
-    errdefer closeFd(fd);
+    if (comptime builtin.os.tag == .windows) {
+        _ = @TypeOf(address);
+        _ = @TypeOf(options);
+        return error.ConnectionFailed;
+    } else {
+        try checkControl(options);
+        const family: posix.sa_family_t = switch (address) {
+            .ip4 => posix.AF.INET,
+            .ip6 => posix.AF.INET6,
+        };
+        const fd = try openSocket(family);
+        errdefer closeFd(fd);
 
-    var storage: PosixAddress = undefined;
-    const len = addressToPosix(address, &storage);
-    while (true) switch (posix.errno(posix.system.connect(fd, &storage.any, len))) {
-        .SUCCESS => return fd,
-        .INTR => {
-            try checkControl(options);
-            continue;
-        },
-        .INPROGRESS, .AGAIN, .ALREADY => {
-            try pollFd(fd, posix.POLL.OUT, options);
-            try checkSocketError(fd);
-            return fd;
-        },
-        else => |err| return classifyConnectErrno(err),
-    };
+        var storage: PosixAddress = undefined;
+        const len = addressToPosix(address, &storage);
+        while (true) switch (posix.errno(posix.system.connect(fd, &storage.any, len))) {
+            .SUCCESS => return fd,
+            .INTR => {
+                try checkControl(options);
+                continue;
+            },
+            .INPROGRESS, .AGAIN, .ALREADY => {
+                try pollFd(fd, posix.POLL.OUT, options);
+                try checkSocketError(fd);
+                return fd;
+            },
+            else => |err| return classifyConnectErrno(err),
+        };
+    }
 }
 
 fn classifyConnectErrno(err: posix.E) anyerror {
@@ -1291,49 +1395,64 @@ fn addressToPosix(address: IpAddress, storage: *PosixAddress) posix.socklen_t {
 }
 
 fn openSocket(family: posix.sa_family_t) !posix.fd_t {
-    const fd = while (true) {
-        const rc = posix.system.socket(family, posix.SOCK.STREAM, 0);
-        switch (posix.errno(rc)) {
-            .SUCCESS => break @as(posix.fd_t, @intCast(rc)),
-            .INTR => continue,
-            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            .NOBUFS, .NOMEM => return error.SystemResources,
-            else => return error.SocketOpenFailed,
-        }
-    };
-    errdefer closeFd(fd);
-    try setCloexec(fd);
-    try setNonblocking(fd);
-    return fd;
+    if (comptime builtin.os.tag == .windows) {
+        _ = @TypeOf(family);
+        return error.SocketOpenFailed;
+    } else {
+        const fd = while (true) {
+            const rc = posix.system.socket(family, posix.SOCK.STREAM, 0);
+            switch (posix.errno(rc)) {
+                .SUCCESS => break @as(posix.fd_t, @intCast(rc)),
+                .INTR => continue,
+                .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+                .MFILE => return error.ProcessFdQuotaExceeded,
+                .NFILE => return error.SystemFdQuotaExceeded,
+                .NOBUFS, .NOMEM => return error.SystemResources,
+                else => return error.SocketOpenFailed,
+            }
+        };
+        errdefer closeFd(fd);
+        try setCloexec(fd);
+        try setNonblocking(fd);
+        return fd;
+    }
 }
 
 fn setCloexec(fd: posix.fd_t) !void {
-    while (true) switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => return error.SocketOptionFailed,
-    };
+    if (comptime builtin.os.tag == .windows) {
+        _ = @TypeOf(fd);
+        return;
+    } else {
+        while (true) switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => return error.SocketOptionFailed,
+        };
+    }
 }
 
 fn setNonblocking(fd: posix.fd_t) !void {
-    const current = while (true) {
-        const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
-        switch (posix.errno(rc)) {
-            .SUCCESS => break rc,
+    if (comptime builtin.os.tag == .windows) {
+        _ = @TypeOf(fd);
+        return;
+    } else {
+        const current = while (true) {
+            const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+            switch (posix.errno(rc)) {
+                .SUCCESS => break rc,
+                .INTR => continue,
+                else => return error.SocketOptionFailed,
+            }
+        };
+        const current_flags: usize = @intCast(current);
+        const nonblock_flag: usize = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
+        const next: usize = current_flags | nonblock_flag;
+        while (true) switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, next))) {
+            .SUCCESS => return,
             .INTR => continue,
             else => return error.SocketOptionFailed,
-        }
-    };
-    const current_flags: usize = @intCast(current);
-    const nonblock_flag: usize = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
-    const next: usize = current_flags | nonblock_flag;
-    while (true) switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, next))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => return error.SocketOptionFailed,
-    };
+        };
+    }
 }
 
 fn checkSocketError(fd: posix.fd_t) !void {
@@ -1346,11 +1465,16 @@ fn checkSocketError(fd: posix.fd_t) !void {
 }
 
 fn closeFd(fd: posix.fd_t) void {
-    while (true) switch (posix.errno(posix.system.close(fd))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => return,
-    };
+    if (comptime builtin.os.tag == .windows) {
+        _ = @TypeOf(fd);
+        return;
+    } else {
+        while (true) switch (posix.errno(posix.system.close(fd))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => return,
+        };
+    }
 }
 
 fn traceFailure(stage: FailureStage, err: anyerror) void {
@@ -1493,21 +1617,27 @@ const PollError = posix.PollError || error{Interrupted};
 
 const Poller = struct {
     ctx: ?*anyopaque,
-    poll_fn: *const fn (?*anyopaque, []posix.pollfd, i32) PollError!usize,
+    poll_fn: *const fn (?*anyopaque, []pollfd, i32) PollError!usize,
 };
 
-fn pollDefault(_: ?*anyopaque, fds: []posix.pollfd, timeout_ms: i32) PollError!usize {
-    const fds_count = std.math.cast(posix.nfds_t, fds.len) orelse
-        return error.SystemResources;
-    const rc = posix.system.poll(fds.ptr, fds_count, timeout_ms);
-    return switch (posix.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        .INTR => error.Interrupted,
-        .NOMEM => error.SystemResources,
-        .NETDOWN => error.NetworkDown,
-        .FAULT, .INVAL => unreachable,
-        else => |err| posix.unexpectedErrno(err),
-    };
+fn pollDefault(_: ?*anyopaque, fds: []pollfd, timeout_ms: i32) PollError!usize {
+    if (comptime builtin.os.tag == .windows) {
+        _ = @TypeOf(fds);
+        _ = @TypeOf(timeout_ms);
+        return error.NetworkDown;
+    } else {
+        const fds_count = std.math.cast(posix.nfds_t, fds.len) orelse
+            return error.SystemResources;
+        const rc = posix.system.poll(fds.ptr, fds_count, timeout_ms);
+        return switch (posix.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            .INTR => error.Interrupted,
+            .NOMEM => error.SystemResources,
+            .NETDOWN => error.NetworkDown,
+            .FAULT, .INVAL => unreachable,
+            else => |err| posix.unexpectedErrno(err),
+        };
+    }
 }
 
 const default_poller: Poller = .{
@@ -1635,7 +1765,7 @@ fn pollFd(fd: posix.fd_t, events: i16, options: FetchOptions) !void {
 
 fn pollFdWith(fd: posix.fd_t, events: i16, options: FetchOptions, poller: Poller) !void {
     while (true) {
-        var fds = [_]posix.pollfd{.{
+        var fds = [_]pollfd{.{
             .fd = fd,
             .events = events,
             .revents = 0,
@@ -1657,12 +1787,19 @@ fn pollFdWith(fd: posix.fd_t, events: i16, options: FetchOptions, poller: Poller
 }
 
 fn classifyPollEvents(fd: posix.fd_t, events: i16, revents: i16) !void {
-    if ((revents & posix.POLL.NVAL) != 0) return error.InvalidDescriptor;
-    if ((revents & events) != 0) return;
-    if (events == posix.POLL.IN and (revents & posix.POLL.HUP) != 0) return;
-    if ((revents & posix.POLL.ERR) != 0) return pollSocketError(fd);
-    if ((revents & posix.POLL.HUP) != 0) return error.UnexpectedClose;
-    return error.UnexpectedClose;
+    if (comptime builtin.os.tag == .windows) {
+        _ = @TypeOf(fd);
+        _ = @TypeOf(events);
+        _ = @TypeOf(revents);
+        return error.NetworkDown;
+    } else {
+        if ((revents & posix.POLL.NVAL) != 0) return error.InvalidDescriptor;
+        if ((revents & events) != 0) return;
+        if (events == posix.POLL.IN and (revents & posix.POLL.HUP) != 0) return;
+        if ((revents & posix.POLL.ERR) != 0) return pollSocketError(fd);
+        if ((revents & posix.POLL.HUP) != 0) return error.UnexpectedClose;
+        return error.UnexpectedClose;
+    }
 }
 
 fn pollSocketError(fd: posix.fd_t) !void {
@@ -3601,7 +3738,7 @@ const ScriptedPoller = struct {
         return .{ .ctx = @ptrCast(self), .poll_fn = poll };
     }
 
-    fn poll(raw: ?*anyopaque, fds: []posix.pollfd, timeout_ms: i32) PollError!usize {
+    fn poll(raw: ?*anyopaque, fds: []pollfd, timeout_ms: i32) PollError!usize {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         self.calls += 1;
         self.observed_events = fds[0].events;

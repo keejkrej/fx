@@ -202,10 +202,10 @@ fn upgradeWorkerInner(
         return;
     };
 
-    const archive_path = try std.fmt.allocPrint(alloc, "{s}/fx.tar.gz", .{tmp_dir});
+    const archive_path = try std.fmt.allocPrint(alloc, "{s}/fx.{s}", .{ tmp_dir, helpers.archive_ext });
     defer alloc.free(archive_path);
 
-    const archive_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz", .{ helpers.github_download_base, target.artifactRef(), helpers.platform });
+    const archive_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.{s}", .{ helpers.github_download_base, target.artifactRef(), helpers.platform, helpers.archive_ext });
     defer alloc.free(archive_url);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
@@ -221,7 +221,7 @@ fn upgradeWorkerInner(
     };
     progress.markFinishing();
 
-    const checksum_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz.sha256", .{ helpers.github_download_base, target.artifactRef(), helpers.platform });
+    const checksum_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.{s}.sha256", .{ helpers.github_download_base, target.artifactRef(), helpers.platform, helpers.archive_ext });
     defer alloc.free(checksum_url);
 
     helpers.verifyChecksum(&client, archive_path, checksum_url) catch |err| {
@@ -232,12 +232,12 @@ fn upgradeWorkerInner(
         return;
     };
 
-    helpers.extractTarGz(alloc, archive_path, tmp_dir) catch {
+    helpers.extractArchive(alloc, archive_path, tmp_dir) catch {
         result.err = .extraction_failed;
         return;
     };
 
-    const extracted_bin = try std.fmt.allocPrint(alloc, "{s}/fx", .{tmp_dir});
+    const extracted_bin = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ tmp_dir, helpers.extracted_binary_name });
     defer alloc.free(extracted_bin);
 
     var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;

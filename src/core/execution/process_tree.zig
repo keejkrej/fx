@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
-const max_darwin_process_fds: usize = std.c.OPEN_MAX;
+const max_darwin_process_fds: usize = if (builtin.os.tag == .macos) std.c.OPEN_MAX else 0;
 
 const DarwinPipeIdentity = struct {
     handle: u64,
@@ -397,6 +397,10 @@ pub const Tracker = struct {
         parent: TrackedProcess,
         tid: std.posix.pid_t,
     ) !void {
+        if (comptime builtin.os.tag != .linux) {
+            _ = @TypeOf(tid);
+            return error.ProcessTreeUnsupported;
+        }
         const path = try std.fmt.allocPrint(
             self.alloc,
             "/proc/{d}/task/{d}/children",

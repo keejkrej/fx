@@ -4,6 +4,7 @@
 //! ignored so the integration cannot block or terminate an fx session.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../../core/shared/io.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const host_target = @import("../../core/hosts/target.zig");
@@ -14,7 +15,7 @@ pub const State = enum { idle, working, blocked };
 // herdr protocol limits custom status to 32 bytes.
 const custom_status_max = 32;
 /// Maximum wait for herdr's one-line reply.
-const response_timeout = std.posix.timeval{ .sec = 0, .usec = 250_000 };
+const response_timeout = if (builtin.os.tag == .windows) {} else std.posix.timeval{ .sec = 0, .usec = 250_000 };
 
 // Third-party reporters use the `custom:` source prefix.
 const source = "custom:fx";
@@ -169,8 +170,13 @@ pub const Client = struct {
     }
 
     fn connectLocked(self: *Client) !std.Io.net.Stream {
-        const address = try std.Io.net.UnixAddress.init(self.socket_path);
-        return address.connect(io_mod.getIo());
+        if (comptime builtin.os.tag == .windows) {
+            _ = @TypeOf(self);
+            return error.SystemResources;
+        } else {
+            const address = try std.Io.net.UnixAddress.init(self.socket_path);
+            return address.connect(io_mod.getIo());
+        }
     }
 
     fn takeIdLocked(self: *Client) u64 {
@@ -181,12 +187,17 @@ pub const Client = struct {
 };
 
 fn applyResponseTimeout(stream: std.Io.net.Stream) void {
-    std.posix.setsockopt(
-        stream.socket.handle,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVTIMEO,
-        std.mem.asBytes(&response_timeout),
-    ) catch {};
+    if (comptime builtin.os.tag == .windows) {
+        _ = @TypeOf(stream);
+        return;
+    } else {
+        std.posix.setsockopt(
+            stream.socket.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&response_timeout),
+        ) catch {};
+    }
 }
 
 fn clampStatus(custom_status: ?[]const u8) ?[]const u8 {

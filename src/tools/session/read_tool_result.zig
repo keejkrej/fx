@@ -250,7 +250,7 @@ test "unknown read_tool_result handle returns failure for legacy and managed sto
     try tmp.dir.createDir(
         io_mod.getIo(),
         "legacy",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "legacy");
     defer alloc.free(dir);
@@ -271,7 +271,7 @@ test "unknown read_tool_result handle returns failure for legacy and managed sto
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -310,7 +310,7 @@ test "read_tool_result pages and searches saved command replay handles" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,

@@ -134,15 +134,15 @@ fn listenerReady(
     cancel_flag: *std.atomic.Value(bool),
 ) !bool {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-    var fds = [_]std.posix.pollfd{.{
+    var fds = [_]io_mod.PollFd{.{
         .fd = listener.socket.handle,
-        .events = std.posix.POLL.IN,
+        .events = io_mod.POLL.IN,
         .revents = 0,
     }};
-    const ready = try std.posix.poll(&fds, poll_ms);
+    const ready = try io_mod.poll(&fds, poll_ms);
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     if (ready == 0) return false;
-    if ((fds[0].revents & std.posix.POLL.IN) == 0) {
+    if ((fds[0].revents & io_mod.POLL.IN) == 0) {
         return error.OAuthCallbackListenerFailed;
     }
     return true;
@@ -160,12 +160,12 @@ fn requestReadable(
             0
         else
             @intCast(@min(remaining_ms, poll_ms));
-        var fds = [_]std.posix.pollfd{.{
+        var fds = [_]io_mod.PollFd{.{
             .fd = socket,
-            .events = std.posix.POLL.IN,
+            .events = io_mod.POLL.IN,
             .revents = 0,
         }};
-        const ready = try std.posix.poll(&fds, wait_ms);
+        const ready = try io_mod.poll(&fds, wait_ms);
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
         if (ready != 0) return true;
         if (remaining_ms <= 0) return false;
@@ -331,28 +331,33 @@ fn writePreflightResponse(stream: std.Io.net.Stream, origin: []const u8) !void {
 }
 
 fn setSocketTimeouts(socket: std.posix.socket_t) void {
-    const timeout = std.posix.timeval{ .sec = socket_timeout_seconds, .usec = 0 };
-    const receive_rc = std.c.setsockopt(
-        socket,
-        std.c.SOL.SOCKET,
-        std.c.SO.RCVTIMEO,
-        &timeout,
-        @sizeOf(std.posix.timeval),
-    );
-    if (receive_rc != 0) {
-        const err = std.posix.errno(receive_rc);
-        debug_trace.logf("auth", "OAuth callback receive timeout setup failed errno={s}", .{@tagName(err)});
-    }
-    const send_rc = std.c.setsockopt(
-        socket,
-        std.c.SOL.SOCKET,
-        std.c.SO.SNDTIMEO,
-        &timeout,
-        @sizeOf(std.posix.timeval),
-    );
-    if (send_rc != 0) {
-        const err = std.posix.errno(send_rc);
-        debug_trace.logf("auth", "OAuth callback send timeout setup failed errno={s}", .{@tagName(err)});
+    if (comptime @import("builtin").os.tag == .windows) {
+        _ = @TypeOf(socket);
+        return;
+    } else {
+        const timeout = std.posix.timeval{ .sec = socket_timeout_seconds, .usec = 0 };
+        const receive_rc = std.c.setsockopt(
+            socket,
+            std.c.SOL.SOCKET,
+            std.c.SO.RCVTIMEO,
+            &timeout,
+            @sizeOf(std.posix.timeval),
+        );
+        if (receive_rc != 0) {
+            const err = std.posix.errno(receive_rc);
+            debug_trace.logf("auth", "OAuth callback receive timeout setup failed errno={s}", .{@tagName(err)});
+        }
+        const send_rc = std.c.setsockopt(
+            socket,
+            std.c.SOL.SOCKET,
+            std.c.SO.SNDTIMEO,
+            &timeout,
+            @sizeOf(std.posix.timeval),
+        );
+        if (send_rc != 0) {
+            const err = std.posix.errno(send_rc);
+            debug_trace.logf("auth", "OAuth callback send timeout setup failed errno={s}", .{@tagName(err)});
+        }
     }
 }
 

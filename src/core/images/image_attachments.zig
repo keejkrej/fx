@@ -181,7 +181,7 @@ pub fn createTempSnapshotDir(alloc: std.mem.Allocator) ![]u8 {
         std.Io.Dir.createDirAbsolute(
             io_mod.getIo(),
             path,
-            std.Io.File.Permissions.fromMode(0o700),
+            io_mod.permissionsFromUnixMode(0o700),
         ) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 alloc.free(path);
@@ -533,7 +533,7 @@ fn captureImageSnapshotFromOpenFileWithBudget(
             .{
                 .truncate = false,
                 .exclusive = true,
-                .permissions = std.Io.File.Permissions.fromMode(0o600),
+                .permissions = io_mod.permissionsFromUnixMode(0o600),
                 .resolve_beneath = true,
             },
         );
@@ -624,7 +624,7 @@ fn streamSourceToFile(
         .{
             .truncate = false,
             .exclusive = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = io_mod.permissionsFromUnixMode(0o600),
             .resolve_beneath = true,
         },
     );
@@ -858,10 +858,7 @@ fn inspectImageCandidate(
 }
 
 fn syncSnapshotDirectory(snapshot_dir: std.Io.Dir) !void {
-    io_mod.syncVerifiedDir(snapshot_dir) catch |err| switch (err) {
-        error.OperationUnsupported => {},
-        else => return err,
-    };
+    io_mod.syncVerifiedDir(snapshot_dir) catch {};
 }
 
 fn deleteSnapshotFile(dir: std.Io.Dir, name: []const u8, reason: []const u8) void {
@@ -970,7 +967,7 @@ fn openOrCreateSnapshotDirectoryNoFollow(path: []const u8) !std.Io.Dir {
             parent.createDir(
                 io_mod.getIo(),
                 name,
-                std.Io.File.Permissions.fromMode(0o700),
+                io_mod.permissionsFromUnixMode(0o700),
             ) catch |create_err| switch (create_err) {
                 error.PathAlreadyExists => {},
                 else => return unsafeSnapshotPathError(create_err),
@@ -1114,7 +1111,7 @@ pub fn copyVerifiedImageAttachmentToDir(
         .{
             .truncate = false,
             .exclusive = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = io_mod.permissionsFromUnixMode(0o600),
             .resolve_beneath = true,
         },
     );
@@ -1734,7 +1731,7 @@ pub fn persistImageBytes(alloc: std.mem.Allocator, bytes: []const u8) !Clipboard
 
     var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), temp_path, .{
         .exclusive = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = io_mod.permissionsFromUnixMode(0o600),
     });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), bytes);
@@ -1785,6 +1782,7 @@ pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAtt
 /// `/tmp/fx-image-snapshots-*/clipboard.png` (or jpeg/gif/webp) and return
 /// that path. macOS returns null so first-class `attachClipboard` owns paste.
 pub fn takeClipboardImagePath(alloc: std.mem.Allocator) !?[]u8 {
+    if (false) return clipboardPasteSentinel(2);
     if (builtin.os.tag != .linux and builtin.os.tag != .windows) return null;
     var loaded = (if (builtin.os.tag == .linux)
         loadLinuxClipboardImageAttachment(alloc)
@@ -2002,7 +2000,7 @@ const windows_clipboard = if (builtin.os.tag == .windows) struct {
     }
 
     fn readBytes(alloc: std.mem.Allocator) ![]u8 {
-        if (OpenClipboard(null) == 0) return error.NoClipboardImage;
+        if (OpenClipboard(null) == .FALSE) return error.NoClipboardImage;
         defer _ = CloseClipboard();
 
         const png_name = std.unicode.utf8ToUtf16LeStringLiteral("PNG");
@@ -3100,7 +3098,7 @@ test "extractInlineImageAttachments preserves image-looking directories" {
     try tmp.dir.createDir(
         std.testing.io,
         "photos.png",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
@@ -3931,7 +3929,7 @@ test "verified snapshot loading rejects a symlinked directory" {
     try tmp.dir.createDir(
         std.testing.io,
         "owned",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     {
         var owned = try tmp.dir.openDir(std.testing.io, "owned", .{});

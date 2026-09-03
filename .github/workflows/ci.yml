@@ -305,6 +305,10 @@ jobs:
             target: x86_64-macos
           - name: macos-aarch64
             target: aarch64-macos
+          - name: windows-x86_64
+            target: x86_64-windows
+          - name: windows-aarch64
+            target: aarch64-windows
     steps:
       - uses: actions/checkout@v4
 
@@ -319,7 +323,11 @@ jobs:
 
       - name: Report binary size
         run: |
-          bytes=$(stat -c%s zig-out/bin/fx)
+          binary=fx
+          case "${{ matrix.target }}" in
+            *-windows) binary=fx.exe ;;
+          esac
+          bytes=$(stat -c%s "zig-out/bin/${binary}")
           mib=$(awk -v b="$bytes" 'BEGIN { printf "%.2f", b / 1048576 }')
           echo "${{ matrix.name }}: $bytes bytes ($mib MiB)"
           echo "${{ matrix.name }}: $bytes bytes ($mib MiB)" >> "$GITHUB_STEP_SUMMARY"
@@ -333,6 +341,7 @@ jobs:
       - name: Shellcheck Fx scripts
         run: |
           scripts=(
+            install
             benchmarks/startup.sh
             scripts/check-public-surface.sh
           )

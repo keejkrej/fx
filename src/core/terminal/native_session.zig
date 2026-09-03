@@ -41,7 +41,7 @@ const marker_ack_timeout_ms: i64 = tmux_session.marker_acknowledgement_timeout_m
 const command_release_byte: u8 = 2;
 const control_nonce_len: usize = 32;
 const marker_frame_len: usize = control_nonce_len + 1;
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_file_permissions = io_mod.private_file_permissions;
 const default_dimensions: contracts.Dimensions = .{
     .rows = 24,
     .columns = 80,
@@ -98,21 +98,21 @@ const LauncherWatchdog = struct {
     host_closed: std.atomic.Value(bool) = .init(false),
 
     fn run(self: *LauncherWatchdog) void {
-        var poll_fds = [_]std.posix.pollfd{.{
-            .fd = std.posix.STDIN_FILENO,
-            .events = std.posix.POLL.IN,
+        var poll_fds = [_]io_mod.PollFd{.{
+            .fd = io_mod.stdinFd(),
+            .events = io_mod.POLL.IN,
             .revents = 0,
         }};
         while (!self.done.load(.acquire)) {
             poll_fds[0].revents = 0;
-            _ = std.posix.poll(&poll_fds, control_poll_ms) catch {
+            _ = io_mod.poll(&poll_fds, control_poll_ms) catch {
                 self.host_closed.store(true, .release);
                 _ = std.c.kill(-self.child_pid, std.c.SIG.KILL);
                 return;
             };
             if (poll_fds[0].revents == 0) continue;
             var byte: [1]u8 = undefined;
-            const count = std.posix.read(std.posix.STDIN_FILENO, &byte) catch 0;
+            const count = io_mod.readFd(io_mod.stdinFd(), &byte) catch 0;
             if (count != 0) {
                 if (byte[0] == command_release_byte) {
                     self.command_released.store(true, .release);
@@ -153,14 +153,14 @@ const LauncherControl = struct {
     }
 
     fn runInner(self: *LauncherControl) !void {
-        var poll_fds = [_]std.posix.pollfd{.{
+        var poll_fds = [_]io_mod.PollFd{.{
             .fd = self.server.socket.handle,
-            .events = std.posix.POLL.IN,
+            .events = io_mod.POLL.IN,
             .revents = 0,
         }};
         while (!self.done.load(.acquire)) {
             poll_fds[0].revents = 0;
-            _ = try std.posix.poll(&poll_fds, control_poll_ms);
+            _ = try io_mod.poll(&poll_fds, control_poll_ms);
             if (poll_fds[0].revents == 0) continue;
 
             var stream = self.server.accept(io_mod.getIo()) catch |err| switch (err) {
@@ -5908,7 +5908,7 @@ fn closeFd(fd: std.posix.fd_t) void {
 fn readExactFd(fd: std.posix.fd_t, destination: []u8) !void {
     var offset: usize = 0;
     while (offset < destination.len) {
-        const count = try std.posix.read(fd, destination[offset..]);
+        const count = try io_mod.readFd(fd, destination[offset..]);
         if (count == 0) return error.EndOfStream;
         offset += count;
     }
@@ -6213,19 +6213,19 @@ fn readOutputChunk(
     var total: usize = 0;
     var poll_timeout = timeout_ms;
     while (total < buffer.len) {
-        var poll_fds = [_]std.posix.pollfd{.{
+        var poll_fds = [_]io_mod.PollFd{.{
             .fd = fd,
-            .events = std.posix.POLL.IN,
+            .events = io_mod.POLL.IN,
             .revents = 0,
         }};
-        _ = try std.posix.poll(&poll_fds, poll_timeout);
+        _ = try io_mod.poll(&poll_fds, poll_timeout);
         const revents = poll_fds[0].revents;
         if (revents == 0) break;
-        if (revents & std.posix.POLL.IN == 0) {
+        if (revents & io_mod.POLL.IN == 0) {
             if (total == 0) return error.EndOfStream;
             break;
         }
-        const count = std.posix.read(fd, buffer[total..]) catch |err| {
+        const count = io_mod.readFd(fd, buffer[total..]) catch |err| {
             if (err == error.WouldBlock) break;
             if (total != 0) break;
             return err;

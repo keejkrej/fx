@@ -10104,7 +10104,7 @@ test "exact relationship replay repairs a failed resume-index marker" {
     try sessions.dir.createDir(
         io_mod.getIo(),
         "index.pending",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     var blocker_present = true;
     defer if (blocker_present) {
@@ -10149,7 +10149,7 @@ test "exact relationship replay repairs a failed resume-index marker" {
     try sessions.dir.createDir(
         io_mod.getIo(),
         "index.pending",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     blocker_present = true;
     var detach = try domain.validateCommand(alloc, .{ .relationship = .{
@@ -10200,7 +10200,7 @@ test "exact relationship replay repairs a failed resume-index marker" {
     try sessions.dir.createDir(
         io_mod.getIo(),
         "index.pending",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     blocker_present = true;
     var reparent = try domain.validateCommand(alloc, .{ .relationship = .{
@@ -10290,7 +10290,7 @@ test "control queue admission remains available while another process owns sessi
     var ready: [1]u8 = undefined;
     try std.testing.expectEqual(
         @as(usize, 1),
-        try std.posix.read(locker.stdout.?.handle, &ready),
+        try io_mod.readFd(locker.stdout.?.handle, &ready),
     );
     try std.testing.expectEqual(@as(u8, 'R'), ready[0]);
     const child_session_path = try std.fs.path.join(

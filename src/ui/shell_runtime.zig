@@ -11,6 +11,11 @@ const resize_runtime = @import("resize_runtime.zig");
 const ui_terminal = @import("terminal/terminal.zig");
 const wasm_terminal = if (builtin.os.tag == .wasi) @import("terminal/wasm_terminal.zig") else struct {};
 
+pub const has_posix_tty = switch (builtin.os.tag) {
+    .windows, .wasi => false,
+    else => true,
+};
+
 const Allocator = std.mem.Allocator;
 const Layout = types.Layout;
 const Metrics = types.Metrics;
@@ -35,7 +40,7 @@ extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname(fd: c_int) ?[*:0]u8;
 
 pub const supports_resize_signal = resize_runtime.supports_resize_signal;
-pub const ResizeHandler = if (builtin.os.tag == .wasi)
+pub const ResizeHandler = if (!has_posix_tty)
     *const fn () callconv(.c) void
 else
     std.posix.Sigaction.handler_fn;
@@ -65,8 +70,8 @@ pub const AlternateScreenOwner = enum {
 };
 
 pub const TerminalState = struct {
-    stdin_fd: std.posix.fd_t = std.posix.STDIN_FILENO,
-    original_termios: std.posix.termios = undefined,
+    stdin_fd: if (has_posix_tty) std.posix.fd_t else void = if (has_posix_tty) std.posix.STDIN_FILENO else {},
+    original_termios: if (has_posix_tty) std.posix.termios else void = undefined,
     raw_enabled: bool = false,
     alternate_screen_owner: AlternateScreenOwner = .none,
     alternate_frame_layout: frame_layout.CommittedLayoutSnapshot = .{},
@@ -77,7 +82,7 @@ pub const TerminalState = struct {
     /// is actually on screen.
     inline_mouse_tracking_active: bool = false,
     signal_handler_installed: bool = false,
-    old_winch_action: ?std.posix.Sigaction = null,
+    old_winch_action: if (has_posix_tty) ?std.posix.Sigaction else void = if (has_posix_tty) null else {},
 
     pub fn fileApprovalScreenActive(self: TerminalState) bool {
         return self.alternate_screen_owner == .file_approval;
@@ -104,19 +109,19 @@ pub const TerminalState = struct {
     }
 
     pub fn ensureInteractive(self: TerminalState) !void {
-        if (comptime builtin.os.tag == .wasi) return;
+        if (comptime !has_posix_tty) return;
         if (std.c.isatty(self.stdin_fd) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
             return error.NotATerminal;
         }
     }
 
     pub fn captureOriginalTermios(self: *TerminalState) !void {
-        if (comptime builtin.os.tag == .wasi) return;
+        if (comptime !has_posix_tty) return;
         self.original_termios = try std.posix.tcgetattr(self.stdin_fd);
     }
 
     pub fn enableRawMode(self: *TerminalState) !void {
-        if (comptime builtin.os.tag == .wasi) {
+        if (comptime !has_posix_tty) {
             self.raw_enabled = true;
             return;
         }
@@ -151,7 +156,7 @@ pub const TerminalState = struct {
 
     pub fn disableRawMode(self: *TerminalState) void {
         if (!self.raw_enabled) return;
-        if (comptime builtin.os.tag != .wasi) {
+        if (comptime has_posix_tty) {
             std.posix.tcsetattr(self.stdin_fd, .FLUSH, self.original_termios) catch {};
         }
         self.raw_enabled = false;
@@ -181,14 +186,17 @@ pub const TerminalState = struct {
     }
 
     pub fn queryLayout(self: TerminalState, footer_rows: u16) !Layout {
-        return if (comptime builtin.os.tag == .wasi)
-            wasm_terminal.queryLayout(footer_rows)
+        return if (comptime !has_posix_tty)
+            if (builtin.os.tag == .wasi)
+                wasm_terminal.queryLayout(footer_rows)
+            else
+                error.UnableToReadTerminalSize
         else
             ui_terminal.queryLayout(self.stdin_fd, footer_rows);
     }
 
     pub fn queryCursorPosition(self: TerminalState) !CursorPosition {
-        if (comptime builtin.os.tag == .wasi) {
+        if (comptime !has_posix_tty) {
             // JavaScript hosts provide a fresh terminal surface rather than an
             // existing shell viewport, so there are no launch rows to preserve.
             return .{ .row = 1, .col = 1 };
@@ -260,10 +268,10 @@ pub const TerminalState = struct {
     }
 
     pub fn read(self: TerminalState, out: []u8) !usize {
-        if (comptime builtin.os.tag == .wasi) {
+        if (comptime !has_posix_tty) {
             return std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{out});
         }
-        return std.posix.read(self.stdin_fd, out);
+        return io_mod.readFd(self.stdin_fd, out);
     }
 
     pub fn pollInput(self: TerminalState, timeout_ms: i32) !PollResult {
@@ -274,18 +282,22 @@ pub const TerminalState = struct {
                 else => .{},
             };
         }
-        var fds = [_]std.posix.pollfd{.{
+        if (comptime !has_posix_tty) {
+            _ = @TypeOf(timeout_ms);
+            return .{};
+        }
+        var fds = [_]io_mod.PollFd{.{
             .fd = self.stdin_fd,
-            .events = std.posix.POLL.IN,
+            .events = io_mod.POLL.IN,
             .revents = 0,
         }};
 
-        _ = try std.posix.poll(&fds, timeout_ms);
+        _ = try io_mod.poll(&fds, timeout_ms);
         const revents = fds[0].revents;
         return .{
-            .readable = (revents & std.posix.POLL.IN) != 0,
-            .hung_up = (revents & std.posix.POLL.HUP) != 0,
-            .has_error = (revents & std.posix.POLL.ERR) != 0,
+            .readable = (revents & io_mod.POLL.IN) != 0,
+            .hung_up = (revents & io_mod.POLL.HUP) != 0,
+            .has_error = (revents & io_mod.POLL.ERR) != 0,
         };
     }
 };
@@ -634,16 +646,16 @@ test "enableRawMode preserves already queued input" {
     try terminal.enableRawMode();
     defer terminal.disableRawMode();
 
-    var fds = [_]std.posix.pollfd{.{
+    var fds = [_]io_mod.PollFd{.{
         .fd = pty.slave,
-        .events = std.posix.POLL.IN,
+        .events = io_mod.POLL.IN,
         .revents = 0,
     }};
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&fds, 100));
-    try std.testing.expect((fds[0].revents & std.posix.POLL.IN) != 0);
+    try std.testing.expectEqual(@as(usize, 1), try io_mod.poll(&fds, 100));
+    try std.testing.expect((fds[0].revents & io_mod.POLL.IN) != 0);
 
     var buf: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.read(pty.slave, &buf));
+    try std.testing.expectEqual(@as(usize, 1), try io_mod.readFd(pty.slave, &buf));
     try std.testing.expectEqual(@as(u8, 3), buf[0]);
 }
 
@@ -675,16 +687,16 @@ test "enableRawMode preserves carriage return input" {
         .flags = .{ .nonblocking = false },
     }).writeStreamingAll(io_mod.getIo(), &enter);
 
-    var fds = [_]std.posix.pollfd{.{
+    var fds = [_]io_mod.PollFd{.{
         .fd = pty.slave,
-        .events = std.posix.POLL.IN,
+        .events = io_mod.POLL.IN,
         .revents = 0,
     }};
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&fds, 100));
-    try std.testing.expect((fds[0].revents & std.posix.POLL.IN) != 0);
+    try std.testing.expectEqual(@as(usize, 1), try io_mod.poll(&fds, 100));
+    try std.testing.expect((fds[0].revents & io_mod.POLL.IN) != 0);
 
     var buf: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.read(pty.slave, &buf));
+    try std.testing.expectEqual(@as(usize, 1), try io_mod.readFd(pty.slave, &buf));
     try std.testing.expectEqual(@as(u8, '\r'), buf[0]);
 }
 

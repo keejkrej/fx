@@ -4,6 +4,103 @@ const darwin_process_spawn = @import("darwin_process_spawn.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
 
+pub const has_posix_file_mode = std.Io.File.Permissions.has_executable_bit;
+
+pub const has_posix_poll = switch (builtin.os.tag) {
+    .windows, .wasi => false,
+    else => true,
+};
+
+pub const PollFd = if (has_posix_poll)
+    std.posix.pollfd
+else
+    extern struct {
+        fd: std.posix.fd_t,
+        events: i16,
+        revents: i16,
+    };
+
+pub const POLL = if (has_posix_poll)
+    std.posix.POLL
+else
+    struct {
+        pub const IN: i16 = 0x0001;
+        pub const ERR: i16 = 0x0008;
+        pub const HUP: i16 = 0x0010;
+    };
+
+pub fn poll(fds: []PollFd, timeout_ms: i32) std.posix.PollError!usize {
+    if (comptime has_posix_poll) {
+        return std.posix.poll(fds, timeout_ms);
+    }
+    _ = @TypeOf(fds);
+    _ = @TypeOf(timeout_ms);
+    return 0;
+}
+
+pub fn stdinFd() std.posix.fd_t {
+    if (comptime builtin.os.tag == .windows) {
+        return std.Io.File.stdin().handle;
+    }
+    return std.posix.STDIN_FILENO;
+}
+
+pub fn stdoutFd() std.posix.fd_t {
+    if (comptime builtin.os.tag == .windows) {
+        return std.Io.File.stdout().handle;
+    }
+    return std.posix.STDOUT_FILENO;
+}
+
+pub fn readFd(fd: std.posix.fd_t, buf: []u8) !usize {
+    if (comptime builtin.os.tag == .windows) {
+        var file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+        return file.readStreaming(getIo(), &.{buf});
+    }
+    return std.posix.read(fd, buf);
+}
+
+pub const comptime_stdout_file: std.Io.File = if (builtin.os.tag == .windows)
+    .{ .handle = @ptrFromInt(1), .flags = .{ .nonblocking = false } }
+else
+    std.Io.File.stdout();
+
+pub const private_dir_permissions: std.Io.File.Permissions = if (has_posix_file_mode)
+    .fromMode(0o700)
+else
+    .default_dir;
+
+pub const private_file_permissions: std.Io.File.Permissions = if (has_posix_file_mode)
+    .fromMode(0o600)
+else
+    .default_file;
+
+pub fn permissionsFromUnixMode(mode: u32) std.Io.File.Permissions {
+    if (comptime has_posix_file_mode) return .fromMode(@truncate(mode));
+    return if (mode & 0o111 != 0) .default_dir else .default_file;
+}
+
+pub const posix_mode_t = if (has_posix_file_mode) std.posix.mode_t else u32;
+
+pub fn posixMode(permissions: std.Io.File.Permissions) posix_mode_t {
+    if (comptime has_posix_file_mode) return permissions.toMode();
+    return 0o600;
+}
+
+pub fn isGroupOrWorldAccessible(permissions: std.Io.File.Permissions) bool {
+    return posixMode(permissions) & 0o077 != 0;
+}
+
+pub fn isOwnerWritable(permissions: std.Io.File.Permissions) bool {
+    if (comptime has_posix_file_mode) return permissions.toMode() & 0o222 != 0;
+    return true;
+}
+
+pub fn matchesUnixMode(permissions: std.Io.File.Permissions, mode: u32) bool {
+    if (comptime has_posix_file_mode) return permissions.toMode() & 0o777 == mode;
+    return true;
+}
+
 // Process globals are installed before threads start and remain read-only.
 var real_io: ?std.Io = null;
 
@@ -488,7 +585,7 @@ pub fn writeFileAtomic(alloc: std.mem.Allocator, path: []const u8, text: []const
     e2eFailIfDurableMutationAttempted();
     const maybe_existing_permissions = existingFilePermissions(path);
     if (maybe_existing_permissions) |existing_permissions| {
-        if (existing_permissions.toMode() & 0o222 == 0) return error.AccessDenied;
+        if (!isOwnerWritable(existing_permissions)) return error.AccessDenied;
     }
     const permissions = maybe_existing_permissions orelse .default_file;
     const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ path, nanoTimestamp() });
@@ -507,9 +604,6 @@ pub fn writeFileAtomic(alloc: std.mem.Allocator, path: []const u8, text: []const
     try std.Io.Dir.renameAbsolute(temp_path, path, getIo());
     cleanup_temp = false;
 }
-
-const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 
 pub const VerifiedDir = struct {
     dir: std.Io.Dir,
@@ -573,13 +667,13 @@ fn validateRelativeLeaf(name: []const u8) !void {
 fn verifyPrivateRegularFile(file: std.Io.File) !void {
     const stat = try file.stat(getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o600) return error.PrivateStatePermissionsUnsupported;
+    if (!matchesUnixMode(stat.permissions, 0o600)) return error.PrivateStatePermissionsUnsupported;
 }
 
 fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
     const stat = try dir.stat(getIo());
     if (stat.kind != .directory) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o700) return error.PrivateStatePermissionsUnsupported;
+    if (!matchesUnixMode(stat.permissions, 0o700)) return error.PrivateStatePermissionsUnsupported;
 }
 
 /// The handle must come from an `openDir` that requested iteration. Linux returns an
@@ -647,7 +741,7 @@ fn validateReplaceTarget(dir: std.Io.Dir, name: []const u8) !void {
         else => return err,
     };
     if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o222 == 0) return error.AccessDenied;
+    if (!isOwnerWritable(stat.permissions)) return error.AccessDenied;
 }
 
 fn cleanupVerifiedTemp(dir: std.Io.Dir, name: []const u8) void {
@@ -712,7 +806,7 @@ pub fn durableReplaceVerifiedWithOps(
         return error.DurableReplacePostRenameFailed;
     };
     if (final_stat.kind != .file or final_stat.nlink != 1 or
-        final_stat.permissions.toMode() & 0o777 != 0o600)
+        !matchesUnixMode(final_stat.permissions, 0o600))
     {
         return error.DurableReplacePostRenameFailed;
     }
@@ -845,7 +939,7 @@ pub fn copyFileAtomic(alloc: std.mem.Allocator, source_path: []const u8, dest_pa
     const stat = try source.stat(zio);
     if (stat.kind != .file) return error.NotRegularFile;
     if (existingFilePermissions(dest_path)) |existing_permissions| {
-        if (existing_permissions.toMode() & 0o222 == 0) return error.AccessDenied;
+        if (!isOwnerWritable(existing_permissions)) return error.AccessDenied;
     }
 
     const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ dest_path, nanoTimestamp() });
@@ -902,12 +996,24 @@ pub fn makeDirRecursive(path: []const u8) !void {
 }
 
 pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
-    var result_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const ptr = std.c.realpath(path_z, &result_buf) orelse return error.FileNotFound;
-    const resolved = std.mem.sliceTo(ptr, 0);
-    return alloc.dupe(u8, resolved);
+    if (comptime builtin.os.tag == .windows) {
+        const zio = getIo();
+        if (std.fs.path.isAbsolute(path)) {
+            std.Io.Dir.accessAbsolute(zio, path, .{}) catch return error.FileNotFound;
+            return std.fs.path.resolve(alloc, &.{path});
+        }
+        std.Io.Dir.cwd().access(zio, path, .{}) catch return error.FileNotFound;
+        const cwd_path = std.process.currentPathAlloc(zio, alloc) catch return error.FileNotFound;
+        defer alloc.free(cwd_path);
+        return std.fs.path.resolve(alloc, &.{ cwd_path, path });
+    } else {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
+        var result_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const ptr = std.c.realpath(path_z, &result_buf) orelse return error.FileNotFound;
+        const resolved = std.mem.sliceTo(ptr, 0);
+        return alloc.dupe(u8, resolved);
+    }
 }
 
 fn handlePathAlloc(alloc: std.mem.Allocator, handle: std.Io.File.Handle) ![]u8 {
@@ -965,7 +1071,7 @@ pub fn dirRealpathAlloc(alloc: std.mem.Allocator, dir: std.Io.Dir, sub_path: []c
         const joined = try std.fs.path.join(alloc, &.{ dir_path, sub_path });
         defer alloc.free(joined);
         return realpathAlloc(alloc, joined);
-    } else if (comptime builtin.os.tag == .wasi) {
+    } else if (comptime builtin.os.tag == .wasi or builtin.os.tag == .windows) {
         if (std.fs.path.isAbsolute(sub_path)) return alloc.dupe(u8, sub_path);
         return std.fs.path.resolve(alloc, &.{sub_path});
     } else {

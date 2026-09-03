@@ -52,12 +52,28 @@ jobs:
         include:
           - name: linux-x86_64
             target: x86_64-linux
+            archive: tar.gz
+            binary: fx
           - name: linux-aarch64
             target: aarch64-linux
+            archive: tar.gz
+            binary: fx
           - name: macos-x86_64
             target: x86_64-macos
+            archive: tar.gz
+            binary: fx
           - name: macos-aarch64
             target: aarch64-macos
+            archive: tar.gz
+            binary: fx
+          - name: windows-x86_64
+            target: x86_64-windows
+            archive: zip
+            binary: fx.exe
+          - name: windows-aarch64
+            target: aarch64-windows
+            archive: zip
+            binary: fx.exe
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -74,17 +90,27 @@ jobs:
         run: |
           package_dir="$RUNNER_TEMP/fx-package-${{ matrix.name }}"
           mkdir -p "$package_dir"
-          cp zig-out/bin/fx LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf fx-${{ matrix.name }}.tar.gz -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
-          sha256sum fx-${{ matrix.name }}.tar.gz > fx-${{ matrix.name }}.tar.gz.sha256
+          cp "zig-out/bin/${{ matrix.binary }}" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          archive="fx-${{ matrix.name }}.${{ matrix.archive }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            python3 -c 'import pathlib, sys, zipfile
+root = pathlib.Path(sys.argv[1])
+with zipfile.ZipFile(sys.argv[2], "w", zipfile.ZIP_DEFLATED) as zf:
+    for path in sorted(root.iterdir()):
+        zf.write(path, path.name)
+' "$package_dir" "$archive"
+          else
+            tar -czf "$archive" -C "$package_dir" ${{ matrix.binary }} LICENSE THIRD_PARTY_NOTICES.md
+          fi
+          sha256sum "$archive" > "${archive}.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fx-${{ matrix.name }}
           path: |
-            fx-${{ matrix.name }}.tar.gz
-            fx-${{ matrix.name }}.tar.gz.sha256
+            fx-${{ matrix.name }}.${{ matrix.archive }}
+            fx-${{ matrix.name }}.${{ matrix.archive }}.sha256
 
   release:
     needs: [check-version, build]
@@ -107,10 +133,17 @@ jobs:
           set -euo pipefail
           [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
           echo -n "$RELEASE_TAG" > latest.txt
+          chmod +x install install.ps1
           for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
             test -f "fx-${platform}.tar.gz"
             test -f "fx-${platform}.tar.gz.sha256"
           done
+          for platform in windows-x86_64 windows-aarch64; do
+            test -f "fx-${platform}.zip"
+            test -f "fx-${platform}.zip.sha256"
+          done
+          test -f install
+          test -f install.ps1
 
       - name: Create git tag
         env:
@@ -138,8 +171,12 @@ jobs:
           body_path: /tmp/release-notes.md
           files: |
             latest.txt
+            install
+            install.ps1
             fx-*.tar.gz
             fx-*.tar.gz.sha256
+            fx-*.zip
+            fx-*.zip.sha256
 
       - name: Publish to CDN
         env:
@@ -154,11 +191,12 @@ jobs:
           fi
           CDN_BASE="cli"
 
-          for FILE in fx-*.tar.gz fx-*.tar.gz.sha256; do
+          for FILE in fx-*.tar.gz fx-*.tar.gz.sha256 fx-*.zip fx-*.zip.sha256; do
             [ -f "$FILE" ] || continue
             CONTENT_TYPE="application/octet-stream"
             [[ "$FILE" == *.sha256 ]] && CONTENT_TYPE="text/plain"
             [[ "$FILE" == *.tar.gz ]] && [[ "$FILE" != *.sha256 ]] && CONTENT_TYPE="application/gzip"
+            [[ "$FILE" == *.zip ]] && [[ "$FILE" != *.sha256 ]] && CONTENT_TYPE="application/zip"
 
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
               -X PUT "https://blob.vercel-storage.com/${CDN_BASE}/${VERSION}/${FILE}" \

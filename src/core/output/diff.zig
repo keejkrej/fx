@@ -1138,7 +1138,6 @@ pub fn formatUnified(
 
     _ = kind;
     _ = path;
-
     const include = try alloc.alloc(bool, diff.len);
     defer alloc.free(include);
     @memset(include, false);

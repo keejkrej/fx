@@ -7334,7 +7334,7 @@ test "process-held session lock preserves queue until explicit exactly-once retr
     var ready: [1]u8 = undefined;
     try std.testing.expectEqual(
         @as(usize, 1),
-        try std.posix.read(locker.stdout.?.handle, &ready),
+        try io_mod.readFd(locker.stdout.?.handle, &ready),
     );
     try std.testing.expectEqual(@as(u8, 'R'), ready[0]);
 
@@ -7665,7 +7665,7 @@ test "shutdown joins while control locking and control writes are unavailable" {
         _ = locker.wait(io_mod.getIo()) catch {};
     };
     var ready: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.read(locker.stdout.?.handle, &ready));
+    try std.testing.expectEqual(@as(usize, 1), try io_mod.readFd(locker.stdout.?.handle, &ready));
     var write_failure = FailNthControlSync{ .fail_at = 1 };
     owner.child_store_options = .{ .replace_ops = .{
         .ctx = &write_failure,

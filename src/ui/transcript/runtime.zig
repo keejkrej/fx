@@ -2392,7 +2392,7 @@ test "historical command detail keeps artifact handles after command block attac
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -3740,7 +3740,7 @@ const CompactTranscriptSourceCache = struct {
 };
 
 pub const TranscriptRuntime = struct {
-    stdout_file: std.Io.File = std.Io.File.stdout(),
+    stdout_file: std.Io.File = io_mod.comptime_stdout_file,
     sync_updates_enabled: bool = true,
     history_reset_uses_ris: bool = false,
     layout: Layout = undefined,

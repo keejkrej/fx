@@ -60,7 +60,6 @@ pub fn configureFromEnv(
     record_requested: bool,
 ) !void {
     _ = workspace_root;
-
     const configured_path = if (io_mod.getenv("FX_RECORD")) |raw_path|
         std.mem.trim(u8, raw_path, " \t\r\n")
     else
@@ -181,7 +180,7 @@ fn openTape(path: []const u8, exclusive: bool, private: bool) !std.Io.File {
             return std.Io.Dir.createFileAbsolute(zio, path, .{
                 .truncate = !exclusive,
                 .exclusive = exclusive,
-                .permissions = .fromMode(0o600),
+                .permissions = io_mod.permissionsFromUnixMode(0o600),
             });
         }
         return std.Io.Dir.createFileAbsolute(zio, path, .{ .truncate = !exclusive, .exclusive = exclusive });
@@ -190,7 +189,7 @@ fn openTape(path: []const u8, exclusive: bool, private: bool) !std.Io.File {
         return std.Io.Dir.cwd().createFile(zio, path, .{
             .truncate = !exclusive,
             .exclusive = exclusive,
-            .permissions = .fromMode(0o600),
+            .permissions = io_mod.permissionsFromUnixMode(0o600),
         });
     }
     return std.Io.Dir.cwd().createFile(zio, path, .{ .truncate = !exclusive, .exclusive = exclusive });
@@ -674,7 +673,7 @@ test "requested recording creates a private tape under home" {
             defer file.close(io_mod.getIo());
             if (@import("builtin").os.tag != .windows) {
                 const stat = try file.stat(io_mod.getIo());
-                try testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
+                try testing.expectEqual(@as(std.posix.mode_t, 0), io_mod.posixMode(stat.permissions) & 0o077);
             }
         },
         else => return error.TestExpectedActiveRecording,

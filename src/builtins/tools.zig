@@ -31,6 +31,7 @@ const skill_search_impl = @import("../tools/skills/skill_search.zig");
 const capability_search_impl = @import("../tools/capabilities/capability_search.zig");
 const web_fetch_impl = @import("../tools/web/fetch.zig");
 const web_search_impl = @import("../tools/web/search.zig");
+const io_mod = @import("../core/shared/io.zig");
 const test_io_mod = if (std_builtin.is_test)
     @import("../core/shared/io.zig")
 else
@@ -1725,7 +1726,7 @@ test "terminal dispatch is permission gated and fails closed when unavailable" {
     try tmp.dir.createDir(
         test_io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromUnixMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(test_io_mod.getIo(), "session", .{
         .iterate = true,

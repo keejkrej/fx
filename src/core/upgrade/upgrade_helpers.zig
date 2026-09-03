@@ -13,9 +13,14 @@ const Channel = update_target.Channel;
 const Target = update_target.Target;
 
 fn setRecvTimeout(conn: *std.http.Client.Connection) void {
-    const sock = conn.stream_writer.stream.socket.handle;
-    const timeout = std.posix.timeval{ .sec = recv_timeout_sec, .usec = 0 };
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+    if (comptime builtin.os.tag == .windows) {
+        _ = @TypeOf(conn);
+        return;
+    } else {
+        const sock = conn.stream_writer.stream.socket.handle;
+        const timeout = std.posix.timeval{ .sec = recv_timeout_sec, .usec = 0 };
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+    }
 }
 
 pub const release_repo = "keejkrej/fx";
@@ -60,12 +65,13 @@ fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
 }
 
 pub const platform = platformFromTarget() orelse
-    @compileError("unsupported platform for auto-upgrade (requires macOS or Linux, x86_64 or aarch64)");
+    @compileError("unsupported platform for auto-upgrade (requires macOS, Linux, or Windows, x86_64 or aarch64)");
 
 fn platformFromTarget() ?[]const u8 {
     const os: ?[]const u8 = switch (builtin.os.tag) {
         .macos => "macos",
         .linux => "linux",
+        .windows => "windows",
         else => null,
     };
     const arch: ?[]const u8 = switch (builtin.cpu.arch) {
@@ -262,8 +268,19 @@ fn extractChecksumHex(raw: []const u8) ?[]const u8 {
 }
 
 pub fn extractTarGz(alloc: Allocator, archive_path: []const u8, dest_dir: []const u8) !void {
+    return extractArchive(alloc, archive_path, dest_dir);
+}
+
+pub const archive_ext: []const u8 = if (builtin.os.tag == .windows) "zip" else "tar.gz";
+pub const extracted_binary_name: []const u8 = if (builtin.os.tag == .windows) "fx.exe" else "fx";
+
+pub fn extractArchive(alloc: Allocator, archive_path: []const u8, dest_dir: []const u8) !void {
+    const argv: []const []const u8 = if (std.mem.endsWith(u8, archive_path, ".zip"))
+        &.{ "tar", "-xf", archive_path, "-C", dest_dir }
+    else
+        &.{ "tar", "-xzf", archive_path, "-C", dest_dir };
     const result = std.process.run(alloc, io_mod.getIo(), .{
-        .argv = &.{ "tar", "-xzf", archive_path, "-C", dest_dir },
+        .argv = argv,
     }) catch return error.ExtractionFailed;
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
