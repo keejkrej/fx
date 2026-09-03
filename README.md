@@ -61,7 +61,7 @@ Windows (PowerShell):
 irm https://github.com/keejkrej/fx/releases/latest/download/install.ps1 | iex
 ```
 
-That installs `fx` to `~/.fx/bin` (Unix) or `%USERPROFILE%\.fx\bin` (Windows) and adds that directory to PATH. Override the destination with `FX_INSTALL_DIR`. Pin a tag with `FX_VERSION=0.0.7`.
+That installs `fx` to `~/.fx/bin` (Unix) or `%USERPROFILE%\.fx\bin` (Windows) and adds that directory to PATH. Override the destination with `FX_INSTALL_DIR`. Pin a tag with `FX_VERSION=0.0.8`.
 
 ## Run fx
 
