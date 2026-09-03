@@ -1,8 +1,20 @@
 # fx
 
-## 0.0.7
+## 0.0.8
 
 <!-- release:start -->
+
+**Install fx from this repository's GitHub Releases, including Windows zip archives and the Unix and PowerShell install scripts as release assets.**
+
+### New Features
+
+- **GitHub Releases install:** Install with `curl -fsSL https://github.com/keejkrej/fx/releases/latest/download/install | bash` on Unix, or `irm https://github.com/keejkrej/fx/releases/latest/download/install.ps1 | iex` on Windows. Pin a tag with `FX_VERSION`.
+- **Windows release archives:** GitHub Releases now include zip artifacts for Windows x86_64 and Windows aarch64.
+- **Install scripts as assets:** Each GitHub Release attaches the Unix `install` script and Windows `install.ps1` so they download from `releases/latest`.
+
+<!-- release:end -->
+
+## 0.0.7
 
 **MCP is safer, easier to manage and more compatible; project servers require explicit trust, `fx mcp` is now a top-level command, `Ctrl+Enter` can steer active turns and fx uses eight fewer tools to preserve context.**
 
@@ -60,8 +72,6 @@
 - [Notion](https://developers.notion.com/guides/mcp/overview)
 - [Exa](https://exa.ai/mcp)
 - [Hugging Face](https://huggingface.co/docs/hub/agents-mcp)
-
-<!-- release:end -->
 
 ## 0.0.6
 
