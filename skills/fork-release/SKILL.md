@@ -31,7 +31,7 @@ Done when `main` contains `upstream/main` and the fork-only commits, and `origin
 
 Cut a fork release whose GitHub assets `fx upgrade` can install.
 
-1. Compute the ship version. Read fork `pub const version`, upstream `pub const version`, and `git ls-remote --tags origin 'v*'`. The ship version is the semver-max of fork and upstream. If `v<version>` already exists on origin, bump patch until it does not. Write that version to `src/main.zig`.
+1. Compute the ship version. Read fork `pub const version`, upstream `pub const version`, and `git ls-remote --tags origin 'v*'`. This fork never publishes a plain `X.Y.Z`. Stay on upstream's `X.Y.Z` in `src/main.zig` while developing; `release.yml` will skip that. A public ship is always `X.Y.Z-N` where `N` is one greater than the highest existing `vX.Y.Z-N` on origin (`0.0.7-1`, then `0.0.7-2`). When upstream moves, replay that `X.Y.Z` and start `N` at 1 (`0.0.8-1`). Do not bump patch past upstream just to ship fork work. Write that hyphenated version to `src/main.zig` only when shipping.
 2. Rewrite `CHANGELOG.md` for this ship version: one `## <version>` heading, `<!-- release:start -->` / `<!-- release:end -->` only on that entry, public user outcomes for fork-only work plus whatever landed from upstream since the previous fork tag. Follow the changelog rules in `AGENTS.md`.
 3. Confirm the **release contract** in [release-contract.md](release-contract.md) still holds. Repair `release.yml` / upgrade helpers before pushing if GitHub Releases would not serve `latest.txt` plus `fx-*.tar.gz` and `.sha256` assets.
 4. Enable Actions on this fork if `gh run list --repo keejkrej/fx --limit 1` is empty. Then push `main`.
@@ -46,7 +46,7 @@ Cut a fork release whose GitHub assets `fx upgrade` can install.
    - `fx-windows-aarch64.zip` and `.sha256`
 6. Ignore a failed **Publish to CDN** step when `BLOB_READ_WRITE_TOKEN` is unset. That is official-CDN publishing. Do not treat it as the upgrade source.
 
-Done when `curl -fsSL https://github.com/keejkrej/fx/releases/latest/download/latest.txt` prints `v<version>` and one platform archive URL under `/releases/download/v<version>/` returns 200.
+Done when `latest.txt` on that tag is `vX.Y.Z-N`, one platform archive URL under `/releases/download/vX.Y.Z-N/` returns 200, and `fx upgrade` would select that tag as the newest hyphenated ship (plain `vX.Y.Z` tags are ignored). GitHub Releases for hyphenated tags must stay non-prerelease with `make_latest: true`.
 
 ## After ship
 

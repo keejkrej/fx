@@ -152,25 +152,89 @@ pub fn normalizeVersion(raw: []const u8) []const u8 {
     return raw;
 }
 
+const VersionParts = struct {
+    major: u32 = 0,
+    minor: u32 = 0,
+    patch: u32 = 0,
+    fork: u32 = 0,
+};
+
 pub fn compareVersions(a: []const u8, b: []const u8) std.math.Order {
-    const av = parseVersionParts(a);
-    const bv = parseVersionParts(b);
-    if (av[0] != bv[0]) return std.math.order(av[0], bv[0]);
-    if (av[1] != bv[1]) return std.math.order(av[1], bv[1]);
-    return std.math.order(av[2], bv[2]);
+    const av = parseVersionParts(a) orelse VersionParts{};
+    const bv = parseVersionParts(b) orelse VersionParts{};
+    if (av.major != bv.major) return std.math.order(av.major, bv.major);
+    if (av.minor != bv.minor) return std.math.order(av.minor, bv.minor);
+    if (av.patch != bv.patch) return std.math.order(av.patch, bv.patch);
+    return std.math.order(av.fork, bv.fork);
 }
 
 fn validVersion(raw: []const u8) bool {
-    if (raw.len == 0 or raw.len > max_version_bytes) return false;
-    var count: usize = 0;
-    var parts = std.mem.splitScalar(u8, raw, '.');
-    while (parts.next()) |part| {
-        if (count == 3 or part.len == 0) return false;
-        for (part) |byte| if (!std.ascii.isDigit(byte)) return false;
-        _ = std.fmt.parseUnsigned(u32, part, 10) catch return false;
-        count += 1;
+    return parseVersionParts(raw) != null;
+}
+
+pub fn isForkShipVersion(raw: []const u8) bool {
+    const parts = parseVersionParts(normalizeVersion(std.mem.trim(u8, raw, " \t\r\n"))) orelse return false;
+    return parts.fork != 0;
+}
+
+pub fn selectLatestForkRelease(candidates: []const []const u8) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    for (candidates) |candidate| {
+        const trimmed = std.mem.trim(u8, candidate, " \t\r\n");
+        if (!isForkShipVersion(trimmed)) continue;
+        if (best) |current_best| {
+            switch (compareVersions(trimmed, current_best)) {
+                .gt => best = trimmed,
+                .eq => {
+                    if (trimmed.len > 0 and trimmed[0] == 'v' and current_best[0] != 'v') {
+                        best = trimmed;
+                    }
+                },
+                .lt => {},
+            }
+        } else {
+            best = trimmed;
+        }
     }
-    return count == 3;
+    return best;
+}
+
+pub fn scanGithubMatchingTagRefs(json: []const u8) ?[]const u8 {
+    var tags: [256][]const u8 = undefined;
+    var count: usize = 0;
+    var offset: usize = 0;
+    while (nextGithubTagRef(json, offset)) |found| {
+        if (count == tags.len) break;
+        tags[count] = found.tag;
+        count += 1;
+        offset = found.next;
+    }
+    return selectLatestForkRelease(tags[0..count]);
+}
+
+const GithubTagRef = struct {
+    tag: []const u8,
+    next: usize,
+};
+
+fn nextGithubTagRef(json: []const u8, start: usize) ?GithubTagRef {
+    const patterns = [_][]const u8{ "\"ref\":\"refs/tags/", "\"ref\": \"refs/tags/" };
+    var best_pos: ?usize = null;
+    var pattern_len: usize = 0;
+    for (patterns) |pattern| {
+        const rel = std.mem.find(u8, json[start..], pattern) orelse continue;
+        const pos = start + rel;
+        if (best_pos == null or pos < best_pos.?) {
+            best_pos = pos;
+            pattern_len = pattern.len;
+        }
+    }
+    const pos = best_pos orelse return null;
+    const tag_start = pos + pattern_len;
+    const rest = json[tag_start..];
+    const end = std.mem.findScalar(u8, rest, '"') orelse return null;
+    if (end == 0) return null;
+    return .{ .tag = rest[0..end], .next = tag_start + end + 1 };
 }
 
 fn validRevision(raw: []const u8) bool {
@@ -179,14 +243,40 @@ fn validRevision(raw: []const u8) bool {
     return true;
 }
 
-fn parseVersionParts(raw: []const u8) [3]u32 {
-    var values = [_]u32{ 0, 0, 0 };
-    var parts = std.mem.splitScalar(u8, normalizeVersion(raw), '.');
-    for (&values) |*value| {
-        const part = parts.next() orelse break;
-        value.* = std.fmt.parseUnsigned(u32, part, 10) catch 0;
+fn parseVersionParts(raw: []const u8) ?VersionParts {
+    const normalized = normalizeVersion(raw);
+    if (normalized.len == 0 or normalized.len > max_version_bytes) return null;
+    if (std.mem.findScalar(u8, normalized, '+') != null) return null;
+    if (std.mem.findScalar(u8, normalized, '/') != null) return null;
+
+    var core = normalized;
+    var fork: u32 = 0;
+    if (std.mem.findScalar(u8, normalized, '-')) |dash| {
+        const suffix = normalized[dash + 1 ..];
+        fork = numericPart(suffix) orelse return null;
+        if (fork == 0) return null;
+        core = normalized[0..dash];
     }
-    return values;
+
+    var parts = std.mem.splitScalar(u8, core, '.');
+    const major_s = parts.next() orelse return null;
+    const minor_s = parts.next() orelse return null;
+    const patch_s = parts.next() orelse return null;
+    if (parts.next() != null) return null;
+
+    return .{
+        .major = numericPart(major_s) orelse return null,
+        .minor = numericPart(minor_s) orelse return null,
+        .patch = numericPart(patch_s) orelse return null,
+        .fork = fork,
+    };
+}
+
+fn numericPart(part: []const u8) ?u32 {
+    if (part.len == 0) return null;
+    for (part) |byte| if (!std.ascii.isDigit(byte)) return null;
+    if (part.len > 1 and part[0] == '0') return null;
+    return std.fmt.parseUnsigned(u32, part, 10) catch null;
 }
 
 fn revisionsEqual(full: []const u8, current: []const u8) bool {
@@ -285,4 +375,82 @@ test "target freshness uses version for stable and revision for dev" {
         .version = "0.3.62",
         .revision = "abcdef012345",
     }));
+}
+
+test "stable versions accept an optional numeric fork revision" {
+    const alloc = std.testing.allocator;
+    var target = try Target.initStable(alloc, "v0.0.7-1");
+    defer target.deinit(alloc);
+    try std.testing.expectEqualStrings("0.0.7-1", target.version());
+    try std.testing.expectEqualStrings("v0.0.7-1", target.artifactRef());
+
+    try std.testing.expectError(error.InvalidVersion, Target.initStable(alloc, "0.0.7-0"));
+    try std.testing.expectError(error.InvalidVersion, Target.initStable(alloc, "0.0.7-01"));
+    try std.testing.expectError(error.InvalidVersion, Target.initStable(alloc, "0.0.7-alpha"));
+    try std.testing.expectError(error.InvalidVersion, Target.initStable(alloc, "0.0.7-1.2"));
+    try std.testing.expectError(error.InvalidVersion, Target.initStable(alloc, "0.0.7+1"));
+    try std.testing.expectError(error.InvalidVersion, Target.initStable(alloc, "0.0.7/1"));
+    try std.testing.expectError(error.InvalidVersion, Target.initStable(alloc, "0.0.7-"));
+}
+
+test "fork revision is newer than its upstream base and older than the next upstream" {
+    try std.testing.expectEqual(std.math.Order.lt, compareVersions("0.0.7", "0.0.7-1"));
+    try std.testing.expectEqual(std.math.Order.lt, compareVersions("0.0.7-1", "0.0.7-2"));
+    try std.testing.expectEqual(std.math.Order.lt, compareVersions("0.0.7-2", "0.0.8"));
+    try std.testing.expectEqual(std.math.Order.lt, compareVersions("0.0.6", "0.0.7-1"));
+    try std.testing.expectEqual(std.math.Order.eq, compareVersions("v0.0.7-1", "0.0.7-1"));
+    try std.testing.expectEqual(std.math.Order.gt, compareVersions("0.0.8-1", "0.0.8"));
+
+    const alloc = std.testing.allocator;
+    var fork_ship = try Target.initStable(alloc, "v0.0.7-1");
+    defer fork_ship.deinit(alloc);
+    try std.testing.expect(fork_ship.shouldInstall(.{
+        .channel = .stable,
+        .version = "0.0.7",
+        .revision = "0123456789ab",
+    }));
+    try std.testing.expect(!fork_ship.shouldInstall(.{
+        .channel = .stable,
+        .version = "0.0.7-1",
+        .revision = "0123456789ab",
+    }));
+    try std.testing.expect(!fork_ship.shouldInstall(.{
+        .channel = .stable,
+        .version = "0.0.7-2",
+        .revision = "0123456789ab",
+    }));
+
+    var upstream = try Target.initStable(alloc, "v0.0.8");
+    defer upstream.deinit(alloc);
+    try std.testing.expect(upstream.shouldInstall(.{
+        .channel = .stable,
+        .version = "0.0.7-99",
+        .revision = "0123456789ab",
+    }));
+}
+
+test "latest fork ship ignores plain upstream tags" {
+    try std.testing.expect(!isForkShipVersion("0.0.7"));
+    try std.testing.expect(!isForkShipVersion("v0.0.8"));
+    try std.testing.expect(isForkShipVersion("v0.0.7-1"));
+
+    const mixed = [_][]const u8{ "v0.0.8", "v0.0.7", "v0.0.7-1", "v0.0.7-2" };
+    try std.testing.expectEqualStrings("v0.0.7-2", selectLatestForkRelease(&mixed).?);
+
+    const next_upstream = [_][]const u8{ "v0.0.7-99", "v0.0.8-1", "v0.0.8" };
+    try std.testing.expectEqualStrings("v0.0.8-1", selectLatestForkRelease(&next_upstream).?);
+
+    const only_plain = [_][]const u8{ "v0.0.7", "v0.0.8" };
+    try std.testing.expect(selectLatestForkRelease(&only_plain) == null);
+}
+
+test "GitHub matching-refs scanner prefers the newest fork ship" {
+    const json =
+        \\[{"ref": "refs/tags/v0.0.7", "url": "https://api.github.com/repos/keejkrej/fx/git/refs/tags/v0.0.7"},
+        \\ {"ref": "refs/tags/v0.0.8", "url": "https://api.github.com/repos/keejkrej/fx/git/refs/tags/v0.0.8"},
+        \\ {"ref": "refs/tags/v0.0.7-1", "url": "https://api.github.com/repos/keejkrej/fx/git/refs/tags/v0.0.7-1"},
+        \\ {"ref":"refs/tags/v0.0.7-2"}]
+    ;
+    try std.testing.expectEqualStrings("v0.0.7-2", scanGithubMatchingTagRefs(json).?);
+    try std.testing.expect(scanGithubMatchingTagRefs("[]") == null);
 }

@@ -429,6 +429,22 @@ test "completeRunResult reports up to date when normalized versions match" {
     try std.testing.expectEqualStrings("0.2.10", result.snapshot.latest);
 }
 
+test "completeRunResult reports upgraded from an upstream base to a fork revision" {
+    const alloc = std.testing.allocator;
+    const target = try update_target.Target.initStable(alloc, "v0.0.7-1");
+
+    var result = try completeRunResult(alloc, .{
+        .channel = .stable,
+        .version = "0.0.7",
+        .revision = "0123456789ab",
+    }, .stable, .{ .target_owned = target });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(output_contracts.UpgradeSnapshot.Status.upgraded, result.snapshot.status);
+    try std.testing.expectEqualStrings("0.0.7", result.snapshot.current);
+    try std.testing.expectEqualStrings("0.0.7-1", result.snapshot.latest);
+}
+
 test "completeRunResult reports upgraded when latest differs" {
     const alloc = std.testing.allocator;
     const target = try update_target.Target.initStable(alloc, "0.2.11");

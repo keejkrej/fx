@@ -6,6 +6,8 @@ Keep upstream sign-in: `fx login grok`, `fx login codex`. This line does not rei
 
 **No Gateway.** Point fx at any OpenAI-compatible `/v1/chat/completions` server, or keep those logins. No Vercel account, no AI Gateway billing.
 
+**Versions.** This fork never ships a plain `X.Y.Z`. Public binaries are `X.Y.Z-N` (`0.0.7-1`, `0.0.7-2`), where `X.Y.Z` is the upstream version they are based on. `fx upgrade` ignores leftover plain tags and installs the newest `X.Y.Z-N`.
+
 **Lua plugins.** Shipped demos of the plugin API:
 
 - **Full-screen views.** Agent, diff, and code are modes, not a split. `fx.view.register` lets plugins take over the whole terminal. Ctrl-T cycles agent → diff → code → agent. `q` always returns to the agent.
@@ -61,7 +63,7 @@ Windows (PowerShell):
 irm https://github.com/keejkrej/fx/releases/latest/download/install.ps1 | iex
 ```
 
-That installs `fx` to `~/.fx/bin` (Unix) or `%USERPROFILE%\.fx\bin` (Windows) and adds that directory to PATH. Override the destination with `FX_INSTALL_DIR`. Pin a tag with `FX_VERSION=0.0.8`.
+That installs `fx` to `~/.fx/bin` (Unix) or `%USERPROFILE%\.fx\bin` (Windows) and adds that directory to PATH. Override the destination with `FX_INSTALL_DIR`. Pin a tag with `FX_VERSION=0.0.7-1`.
 
 ## Run fx
 

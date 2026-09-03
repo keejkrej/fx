@@ -28,6 +28,8 @@ pub const github_release_base = "https://github.com/" ++ release_repo ++ "/relea
 pub const github_latest_download_base = github_release_base ++ "/latest/download";
 pub const github_download_base = github_release_base ++ "/download";
 pub const github_user_agent = "fx-upgrade (+https://github.com/" ++ release_repo ++ ")";
+pub const github_api_tags_url = "https://api.github.com/repos/" ++ release_repo ++ "/git/matching-refs/tags/v";
+const github_refs_max_bytes: usize = 256 * 1024;
 
 pub const cdn_base = github_latest_download_base;
 
@@ -44,6 +46,11 @@ fn requestHeaders() std.http.Client.Request.Headers {
         .accept_encoding = .omit,
     };
 }
+
+const github_api_extra_headers = [_]std.http.Header{
+    .{ .name = "Accept", .value = "application/vnd.github+json" },
+    .{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" },
+};
 
 fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
     const uri = std.Uri.parse(url) catch return false;
@@ -112,6 +119,36 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8) !Ta
 }
 
 fn fetchLatestVersion(alloc: Allocator, base_url: []const u8) ![]u8 {
+    if (isLoopbackE2eUpgradeBase(base_url)) {
+        return fetchLatestTxt(alloc, base_url);
+    }
+
+    if (fetchLatestForkReleaseFromGithub(alloc)) |latest| {
+        return latest;
+    } else |_| {}
+
+    const from_txt = fetchLatestTxt(alloc, base_url) catch return error.FetchFailed;
+    if (update_target.isForkShipVersion(from_txt)) return from_txt;
+    alloc.free(from_txt);
+    return error.FetchFailed;
+}
+
+fn fetchLatestForkReleaseFromGithub(alloc: Allocator) ![]u8 {
+    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    defer client.deinit();
+    const raw = try fetchTextBoundedWithHeaders(
+        &client,
+        alloc,
+        github_api_tags_url,
+        github_refs_max_bytes,
+        &github_api_extra_headers,
+    );
+    defer alloc.free(raw);
+    const latest = update_target.scanGithubMatchingTagRefs(raw) orelse return error.FetchFailed;
+    return alloc.dupe(u8, latest);
+}
+
+fn fetchLatestTxt(alloc: Allocator, base_url: []const u8) ![]u8 {
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
     const url = try std.fmt.allocPrint(alloc, "{s}/latest.txt", .{base_url});
@@ -137,10 +174,21 @@ fn fetchTextBounded(
     url: []const u8,
     max_bytes: usize,
 ) ![]u8 {
+    return fetchTextBoundedWithHeaders(client, alloc, url, max_bytes, &.{});
+}
+
+fn fetchTextBoundedWithHeaders(
+    client: *std.http.Client,
+    alloc: Allocator,
+    url: []const u8,
+    max_bytes: usize,
+    extra_headers: []const std.http.Header,
+) ![]u8 {
     const uri = std.Uri.parse(url) catch return error.FetchFailed;
 
     var req = client.request(.GET, uri, .{
         .headers = requestHeaders(),
+        .extra_headers = extra_headers,
         .keep_alive = false,
     }) catch return error.FetchFailed;
     defer req.deinit();
@@ -378,6 +426,10 @@ test "GitHub upgrade URLs stay on this fork" {
     try std.testing.expectEqualStrings(
         "https://github.com/keejkrej/fx/releases/download",
         github_download_base,
+    );
+    try std.testing.expectEqualStrings(
+        "https://api.github.com/repos/keejkrej/fx/git/matching-refs/tags/v",
+        github_api_tags_url,
     );
 }
 

@@ -33,13 +33,26 @@ jobs:
         id: version
         run: |
           CURRENT=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          if ! [[ "$CURRENT" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([1-9][0-9]*))?$ ]]; then
+            echo "::error::src/main.zig version must be X.Y.Z or X.Y.Z-N"
+            exit 1
+          fi
+          MAJOR="${BASH_REMATCH[1]}"
+          MINOR="${BASH_REMATCH[2]}"
+          PATCH="${BASH_REMATCH[3]}"
+          FORK="${BASH_REMATCH[5]:-}"
           case "${{ inputs.bump }}" in
-            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-            patch) PATCH=$((PATCH + 1)) ;;
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0; FORK=1 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0; FORK=1 ;;
+            patch)
+              if [ -n "$FORK" ]; then
+                FORK=$((FORK + 1))
+              else
+                FORK=1
+              fi
+              ;;
           esac
-          NEW="${MAJOR}.${MINOR}.${PATCH}"
+          NEW="${MAJOR}.${MINOR}.${PATCH}-${FORK}"
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
           echo "new=$NEW" >> "$GITHUB_OUTPUT"
           echo "Bumping $CURRENT -> $NEW (${{ inputs.bump }})"

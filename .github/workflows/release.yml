@@ -27,8 +27,14 @@ jobs:
         id: check
         run: |
           VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::src/main.zig version is not strict SemVer"
+          if [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Fork ships are X.Y.Z-N; not publishing plain ${VERSION}"
+            exit 0
+          fi
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[1-9][0-9]*$ ]]; then
+            echo "::error::src/main.zig version must be X.Y.Z-N"
             exit 1
           fi
           TAG="v${VERSION}"
@@ -126,7 +132,7 @@ jobs:
           RELEASE_TAG: ${{ needs.check-version.outputs.version }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[1-9][0-9]*$ ]]
           echo -n "$RELEASE_TAG" > latest.txt
           chmod +x install install.ps1
           for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
@@ -145,7 +151,7 @@ jobs:
           RELEASE_TAG: ${{ needs.check-version.outputs.version }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[1-9][0-9]*$ ]]
           git tag -- "$RELEASE_TAG"
           git push origin "refs/tags/${RELEASE_TAG}"
 
@@ -163,6 +169,9 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.check-version.outputs.version }}
+          # Hyphenated tags are fork revisions (0.0.7-1), not GitHub prereleases.
+          prerelease: false
+          make_latest: true
           body_path: /tmp/release-notes.md
           files: |
             latest.txt
@@ -179,7 +188,7 @@ jobs:
           VERSION: ${{ needs.check-version.outputs.version }}
         run: |
           set -euo pipefail
-          [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[1-9][0-9]*$ ]]
           if [ -z "${BLOB_READ_WRITE_TOKEN:-}" ]; then
             echo "BLOB_READ_WRITE_TOKEN is unset; skipping official CDN publish"
             exit 0

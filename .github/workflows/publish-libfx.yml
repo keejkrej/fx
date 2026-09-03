@@ -65,30 +65,36 @@ jobs:
           fi
 
           BASE_VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if ! [[ "$BASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::src/main.zig version is not strict SemVer"
+          if ! [[ "$BASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[1-9][0-9]*)?$ ]]; then
+            echo "::error::src/main.zig version must be X.Y.Z or X.Y.Z-N"
             exit 1
           fi
           SHOULD_PUBLISH=true
+          if [ "$CHANNEL" = "stable" ] && ! [[ "$BASE_VERSION" =~ -[1-9][0-9]*$ ]]; then
+            echo "Fork stable ships are X.Y.Z-N; skipping libfx publish for ${BASE_VERSION}"
+            SHOULD_PUBLISH=false
+          fi
           if [ "$CHANNEL" = "stable" ]; then
-            TAG="v${BASE_VERSION}"
-            if git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null; then
-              TAG_SHA=$(git rev-list -n 1 "$TAG")
-              if [ "$TAG_SHA" != "$SHA" ]; then
+            if [ "$SHOULD_PUBLISH" = "true" ]; then
+              TAG="v${BASE_VERSION}"
+              if git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null; then
+                TAG_SHA=$(git rev-list -n 1 "$TAG")
+                if [ "$TAG_SHA" != "$SHA" ]; then
+                  if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+                    echo "::error::Stable tag ${TAG} points to ${TAG_SHA}, not ${SHA}"
+                    exit 1
+                  fi
+                  echo "Release workflow did not publish ${SHA}; skipping libfx stable publish"
+                  SHOULD_PUBLISH=false
+                fi
+              else
                 if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-                  echo "::error::Stable tag ${TAG} points to ${TAG_SHA}, not ${SHA}"
+                  echo "::error::Stable tag ${TAG} does not exist"
                   exit 1
                 fi
-                echo "Release workflow did not publish ${SHA}; skipping libfx stable publish"
+                echo "Release workflow did not create ${TAG}; skipping libfx stable publish"
                 SHOULD_PUBLISH=false
               fi
-            else
-              if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-                echo "::error::Stable tag ${TAG} does not exist"
-                exit 1
-              fi
-              echo "Release workflow did not create ${TAG}; skipping libfx stable publish"
-              SHOULD_PUBLISH=false
             fi
             VERSION="$BASE_VERSION"
             NPM_TAG=latest
