@@ -11,6 +11,7 @@ extern "advapi32" fn GetTokenInformation(w.HANDLE, u32, *anyopaque, u32, *u32) c
 extern "advapi32" fn ConvertSidToStringSidW(*anyopaque, *[*:0]u16) callconv(.winapi) i32;
 extern "advapi32" fn ConvertStringSecurityDescriptorToSecurityDescriptorW([*:0]const u16, u32, *?*anyopaque, ?*u32) callconv(.winapi) i32;
 extern "advapi32" fn GetSecurityDescriptorDacl(*anyopaque, *i32, *?*Acl, *i32) callconv(.winapi) i32;
+extern "advapi32" fn GetSecurityDescriptorOwner(*anyopaque, *?*anyopaque, *i32) callconv(.winapi) i32;
 extern "advapi32" fn GetSecurityInfo(w.HANDLE, u32, u32, ?*?*anyopaque, ?*?*anyopaque, ?*?*Acl, ?*?*anyopaque, *?*anyopaque) callconv(.winapi) u32;
 extern "advapi32" fn SetSecurityInfo(w.HANDLE, u32, u32, ?*anyopaque, ?*anyopaque, ?*Acl, ?*anyopaque) callconv(.winapi) u32;
 extern "advapi32" fn GetAce(*Acl, u32, *?*anyopaque) callconv(.winapi) i32;
@@ -63,10 +64,19 @@ fn descriptor(mode: u32) !*anyopaque {
     defer _ = LocalFree(sid_text);
     var buffer: [512]u16 = undefined;
     var used: usize = 0;
-    const prefix = if (mode & 0o200 != 0) std.unicode.utf8ToUtf16LeStringLiteral("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;") else std.unicode.utf8ToUtf16LeStringLiteral("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;");
-    @memcpy(buffer[0..prefix.len], prefix);
-    used += prefix.len;
     const sid_slice = std.mem.span(sid_text);
+    // Elevated tokens may default to Administrators as the object owner.
+    // Private storage must belong to the user even with such a token.
+    const owner_prefix = std.unicode.utf8ToUtf16LeStringLiteral("O:");
+    @memcpy(buffer[0..owner_prefix.len], owner_prefix);
+    used += owner_prefix.len;
+    if (used + sid_slice.len > buffer.len) return error.AccessDenied;
+    @memcpy(buffer[used..][0..sid_slice.len], sid_slice);
+    used += sid_slice.len;
+    const prefix = if (mode & 0o200 != 0) std.unicode.utf8ToUtf16LeStringLiteral("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;") else std.unicode.utf8ToUtf16LeStringLiteral("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;");
+    if (used + prefix.len > buffer.len) return error.AccessDenied;
+    @memcpy(buffer[used..][0..prefix.len], prefix);
+    used += prefix.len;
     if (used + sid_slice.len + 2 > buffer.len) return error.AccessDenied;
     @memcpy(buffer[used..][0..sid_slice.len], sid_slice);
     used += sid_slice.len;
@@ -278,6 +288,22 @@ fn rename(context: ?*anyopaque, old_dir: Io.Dir, old_path: []const u8, new_dir: 
         .NOT_SAME_DEVICE => error.CrossDevice,
         else => error.AccessDenied,
     };
+}
+
+test "Windows private descriptors explicitly name the user as owner" {
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
+    var token: [512]u8 align(8) = undefined;
+    const user = try currentSid(&token);
+    for ([_]u32{ 0o400, 0o600, 0o700 }) |mode| {
+        const sd = try descriptor(mode);
+        defer _ = LocalFree(sd);
+        var owner: ?*anyopaque = null;
+        var defaulted: i32 = 0;
+        try std.testing.expect(GetSecurityDescriptorOwner(sd, &owner, &defaulted) != 0);
+        try std.testing.expect(owner != null);
+        try std.testing.expect(EqualSid(owner.?, user) != 0);
+        try std.testing.expectEqual(@as(i32, 0), defaulted);
+    }
 }
 
 test "Windows private storage creates and verifies owner-only ACLs" {
