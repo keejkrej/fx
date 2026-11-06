@@ -37,6 +37,36 @@ fx keeps its settings and sessions in `~/.fx`, and on macOS it stores API keys a
 HOME="$(mktemp -d)" FX_DISABLE_KEYCHAIN=1 ./zig-out/bin/fx
 ```
 
+### Native Windows build
+
+The experimental Windows port builds with Zig 0.17.1. Use Windows Terminal on Windows 10 or later and install Git for Windows for its Bash executable. fx runs natively; shell-tool commands use Git Bash. An absolute `SHELL` path can select another installed Bash or Zsh executable.
+
+From PowerShell in the repository root:
+
+```powershell
+zig build -Doptimize=ReleaseSafe
+.\zig-out\bin\fx.exe --version
+.\zig-out\bin\fx.exe
+```
+
+Profiles default to `$env:USERPROFILE\.fx` when `HOME` is unset. To test with a separate profile, set `FX_HOME` to an absolute folder path before starting fx. Private files use Windows ACLs that permit the current user, SYSTEM, and Administrators. Use a local filesystem that supports ACLs, such as NTFS.
+
+Run the Windows storage and runtime checks with Node.js and Bun installed:
+
+```powershell
+zig build test-windows -Doptimize=ReleaseSafe
+bun install --cwd tests/e2e
+$env:FX_SOUND = "0"
+$env:FX_E2E_DISABLE_DOTENV = "1"
+bun test ./tests/e2e/tui-windows-native.test.ts
+```
+
+The runtime suite uses isolated profiles and a local model fixture. It exercises saved conversations, Unicode paths, shell timeouts and descendant cleanup, MCP stdio, and the interactive interface through ConPTY. The Windows workflow uploads `fx-windows-x86_64.zip` after these checks pass. The Unix unit and E2E suites remain separate CI gates.
+
+Windows support does not yet include managed `tty=true` tool terminals, process inspection and signaling tools, native browser opening, or clipboard integration. Display timestamps currently use UTC. Install updates by replacing the executable after fx exits; the Unix release installer and in-place upgrade flow do not provide Windows installation support.
+
+Session files are flushed before publication. Windows does not provide the directory `fsync` used by the Unix implementation, so this port does not promise the same recovery behavior after a power failure. Process-crash recovery and exclusive session ownership use file locks and a publication lock.
+
 ## Make a change
 
 Start each change from the latest `main`, and keep each pull request to one change. Put unrelated formatting, renames, and cleanup in their own pull requests, so each one can be reviewed and reverted on its own.

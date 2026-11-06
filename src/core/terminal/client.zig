@@ -593,6 +593,7 @@ pub const Runtime = struct {
     /// Opens the store and registry on the first request. Fails after the
     /// owned terminals were ended for exit, so none can start later.
     fn openBackend(self: *Runtime) !*Backend {
+        if (comptime builtin.target.os.tag == .windows) return error.TerminalUnavailable;
         const zio = io_mod.getIo();
         self.backend_mutex.lockUncancelable(zio);
         defer self.backend_mutex.unlock(zio);

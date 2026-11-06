@@ -2509,6 +2509,7 @@ fn writePasteFailure(alloc: Allocator, deps: RunDeps, command: []const u8, probl
 }
 
 fn setupTerminalAvailableDefault(_: ?*anyopaque) bool {
+    if (comptime builtin.target.os.tag == .windows) return @import("../shared/windows_platform.zig").isTerminal(std.Io.File.stdin().handle) and @import("../shared/windows_platform.zig").isTerminal(std.Io.File.stderr().handle);
     return std.c.isatty(std.posix.STDIN_FILENO) != 0 and
         std.c.isatty(std.posix.STDERR_FILENO) != 0;
 }
@@ -2529,7 +2530,8 @@ fn readMaskedKeyDefault(
 
     while (input.items.len < 8 * 1024) {
         var byte: [1]u8 = undefined;
-        if (try std.posix.read(std.posix.STDIN_FILENO, &byte) == 0) return error.SetupCancelled;
+        const count = if (comptime builtin.target.os.tag == .windows) try std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{&byte}) else try std.posix.read(std.posix.STDIN_FILENO, &byte);
+        if (count == 0) return error.SetupCancelled;
         switch (byte[0]) {
             '\r', '\n' => {
                 if (input.items.len == 0) continue;
@@ -2557,10 +2559,15 @@ fn readMaskedKeyDefault(
 }
 
 const MaskedKeyRawMode = struct {
-    original: std.posix.termios = undefined,
+    original: if (builtin.target.os.tag == .windows) @import("../shared/windows_platform.zig").ConsoleMode else std.posix.termios = undefined,
     active: bool = false,
 
     fn enable() !MaskedKeyRawMode {
+        if (comptime builtin.target.os.tag == .windows) {
+            const mode = try @import("../shared/windows_platform.zig").ConsoleMode.capture();
+            try mode.enable();
+            return .{ .original = mode, .active = true };
+        }
         if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or
             std.c.isatty(std.posix.STDERR_FILENO) == 0)
         {
@@ -2600,6 +2607,11 @@ const MaskedKeyRawMode = struct {
 
     fn disable(self: *MaskedKeyRawMode) void {
         if (!self.active) return;
+        if (comptime builtin.target.os.tag == .windows) {
+            self.original.restore();
+            self.active = false;
+            return;
+        }
         io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
         self.active = false;
     }

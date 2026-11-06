@@ -38,12 +38,37 @@ pub const FxHomeError = error{ FxHomeNotAbsolute, FxHomeIsRoot, FxHomeIsHome };
 /// ignored, and an empty value leaves the default. `value` must outlive the
 /// process, as an environment string does.
 pub fn useFxHome(value: []const u8, home: ?[]const u8) FxHomeError!void {
-    const trimmed = std.mem.trimEnd(u8, value, "/");
+    const is_windows = @import("builtin").target.os.tag == .windows;
+    const separators = if (is_windows) "/\\" else "/";
+    const trimmed = std.mem.trimEnd(u8, value, separators);
     if (value.len == 0) return;
     if (!std.Io.Dir.path.isAbsolute(value)) return error.FxHomeNotAbsolute;
     if (trimmed.len == 0) return error.FxHomeIsRoot;
-    if (home) |path| if (std.mem.eql(u8, trimmed, std.mem.trimEnd(u8, path, "/"))) return error.FxHomeIsHome;
+    if (is_windows) {
+        var components = std.Io.Dir.path.componentIterator(value);
+        if (components.next() == null) return error.FxHomeIsRoot;
+    }
+    if (home) |path| {
+        const home_trimmed = std.mem.trimEnd(u8, path, separators);
+        if (std.mem.eql(u8, trimmed, home_trimmed) or (is_windows and sameWindowsPath(trimmed, home_trimmed))) return error.FxHomeIsHome;
+    }
     fx_home = trimmed;
+}
+
+fn sameWindowsPath(left: []const u8, right: []const u8) bool {
+    var a = std.mem.tokenizeAny(u8, left, "/\\");
+    var b = std.mem.tokenizeAny(u8, right, "/\\");
+    while (a.next()) |part| {
+        const other = b.next() orelse return false;
+        if (!std.os.windows.eqlIgnoreCaseWtf8(part, other)) return false;
+    }
+    return b.next() == null;
+}
+
+test "Windows home comparison accepts case and separator variants" {
+    try std.testing.expect(sameWindowsPath("C:\\Users\\Example", "c:/users/example/"));
+    try std.testing.expect(sameWindowsPath("C:\\Users\\Üser", "c:/users/üser"));
+    try std.testing.expect(!sameWindowsPath("C:\\Users\\Example\\.fx", "c:/users/example"));
 }
 
 /// The folder that holds `$FX_HOME`, or null when it isn't set. fx uses it

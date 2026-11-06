@@ -1,4 +1,5 @@
 const std = @import("std");
+const windows_child = @import("windows_child.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const command_contract = @import("command_contract.zig");
@@ -1434,7 +1435,9 @@ fn executeProcessWithInput(
     var environment = try io_mod.cloneEnvironMap(scratch);
     defer environment.deinit();
     try applyCommandEnvironment(&environment, cfg);
-    var child = try std.process.spawn(io_mod.getIo(), .{
+    var windows_job: ?windows_child.Job = null;
+    defer if (windows_job) |job| job.close();
+    const spawn_options: std.process.SpawnOptions = .{
         .argv = argv,
         .stdin = if (closed_input) .pipe else .ignore,
         .stdout = .pipe,
@@ -1442,7 +1445,11 @@ fn executeProcessWithInput(
         .cwd = .{ .path = cwd },
         .environ_map = &environment,
         .pgid = if (isolate_process_group and builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) 0 else null,
-    });
+    };
+    var child = if (comptime builtin.target.os.tag == .windows)
+        try windows_child.spawn(io_mod.getIo(), spawn_options, &windows_job)
+    else
+        try std.process.spawn(io_mod.getIo(), spawn_options);
     if (child.stdin) |input| {
         input.close(io_mod.getIo());
         child.stdin = null;
@@ -1468,6 +1475,7 @@ fn executeProcessWithInput(
         null,
         process_group_id,
         .process_group,
+        windows_job,
     );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
 
@@ -1605,6 +1613,7 @@ fn executeProcessWithDetachedSession(
         &launch_failure_probe,
         process_group_id,
         .foreground_supervisor,
+        null,
     );
     // Judge the deadline at the supervisor's exit, not after the output drain.
     collected.source = reconcileForegroundTerminationSource(
@@ -1829,7 +1838,9 @@ fn executeProcessWithScriptUnisolated(
     environ_map: ?*const std.process.Environ.Map,
 ) !CollectedProcess {
     const started_ms = io_mod.milliTimestamp();
-    var child = try std.process.spawn(io_mod.getIo(), .{
+    var windows_job: ?windows_child.Job = null;
+    defer if (windows_job) |job| job.close();
+    const spawn_options: std.process.SpawnOptions = .{
         .argv = argv,
         .stdin = .pipe,
         .stdout = .pipe,
@@ -1837,7 +1848,11 @@ fn executeProcessWithScriptUnisolated(
         .cwd = .{ .path = cwd },
         .pgid = if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) 0 else null,
         .environ_map = environ_map,
-    });
+    };
+    var child = if (comptime builtin.target.os.tag == .windows)
+        try windows_child.spawn(io_mod.getIo(), spawn_options, &windows_job)
+    else
+        try std.process.spawn(io_mod.getIo(), spawn_options);
 
     var output = OutputCollector.init(scratch, cfg);
     defer output.deinit();
@@ -1863,6 +1878,7 @@ fn executeProcessWithScriptUnisolated(
         null,
         process_group_id,
         .process_group,
+        windows_job,
     );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
 
@@ -2035,6 +2051,7 @@ fn fallbackCommandArtifactDir(alloc: Allocator) ![]u8 {
 }
 
 fn currentProcessId() u64 {
+    if (comptime builtin.target.os.tag == .windows) return @import("../shared/windows_platform.zig").GetCurrentProcessId();
     return @intCast(std.c.getpid());
 }
 
@@ -2097,6 +2114,10 @@ fn executeRawInvocation(
     cwd: []const u8,
     invocation: *const shell_resolver.Invocation,
 ) !command_contract.RunCommandResult {
+    if (comptime builtin.target.os.tag == .windows) {
+        const result = try executeProcess(scratch, cfg, invocation.argv(), cwd);
+        return formatCollectedOutput(alloc, command, cwd, result);
+    }
     if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.InvalidCommandEnvironment;
     }
@@ -3208,13 +3229,14 @@ const ProcessObserver = struct {
     stdout: std.Io.File,
     stderr: std.Io.File,
     detached_pipes: bool = false,
+    windows_job: ?windows_child.Job = null,
+    windows_status: ?command_contract.CommandStatus = null,
 
     fn init(child: *std.process.Child) !ProcessObserver {
         const process_id = child.id orelse return error.SpawnFailed;
         const stdout = child.stdout orelse return error.SpawnFailed;
         const stderr = child.stderr orelse return error.SpawnFailed;
-        const detached_pipes = comptime builtin.target.os.tag != .windows and
-            builtin.target.os.tag != .wasi;
+        const detached_pipes = comptime builtin.target.os.tag != .wasi;
         if (detached_pipes) {
             child.stdout = null;
             child.stderr = null;
@@ -3242,6 +3264,18 @@ const ProcessObserver = struct {
     }
 
     fn observe(self: *ProcessObserver) ?command_contract.CommandStatus {
+        if (comptime builtin.target.os.tag == .windows) {
+            if (self.windows_status) |status| return status;
+            if (!windows_child.exited(self.process_id)) return null;
+            const term = self.waiter.child.wait(self.waiter.io) catch |err| {
+                self.windows_status = indeterminateStatus(err);
+                return self.windows_status;
+            };
+            self.waiter.completed_ms = io_mod.milliTimestamp();
+            self.windows_status = statusFromTerm(term);
+            if (self.windows_job) |job| job.terminate();
+            return self.windows_status;
+        }
         if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return null;
         if (!self.waiter.isReady()) return null;
         const term = self.waiter.awaitReady() catch |err| {
@@ -3314,7 +3348,13 @@ const ProcessObserver = struct {
         protocol: TerminationProtocol,
         intent: TerminationIntent,
     ) !void {
-        if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        if (comptime builtin.target.os.tag == .windows) {
+            if (self.windows_status == null) {
+                if (self.windows_job) |job| job.terminate();
+            }
+            return;
+        }
+        if (builtin.target.os.tag == .wasi) {
             self.waiter.child.kill(self.waiter.io);
             return;
         }
@@ -3727,11 +3767,13 @@ fn collectSpawnedProcess(
     launch_failure_probe: ?*ForegroundLaunchFailureProbe,
     process_group_id: ?std.posix.pid_t,
     termination_protocol: TerminationProtocol,
+    windows_job: ?windows_child.Job,
 ) !CollectedTermination {
     var observer = ProcessObserver.init(child) catch |err| {
         cleanupChild(child);
         return err;
     };
+    observer.windows_job = windows_job;
     defer observer.deinit();
     observer.start() catch |err| {
         debug_trace.logf(
@@ -3912,6 +3954,7 @@ fn signalProcessGroup(pid: std.posix.pid_t, signal: std.posix.SIG) !void {
 }
 
 fn terminateRemainingProcessGroup(pid: std.posix.pid_t) void {
+    if (comptime builtin.target.os.tag == .windows) return;
     signalProcessGroup(pid, std.posix.SIG.KILL) catch |err| {
         debug_trace.logf(
             "core",

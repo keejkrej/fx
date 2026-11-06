@@ -1,0 +1,50 @@
+name: Windows
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Windows x86_64
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      FX_SOUND: "0"
+      FX_AUTO_UPGRADE: "0"
+      FX_E2E_DISABLE_DOTENV: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.17.1"
+          use-cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: oven-sh/setup-bun@v2
+      - name: Build native executable
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Test private storage
+        run: zig build test-windows -Doptimize=ReleaseSafe
+      - name: Install test dependencies
+        working-directory: tests/e2e
+        run: bun install
+      - name: Exercise native runtime and console
+        run: bun test ./tests/e2e/tui-windows-native.test.ts
+      - name: Package executable
+        shell: pwsh
+        run: Compress-Archive -LiteralPath zig-out/bin/fx.exe -DestinationPath zig-out/fx-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fx-windows-x86_64
+          path: zig-out/fx-windows-x86_64.zip

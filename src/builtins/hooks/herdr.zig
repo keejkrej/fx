@@ -240,6 +240,7 @@ fn clampStatus(custom_status: ?[]const u8) ?[]const u8 {
 /// answers costs `response_wait_ms` and nothing more. A receive timeout on the
 /// socket would make `std.Io`'s reader panic on the EAGAIN it returns.
 fn drainResponse(socket: std.posix.socket_t) void {
+    if (comptime @import("builtin").target.os.tag == .windows) return;
     const deadline = io_mod.milliTimestamp() + response_wait_ms;
     var buffer: [512]u8 = undefined;
     while (true) {

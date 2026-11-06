@@ -147,7 +147,7 @@ extern "c" fn localtime_r(timer: *const std.c.time_t, result: *Tm) ?*Tm;
 /// away.
 fn localZoneAt(epoch_s: i64) Zone {
     if (builtin.is_test) return test_zone;
-    if (!builtin.link_libc or builtin.target.os.tag == .wasi) return .utc;
+    if (!builtin.link_libc or builtin.target.os.tag == .wasi or builtin.target.os.tag == .windows) return .utc;
     const timer = std.math.cast(std.c.time_t, epoch_s) orelse return .utc;
     var tm: Tm = undefined;
     if (localtime_r(&timer, &tm) == null) return .utc;

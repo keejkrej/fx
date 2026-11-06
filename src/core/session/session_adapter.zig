@@ -142,6 +142,7 @@ fn traceWiring(comptime action: []const u8, session_id: []const u8, comptime det
 }
 
 fn processId() i64 {
+    if (comptime @import("builtin").target.os.tag == .windows) return @import("../shared/windows_platform.zig").GetCurrentProcessId();
     if (comptime builtin.target.os.tag == .wasi) return 0;
     return std.c.getpid();
 }

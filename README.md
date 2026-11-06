@@ -68,6 +68,8 @@ fx ask "explain the changes in this repository"
 fx ask --json "summarize the failing tests" | jq -r .final_output
 ```
 
+For the experimental native Windows build, prerequisites, and platform limitations, see [Native Windows build](CONTRIBUTING.md#native-windows-build).
+
 ## Embed and extend
 
 | Surface | Use it for |

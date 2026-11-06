@@ -25,6 +25,7 @@ pub fn setIo(zio: std.Io) void {
 }
 
 fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
+    if (os_tag == .windows) return @import("windows_io.zig").wrap(zio);
     return if (os_tag == .macos) darwin_process_spawn.wrap(zio) else zio;
 }
 
@@ -456,7 +457,10 @@ pub fn resetEnvironForTest() void {
 pub fn getenv(key: []const u8) ?[]const u8 {
     if (global_environ) |m| return m.get(key);
     if (global_environ_block) |block| return getenvFromBlock(block, key);
-    if (global_raw_environ) |raw| return getenvFromLibc(key) orelse getenvFromRaw(raw, key);
+    if (global_raw_environ) |raw| {
+        if (comptime builtin.target.os.tag == .windows) return getenvFromRaw(raw, key);
+        return getenvFromLibc(key) orelse getenvFromRaw(raw, key);
+    }
     if (global_libc_environ) {
         if (getenvFromLibc(key)) |value| return value;
         // getenvFromLibc copies the key into a 128-byte buffer.
@@ -469,6 +473,7 @@ pub fn getenv(key: []const u8) ?[]const u8 {
 /// The environment array libc holds now, valid only until the process next
 /// changes its environment.
 fn liveLibcEnviron() ?RawEnviron {
+    if (comptime builtin.target.os.tag == .windows) return global_raw_environ;
     if (comptime !builtin.link_libc) return null;
     return @ptrCast(std.c.environ);
 }
@@ -484,7 +489,7 @@ pub const no_home_dir_reason = "HOME is not set to an absolute path";
 /// inherit `HOME` unchanged.
 pub fn homeDir() ?[]const u8 {
     // With HOME unset, FX_HOME alone names fx's files, so its parent serves.
-    const home = getenv("HOME") orelse return profile_paths.fxHomeParent();
+    const home = getenv("HOME") orelse (if (comptime builtin.target.os.tag == .windows) getenv("USERPROFILE") else null) orelse return profile_paths.fxHomeParent();
     if (!std.Io.Dir.path.isAbsolute(home)) return profile_paths.fxHomeParent();
     return home;
 }
@@ -539,7 +544,7 @@ fn getenvFromBlock(block: std.process.Environ.Block, key: []const u8) ?[]const u
     for (view.slice) |entry_z| {
         const entry = std.mem.sliceTo(entry_z, 0);
         if (entry.len <= key.len or entry[key.len] != '=') continue;
-        if (std.mem.eql(u8, entry[0..key.len], key)) return entry[key.len + 1 ..];
+        if (if (builtin.target.os.tag == .windows) std.ascii.eqlIgnoreCase(entry[0..key.len], key) else std.mem.eql(u8, entry[0..key.len], key)) return entry[key.len + 1 ..];
     }
     return null;
 }
@@ -550,7 +555,7 @@ fn getenvFromRaw(raw: RawEnviron, key: []const u8) ?[]const u8 {
     while (raw[i]) |entry_z| : (i += 1) {
         const entry = std.mem.sliceTo(entry_z, 0);
         if (entry.len <= key.len or entry[key.len] != '=') continue;
-        if (std.mem.eql(u8, entry[0..key.len], key)) return entry[key.len + 1 ..];
+        if (if (builtin.target.os.tag == .windows) std.ascii.eqlIgnoreCase(entry[0..key.len], key) else std.mem.eql(u8, entry[0..key.len], key)) return entry[key.len + 1 ..];
     }
     return null;
 }
@@ -708,8 +713,10 @@ fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
 
 /// The handle must come from an `openDir` that requested iteration. Linux returns an
 /// `O_PATH` descriptor otherwise, and `fsync` rejects those with `EBADF`.
-pub fn syncVerifiedDir(dir: std.Io.Dir) !void {
-    if (comptime builtin.target.os.tag == .windows) return error.OperationUnsupported;
+pub fn syncVerifiedDir(dir: std.Io.Dir) anyerror!void {
+    // Windows flushes file contents, but has no unprivileged directory fsync.
+    // Atomic visibility is supported; Unix power-loss guarantees do not apply.
+    if (comptime builtin.target.os.tag == .windows) return;
     while (true) {
         const rc = std.c.fsync(dir.handle);
         if (rc == 0) return;
@@ -1107,7 +1114,12 @@ pub fn makeDirRecursive(path: []const u8) !void {
     }
 }
 
-pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) anyerror![]u8 {
+    if (comptime builtin.target.os.tag == .windows) {
+        const file = try std.Io.Dir.cwd().openFile(getIo(), path, .{ .allow_directory = true });
+        defer file.close(getIo());
+        return handlePathAlloc(alloc, file.handle);
+    }
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path_z = std.mem.printSentinel(&buf, "{s}", .{path}, 0) catch return error.NameTooLong;
     var result_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -1130,6 +1142,7 @@ pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn handlePathAlloc(alloc: std.mem.Allocator, handle: std.Io.File.Handle) ![]u8 {
+    if (comptime builtin.target.os.tag == .windows) return @import("windows_platform.zig").handlePathAlloc(alloc, handle);
     if (comptime builtin.target.os.tag == .macos or builtin.target.os.tag == .ios) {
         // F_GETPATH (macOS fcntl command 50): resolve filesystem path for an fd.
         var path_buf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
@@ -1164,6 +1177,12 @@ pub fn openedFilePathAlloc(alloc: std.mem.Allocator, file: std.Io.File) ![]u8 {
 }
 
 pub fn dirRealpathAlloc(alloc: std.mem.Allocator, dir: std.Io.Dir, sub_path: []const u8) ![]u8 {
+    if (comptime builtin.target.os.tag == .windows) {
+        if (sub_path.len == 0) return handlePathAlloc(alloc, dir.handle);
+        const file = try dir.openFile(getIo(), sub_path, .{ .allow_directory = true });
+        defer file.close(getIo());
+        return handlePathAlloc(alloc, file.handle);
+    }
     if (comptime builtin.target.os.tag == .macos or builtin.target.os.tag == .ios) {
         const dir_path = handlePathAlloc(alloc, dir.handle) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,

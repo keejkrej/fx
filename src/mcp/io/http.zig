@@ -540,7 +540,7 @@ pub const Client = struct {
         const stale = fresh or c.markUsed() > c.options.max_idle_ms;
         const pool = &c.http.connection_pool;
         while (try pool.findConnection(c.io, criteria)) |kept| {
-            if (!stale and !closedByServer(kept)) return kept;
+            if (!stale and !closedByServer(c.io, kept)) return kept;
             kept.closing = true;
             pool.release(kept, c.io);
         }
@@ -705,8 +705,11 @@ fn now(io: Io) i64 {
 /// Whether the server closed or reset a kept connection while it sat idle.
 /// Nothing is due on one between requests, so anything to read, its end
 /// included, means it can't carry another.
-fn closedByServer(kept: *std.http.Client.Connection) bool {
+fn closedByServer(io: Io, kept: *std.http.Client.Connection) bool {
     if (kept.reader().bufferedLen() > 0 or kept.stream_reader.interface.bufferedLen() > 0) return true;
+    if (comptime @import("builtin").target.os.tag == .windows) {
+        return @import("windows_afd.zig").readable(io, kept.stream_reader.stream.socket.handle, 0) catch true;
+    }
     var ready = [_]std.posix.pollfd{.{ .fd = kept.stream_reader.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
     return (std.posix.poll(&ready, 0) catch return true) > 0;
 }

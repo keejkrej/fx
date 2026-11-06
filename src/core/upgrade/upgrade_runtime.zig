@@ -22,6 +22,7 @@ pub const RunResult = struct {
 };
 
 const RunError = error{
+    UnsupportedPlatform,
     FetchFailed,
     DownloadFailed,
     ChecksumFetchFailed,
@@ -39,6 +40,7 @@ pub fn run(
     channel: update_target.Channel,
     format: output_contracts.OutputFormat,
 ) RunResult {
+    if (@import("builtin").target.os.tag == .windows) return failureResult(current, channel, error.UnsupportedPlatform);
     return runInner(alloc, current, channel, format) catch |err| failureResult(current, channel, err);
 }
 
@@ -131,6 +133,7 @@ fn failureResult(
 
 fn failureMessage(err: RunError) []const u8 {
     return switch (err) {
+        error.UnsupportedPlatform => "Windows upgrades require replacing fx.exe after exiting fx",
         error.FetchFailed => "failed to fetch latest version from CDN",
         error.DownloadFailed => "failed to download release archive",
         error.ChecksumFetchFailed => "failed to fetch checksum from CDN",

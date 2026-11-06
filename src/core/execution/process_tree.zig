@@ -217,7 +217,8 @@ pub const Tracker = struct {
         self.darwin_process_witness_fd = witness.descendant_fd;
     }
 
-    pub fn refresh(self: *Tracker, root_pid: std.posix.pid_t) !void {
+    pub fn refresh(self: *Tracker, root_pid: std.posix.pid_t) anyerror!void {
+        if (comptime builtin.target.os.tag == .windows) return error.ProcessTreeUnsupported;
         const root_snapshot: ?ProcessSnapshot = captureSnapshot(self.alloc, root_pid) catch |err| switch (err) {
             error.ProcessNotFound => null,
             else => return err,

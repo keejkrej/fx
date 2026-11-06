@@ -1,4 +1,17 @@
 const std = @import("std");
+const is_windows = @import("builtin").target.os.tag == .windows;
+const windows_socket = @import("../shared/windows_socket.zig");
+const PollFd = if (is_windows) windows_socket.PollFd else std.posix.pollfd;
+const Poll = if (is_windows) windows_socket.Poll else std.posix.POLL;
+fn pollSockets(fds: []PollFd, timeout: i32) !usize {
+    if (comptime is_windows) {
+        std.debug.assert(fds.len == 1);
+        const ready = try @import("../shared/windows_afd.zig").readable(io_mod.getIo(), fds[0].fd, @intCast(@max(timeout, 0)));
+        fds[0].revents = if (ready) Poll.IN else 0;
+        return @intFromBool(ready);
+    }
+    return std.posix.poll(fds, timeout);
+}
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 
@@ -171,15 +184,15 @@ fn listenerReady(
     cancel_flag: Cancellation,
 ) !bool {
     if (cancel_flag.cancelled()) return error.Cancelled;
-    var fds = [_]std.posix.pollfd{.{
+    var fds = [_]PollFd{.{
         .fd = listener.socket.handle,
-        .events = std.posix.POLL.IN,
+        .events = Poll.IN,
         .revents = 0,
     }};
-    const ready = try std.posix.poll(&fds, poll_ms);
+    const ready = try pollSockets(&fds, poll_ms);
     if (cancel_flag.cancelled()) return error.Cancelled;
     if (ready == 0) return false;
-    if ((fds[0].revents & std.posix.POLL.IN) == 0) {
+    if ((fds[0].revents & Poll.IN) == 0) {
         return error.OAuthCallbackListenerFailed;
     }
     return true;
@@ -197,12 +210,12 @@ fn requestReadable(
             0
         else
             @intCast(@min(remaining_ms, poll_ms));
-        var fds = [_]std.posix.pollfd{.{
+        var fds = [_]PollFd{.{
             .fd = socket,
-            .events = std.posix.POLL.IN,
+            .events = Poll.IN,
             .revents = 0,
         }};
-        const ready = try std.posix.poll(&fds, wait_ms);
+        const ready = try pollSockets(&fds, wait_ms);
         if (cancel_flag.cancelled()) return error.Cancelled;
         if (ready != 0) return true;
         if (remaining_ms <= 0) return false;
@@ -444,6 +457,7 @@ fn writePreflightResponse(stream: std.Io.net.Stream, origin: []const u8) !void {
 }
 
 fn setSocketTimeouts(socket: std.posix.socket_t) void {
+    if (comptime is_windows) return @import("../shared/windows_afd.zig").setTimeouts(io_mod.getIo(), socket, socket_timeout_seconds * 1000);
     const timeout = std.posix.timeval{ .sec = socket_timeout_seconds, .usec = 0 };
     const receive_rc = std.c.setsockopt(
         socket,

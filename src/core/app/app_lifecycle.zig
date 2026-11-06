@@ -131,6 +131,7 @@ fn closerMain() void {
 pub fn closeOnHangup(turn_running: bool) void {
     if (!turn_running) return;
     const saved = request_recovery.RequestRecovery.closeActive();
+    if (comptime @import("builtin").target.os.tag == .windows) std.process.exit(1);
     debug_trace.logf("app", "event=closing cause=hangup records_saved={d} turn=left_open", .{saved});
     if (io_mod.getenv("TMUX") != null) {
         abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, std.posix.SIG.HUP);

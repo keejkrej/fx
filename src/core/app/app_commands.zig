@@ -1757,6 +1757,10 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
 }
 
 fn writeProcessSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
+    if (comptime @import("builtin").target.os.tag == .windows) {
+        try writer.print("process: pid={d}\n", .{@import("../shared/windows_platform.zig").GetCurrentProcessId()});
+        return;
+    }
     const pid = std.c.getpid();
     try writer.print("process: pid={d}", .{pid});
     if (countOpenFileDescriptors()) |fd_count| try writer.print(" open_fds={d}", .{fd_count});

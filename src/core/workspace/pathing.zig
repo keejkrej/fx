@@ -90,7 +90,7 @@ pub fn fileIdentity(
 ) file_mutation_contract.FileIdentity {
     return .{
         .device = device,
-        .inode = @intCast(stat.inode),
+        .inode = @as(u64, @bitCast(stat.inode)),
         .kind = stat.kind,
     };
 }
@@ -104,6 +104,14 @@ pub fn directoryIdentity(
 
 pub fn descriptorDevice(handle: std.Io.File.Handle) FileIdentityError!u64 {
     return switch (builtin_mod.target.os.tag) {
+        .windows => blk: {
+            const w = std.os.windows;
+            var buffer: [512]u8 align(@alignOf(w.FILE.FS_VOLUME_INFORMATION)) = undefined;
+            var status: w.IO_STATUS_BLOCK = undefined;
+            if (w.ntdll.NtQueryVolumeInformationFile(handle, &status, &buffer, buffer.len, .Volume) != .SUCCESS) return error.Unexpected;
+            const info: *const w.FILE.FS_VOLUME_INFORMATION = @ptrCast(&buffer);
+            break :blk info.VolumeSerialNumber;
+        },
         .linux => blk: {
             const linux = std.os.linux;
             while (true) {
@@ -145,6 +153,11 @@ pub fn directoryEntryDevice(
     dir: std.Io.Dir,
     component: []const u8,
 ) FileIdentityError!u64 {
+    if (comptime builtin_mod.target.os.tag == .windows) {
+        const file = dir.openFile(io_mod.getIo(), component, .{ .allow_directory = true, .follow_symlinks = false }) catch return error.Unexpected;
+        defer file.close(io_mod.getIo());
+        return descriptorDevice(file.handle);
+    }
     if (component.len > std.Io.Dir.max_path_bytes) return error.Unexpected;
     var component_z_buffer: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
     @memcpy(component_z_buffer[0..component.len], component);
@@ -499,17 +512,17 @@ fn traverseBoundedAbsoluteFileTarget(
     }
 
     const absolute = pending_scratch[0..pending_path_len];
-    path_scratch[0] = std.Io.Dir.path.sep;
-    var path_len: usize = 1;
+    var path_len = try copyPathRoot(path_scratch, absolute);
+    const root = path_scratch[0..path_len];
     var component_count: usize = 0;
     const workspace_target = pathInside(workspace_root, absolute);
-    var workspace_anchor_end: ?usize = if (workspace_target and std.mem.eql(u8, workspace_root, "/"))
-        1
+    var workspace_anchor_end: ?usize = if (workspace_target and std.mem.eql(u8, workspace_root, root))
+        root.len
     else
         null;
 
     const zio = io_mod.getIo();
-    var current_dir = std.Io.Dir.openDirAbsolute(zio, "/", .{ .follow_symlinks = false }) catch |err| {
+    var current_dir = std.Io.Dir.openDirAbsolute(zio, root, .{ .follow_symlinks = false }) catch |err| {
         return mapDirOpenError(err);
     };
     defer current_dir.close(zio);
@@ -645,9 +658,7 @@ fn resolveBoundedIntermediateSymlink(
 
     const link_target = pending_scratch[0..link_len];
     var resolved_len: usize = if (std.Io.Dir.path.isAbsolute(link_target)) absolute: {
-        if (output_scratch.len == 0) return error.InvalidPath;
-        output_scratch[0] = std.Io.Dir.path.sep;
-        break :absolute 1;
+        break :absolute try copyPathRoot(output_scratch, link_target);
     } else parent_path_end;
 
     if (resolved_len > output_scratch.len) return error.InvalidPath;
@@ -667,18 +678,18 @@ const PathComponentIterator = struct {
     fn init(path: []const u8) PathComponentIterator {
         return .{
             .path = path,
-            .index = if (path.len > 0 and path[0] == std.Io.Dir.path.sep) 1 else 0,
+            .index = if (std.Io.Dir.path.componentIterator(path).root()) |root| root.len else 0,
         };
     }
 
     fn next(self: *PathComponentIterator) ?[]const u8 {
-        while (self.index < self.path.len and self.path[self.index] == std.Io.Dir.path.sep) {
+        while (self.index < self.path.len and std.Io.Dir.path.isSep(self.path[self.index])) {
             self.index += 1;
         }
         if (self.index >= self.path.len) return null;
 
         const start = self.index;
-        while (self.index < self.path.len and self.path[self.index] != std.Io.Dir.path.sep) {
+        while (self.index < self.path.len and !std.Io.Dir.path.isSep(self.path[self.index])) {
             self.index += 1;
         }
         const end = self.index;
@@ -710,8 +721,7 @@ fn normalizeAbsolutePathInto(scratch: []u8, raw_path: []const u8) FileTargetReso
     if (!std.Io.Dir.path.isAbsolute(raw_path)) return error.InvalidPath;
     if (scratch.len == 0) return error.InvalidPath;
 
-    scratch[0] = std.Io.Dir.path.sep;
-    var len: usize = 1;
+    var len = try copyPathRoot(scratch, raw_path);
     try normalizeRelativePathPartInto(scratch, &len, raw_path);
     return scratch[0..len];
 }
@@ -724,8 +734,7 @@ fn normalizeBaseRelativePathInto(
     if (!std.Io.Dir.path.isAbsolute(base_abs)) return error.InvalidPath;
     if (scratch.len == 0) return error.InvalidPath;
 
-    scratch[0] = std.Io.Dir.path.sep;
-    var len: usize = 1;
+    var len = try copyPathRoot(scratch, base_abs);
     try normalizeRelativePathPartInto(scratch, &len, base_abs);
     try normalizeRelativePathPartInto(scratch, &len, relative_path);
     return scratch[0..len];
@@ -736,15 +745,15 @@ fn normalizeRelativePathPartInto(
     path_len: *usize,
     raw_path: []const u8,
 ) FileTargetResolveError!void {
-    var index: usize = 0;
+    var index: usize = if (std.Io.Dir.path.componentIterator(raw_path).root()) |root| root.len else 0;
     while (index < raw_path.len) {
-        while (index < raw_path.len and raw_path[index] == std.Io.Dir.path.sep) {
+        while (index < raw_path.len and std.Io.Dir.path.isSep(raw_path[index])) {
             index += 1;
         }
         if (index >= raw_path.len) return;
 
         const start = index;
-        while (index < raw_path.len and raw_path[index] != std.Io.Dir.path.sep) : (index += 1) {
+        while (index < raw_path.len and !std.Io.Dir.path.isSep(raw_path[index])) : (index += 1) {
             if (raw_path[index] == 0) return error.InvalidPath;
         }
         const component = raw_path[start..index];
@@ -760,13 +769,24 @@ fn normalizeRelativePathPartInto(
 }
 
 fn popNormalizedPathComponent(path: []const u8, path_len: *usize) void {
-    if (path_len.* <= 1) return;
+    const root_len = if (std.Io.Dir.path.componentIterator(path[0..path_len.*]).root()) |root| root.len else 1;
+    if (path_len.* <= root_len) return;
 
     var index = path_len.* - 1;
-    while (index > 0 and path[index] != std.Io.Dir.path.sep) {
+    while (index > root_len and !std.Io.Dir.path.isSep(path[index])) {
         index -= 1;
     }
-    path_len.* = if (index == 0) 1 else index;
+    path_len.* = @max(root_len, index);
+}
+
+fn copyPathRoot(scratch: []u8, path: []const u8) FileTargetResolveError!usize {
+    const root = std.Io.Dir.path.componentIterator(path).root() orelse return error.InvalidPath;
+    if (root.len == 0 or root.len > scratch.len) return error.InvalidPath;
+    @memcpy(scratch[0..root.len], root);
+    for (scratch[0..root.len]) |*byte| {
+        if (std.Io.Dir.path.isSep(byte.*)) byte.* = std.Io.Dir.path.sep;
+    }
+    return root.len;
 }
 
 fn appendBoundedPathComponent(
@@ -778,7 +798,7 @@ fn appendBoundedPathComponent(
         return error.InvalidPath;
     }
 
-    const needs_separator = path_len.* > 1;
+    const needs_separator = path_len.* != 0 and !std.Io.Dir.path.isSep(scratch[path_len.* - 1]);
     const required_len = path_len.* + component.len + @intFromBool(needs_separator);
     if (required_len > scratch.len) return error.InvalidPath;
 

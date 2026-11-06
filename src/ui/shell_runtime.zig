@@ -11,6 +11,7 @@ const cursor_probe = @import("terminal/cursor_probe.zig");
 const resize_runtime = @import("resize_runtime.zig");
 const ui_terminal = @import("terminal/terminal.zig");
 const wasm_terminal = if (builtin.target.os.tag == .wasi) @import("terminal/wasm_terminal.zig") else struct {};
+const windows = @import("../core/shared/windows_platform.zig");
 
 const Allocator = std.mem.Allocator;
 const Layout = types.Layout;
@@ -36,7 +37,7 @@ extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname(fd: c_int) ?[*:0]u8;
 
 pub const supports_resize_signal = resize_runtime.supports_resize_signal;
-pub const ResizeHandler = if (builtin.target.os.tag == .wasi)
+pub const ResizeHandler = if (builtin.target.os.tag == .wasi or builtin.target.os.tag == .windows)
     *const fn () callconv(.c) void
 else
     std.posix.Sigaction.handler_fn;
@@ -63,8 +64,8 @@ pub const AlternateScreenOwner = enum {
 };
 
 pub const TerminalState = struct {
-    stdin_fd: std.posix.fd_t = std.posix.STDIN_FILENO,
-    original_termios: std.posix.termios = undefined,
+    stdin_fd: std.posix.fd_t = if (builtin.target.os.tag == .windows) std.os.windows.INVALID_HANDLE_VALUE else std.posix.STDIN_FILENO,
+    original_termios: if (builtin.target.os.tag == .windows) windows.ConsoleMode else std.posix.termios = undefined,
     raw_enabled: bool = false,
     alternate_screen_owner: AlternateScreenOwner = .none,
     alternate_frame_layout: frame_layout.CommittedLayoutSnapshot = .{},
@@ -85,6 +86,10 @@ pub const TerminalState = struct {
     }
 
     pub fn ensureInteractive(self: TerminalState) !void {
+        if (comptime builtin.target.os.tag == .windows) {
+            if (!windows.isTerminal(std.Io.File.stdin().handle) or !windows.isTerminal(std.Io.File.stdout().handle)) return error.NotATerminal;
+            return;
+        }
         if (comptime builtin.target.os.tag == .wasi) return;
         if (std.c.isatty(self.stdin_fd) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
             return error.NotATerminal;
@@ -94,11 +99,21 @@ pub const TerminalState = struct {
     }
 
     pub fn captureOriginalTermios(self: *TerminalState) !void {
+        if (comptime builtin.target.os.tag == .windows) {
+            self.stdin_fd = std.Io.File.stdin().handle;
+            self.original_termios = try windows.ConsoleMode.capture();
+            return;
+        }
         if (comptime builtin.target.os.tag == .wasi) return;
         self.original_termios = try io_mod.tcgetattr(self.stdin_fd);
     }
 
     pub fn enableRawMode(self: *TerminalState) !void {
+        if (comptime builtin.target.os.tag == .windows) {
+            try self.original_termios.enable();
+            self.raw_enabled = true;
+            return;
+        }
         if (comptime builtin.target.os.tag == .wasi) {
             self.raw_enabled = true;
             return;
@@ -134,6 +149,11 @@ pub const TerminalState = struct {
 
     pub fn disableRawMode(self: *TerminalState) void {
         if (!self.raw_enabled) return;
+        if (comptime builtin.target.os.tag == .windows) {
+            self.original_termios.restore();
+            self.raw_enabled = false;
+            return;
+        }
         if (comptime builtin.target.os.tag != .wasi) {
             io_mod.tcsetattr(self.stdin_fd, .FLUSH, self.original_termios) catch {};
         }
@@ -243,6 +263,7 @@ pub const TerminalState = struct {
     }
 
     pub fn read(self: TerminalState, out: []u8) !usize {
+        if (comptime builtin.target.os.tag == .windows) return std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{out});
         if (comptime builtin.target.os.tag == .wasi) {
             return std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{out});
         }
@@ -250,6 +271,7 @@ pub const TerminalState = struct {
     }
 
     pub fn pollInput(self: TerminalState, timeout_ms: i32) !PollResult {
+        if (comptime builtin.target.os.tag == .windows) return .{ .readable = try windows.poll(std.Io.File.stdin().handle, timeout_ms) };
         if (comptime builtin.target.os.tag == .wasi) {
             return switch (wasm_terminal.pollInput(timeout_ms)) {
                 1 => .{ .readable = true },

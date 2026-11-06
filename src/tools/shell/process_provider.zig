@@ -19,6 +19,7 @@ fn captureToken(
     alloc: Allocator,
     pid_text: []const u8,
 ) process_provider.ProviderError!process_identity.ProcessInstanceToken {
+    if (comptime builtin.target.os.tag == .windows) return error.ProcessIdentityUnsupported;
     const pid = std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch
         return error.InvalidPid;
     return switch (builtin.target.os.tag) {
@@ -222,6 +223,7 @@ fn signalProcess(
     pid_text: []const u8,
     expected: process_identity.ProcessInstanceToken,
 ) process_provider.ProviderError!void {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.Unsupported;
     switch (matchToken(context, alloc, pid_text, expected)) {
         .matched => {},
         .missing, .mismatched => return error.ProcessIdentityMismatch,

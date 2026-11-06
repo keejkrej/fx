@@ -275,6 +275,12 @@ pub const Storage = struct {
     pub fn syncDir(s: Storage, dir: Dir) Error!void {
         try s.alive();
         try s.mutate();
+        if (comptime @import("builtin").target.os.tag == .windows) {
+            // No directory fsync on Windows. File syncs remain real; fault
+            // hooks model process crashes, not durable namespace persistence.
+            if (hooks) if (s.fault) |f| try f.noteDirSync(s, dir);
+            return;
+        }
         const as_file: Io.File = .{ .handle = dir.handle.handle, .flags = .{ .nonblocking = false } };
         as_file.sync(s.io) catch |err| return translate(err);
         if (hooks) if (s.fault) |f| try f.noteDirSync(s, dir);
