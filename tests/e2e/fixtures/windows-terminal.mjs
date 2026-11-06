@@ -22,7 +22,9 @@ async function until(predicate, label) {
 let code = 0;
 try {
   await until(() => screen().includes("local-model"), "composer");
-  child.write("Hello café 日本語\r");
+  child.write("Hello café 日本語");
+  await until(() => screen().includes("Hello café 日本語"), "Unicode input");
+  child.write("\r");
   await until(() => screen().includes("Windows response: café 日本語"), "answer");
   assert.ok(screen().includes("Hello café 日本語"));
   assert.ok(screen().includes("windows-shell-ok"));
@@ -39,6 +41,7 @@ try {
   console.log(screen());
 } catch (error) {
   console.error(error);
+  console.error(`Terminal screen:\n${screen()}\nTerminal stream:\n${JSON.stringify(raw)}`);
   code = 1;
 } finally {
   if (!exit) child.kill();

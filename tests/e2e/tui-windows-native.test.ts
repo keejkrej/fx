@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { FX_BIN, createIsolatedTestHome, cleanupIsolatedTestHome } from "../evals/eval-helpers";
 import { completion, toolCompletion } from "./fixtures/chat-completions";
@@ -91,7 +91,7 @@ describe.skipIf(process.platform !== "win32")("native Windows", () => {
     expect(resumed.final_output).toBe(answer);
     const sessions = JSON.parse((await f.run(["sessions", "--json"])).stdout);
     expect(sessions.count).toBe(1);
-    expect(sessions.sessions[0].workspace_root).toBe(f.workspace);
+    expect(sessions.sessions[0].workspace_root).toBe(realpathSync.native(f.workspace));
   }, 30000);
 
   test("timeout stops descendants without crashing or leaving a delayed writer", async () => {
@@ -132,6 +132,7 @@ describe.skipIf(process.platform !== "win32")("native Windows", () => {
     });
     expect(result.stderr).toBe("");
     expect(result.stdout).toContain(answer);
+    expect(f.requests[0].messages.some((message: any) => message.role === "user" && message.content === "Hello café 日本語")).toBe(true);
     const sessions = JSON.parse((await f.run(["sessions", "--json"])).stdout);
     expect(sessions.count).toBe(1);
   }, 40000);
