@@ -2530,7 +2530,7 @@ fn readMaskedKeyDefault(
 
     while (input.items.len < 8 * 1024) {
         var byte: [1]u8 = undefined;
-        const count = if (comptime builtin.target.os.tag == .windows) try std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{&byte}) else try std.posix.read(std.posix.STDIN_FILENO, &byte);
+        const count = if (comptime builtin.target.os.tag == .windows) try @import("../shared/windows_platform.zig").readStdin(io_mod.getIo(), &byte) else try std.posix.read(std.posix.STDIN_FILENO, &byte);
         if (count == 0) return error.SetupCancelled;
         switch (byte[0]) {
             '\r', '\n' => {

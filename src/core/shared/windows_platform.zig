@@ -43,6 +43,7 @@ extern "kernel32" fn GetFileType(w.HANDLE) callconv(.winapi) u32;
 extern "kernel32" fn PeekNamedPipe(w.HANDLE, ?*anyopaque, u32, ?*u32, *u32, ?*u32) callconv(.winapi) i32;
 extern "kernel32" fn PeekConsoleInputW(w.HANDLE, *InputRecord, u32, *u32) callconv(.winapi) i32;
 extern "kernel32" fn ReadConsoleInputW(w.HANDLE, *InputRecord, u32, *u32) callconv(.winapi) i32;
+extern "kernel32" fn ReadConsoleW(w.HANDLE, *u16, u32, *u32, ?*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn GetFinalPathNameByHandleW(w.HANDLE, [*]u16, u32, u32) callconv(.winapi) u32;
 const Coord = extern struct { x: i16, y: i16 };
 const Rect = extern struct { left: i16, top: i16, right: i16, bottom: i16 };
@@ -60,6 +61,7 @@ pub fn screenInfo() !ScreenInfo {
     return info;
 }
 pub fn poll(handle: w.HANDLE, timeout_ms: i32) !bool {
+    if (handle == std.Io.File.stdin().handle and console_input.length != 0) return true;
     const started = GetTickCount64();
     const console = isTerminal(handle);
     const pipe = !console and GetFileType(handle) == 3;
@@ -100,6 +102,27 @@ pub fn poll(handle: w.HANDLE, timeout_ms: i32) !bool {
         if (remaining == 0) return false;
     }
 }
+
+// Console input has one reader at a time. Keep pending UTF-8 bytes on that
+// reader's thread because callers can request as little as one byte.
+threadlocal var console_input: ConsoleInput = .{};
+const ConsoleInput = @import("windows_console_input.zig").ConsoleInput;
+
+pub fn readStdin(io: std.Io, out: []u8) !usize {
+    if (out.len == 0) return 0;
+    const file = std.Io.File.stdin();
+    if (!isTerminal(file.handle)) return file.readStreaming(io, &.{out});
+    while (console_input.length == 0) {
+        var unit: u16 = undefined;
+        var count: u32 = 0;
+        // ReadFile's CP_UTF8 conversion loses non-ASCII input on older ConPTY.
+        if (ReadConsoleW(file.handle, &unit, 1, &count, null) == 0) return error.InputOutput;
+        if (count == 0) return 0;
+        console_input.feed(unit);
+    }
+    return console_input.take(out);
+}
+
 pub fn handlePathAlloc(alloc: std.mem.Allocator, handle: w.HANDLE) ![]u8 {
     var buffer: [32768]u16 = undefined;
     const len = GetFinalPathNameByHandleW(handle, &buffer, buffer.len, 0);

@@ -263,7 +263,7 @@ pub const TerminalState = struct {
     }
 
     pub fn read(self: TerminalState, out: []u8) !usize {
-        if (comptime builtin.target.os.tag == .windows) return std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{out});
+        if (comptime builtin.target.os.tag == .windows) return windows.readStdin(io_mod.getIo(), out);
         if (comptime builtin.target.os.tag == .wasi) {
             return std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{out});
         }

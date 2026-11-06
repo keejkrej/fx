@@ -61,7 +61,9 @@ $env:FX_E2E_DISABLE_DOTENV = "1"
 bun test ./tests/e2e/tui-windows-native.test.ts
 ```
 
-The runtime suite uses isolated profiles and a local model fixture. It exercises saved conversations, Unicode paths, shell timeouts and descendant cleanup, MCP stdio, and the interactive interface through ConPTY. The Windows workflow uploads `fx-windows-x86_64.zip` after these checks pass. The Unix unit and E2E suites remain separate CI gates.
+The runtime suite uses isolated profiles and a local model fixture. It exercises saved conversations, Unicode paths, shell timeouts and descendant cleanup, MCP stdio, and the interactive interface through ConPTY. The Windows workflow builds and tests on x64 and ARM64 runners, then uploads `fx-windows-x64.zip` and `fx-windows-arm64.zip`. The Unix unit and E2E suites remain separate CI gates.
+
+Windows-only prereleases use `v<upstream-version>-windows.<revision>`, for example `v0.0.16-windows.1`. Increment the Windows revision for fixes based on the same upstream version. The executable continues to report the upstream version; the release tag identifies the Windows package revision.
 
 Windows support does not yet include managed `tty=true` tool terminals, process inspection and signaling tools, native browser opening, or clipboard integration. Display timestamps currently use UTC. Install updates by replacing the executable after fx exits; the Unix release installer and in-place upgrade flow do not provide Windows installation support.
 

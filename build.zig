@@ -108,7 +108,14 @@ pub fn build(b: *std.Build) void {
                 .mode = .simple,
             },
         });
-        b.step("test-windows", "Test Windows private storage and file publication").dependOn(&b.addRunArtifact(windows_tests).step);
+        const windows_test_step = b.step("test-windows", "Test Windows storage, sockets, and console input");
+        windows_test_step.dependOn(&b.addRunArtifact(windows_tests).step);
+        const input_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/core/shared/windows_console_input.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) });
+        windows_test_step.dependOn(&b.addRunArtifact(input_tests).step);
     }
 
     const run_cmd = b.addRunArtifact(exe);

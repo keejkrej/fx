@@ -1243,7 +1243,7 @@ fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
 fn discardStdinLine() void {
     var buf: [256]u8 = undefined;
     while (true) {
-        const n = (if (comptime @import("builtin").target.os.tag == .windows) std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{&buf}) else std.posix.read(std.posix.STDIN_FILENO, &buf)) catch return;
+        const n = (if (comptime @import("builtin").target.os.tag == .windows) @import("../shared/windows_platform.zig").readStdin(io_mod.getIo(), &buf) else std.posix.read(std.posix.STDIN_FILENO, &buf)) catch return;
         if (n == 0) return;
         if (std.mem.findScalar(u8, buf[0..n], '\n') != null) return;
     }
@@ -1444,11 +1444,11 @@ const TeamPickerKey = union(enum) {
 fn readTeamPickerKey() !TeamPickerKey {
     if (comptime builtin.target.os.tag == .windows) {
         var bytes: [8]u8 = undefined;
-        var len = try std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{bytes[0..1]});
+        var len = try @import("../shared/windows_platform.zig").readStdin(io_mod.getIo(), bytes[0..1]);
         if (len == 0) return .ignored;
         while (bytes[0] == 0x1b and len < bytes.len and !escapeSequenceComplete(bytes[0..len])) {
             if (!try @import("../shared/windows_platform.zig").poll(std.Io.File.stdin().handle, 25)) break;
-            const n = try std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{bytes[len .. len + 1]});
+            const n = try @import("../shared/windows_platform.zig").readStdin(io_mod.getIo(), bytes[len .. len + 1]);
             if (n == 0) break;
             len += n;
         }

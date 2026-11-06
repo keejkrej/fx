@@ -404,7 +404,7 @@ const StdinManualCodeReader = struct {
 
         var chunk: [512]u8 = undefined;
         defer @memset(&chunk, 0);
-        const read_len = if (comptime @import("builtin").target.os.tag == .windows) try std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{&chunk}) else try std.posix.read(std.posix.STDIN_FILENO, &chunk);
+        const read_len = if (comptime @import("builtin").target.os.tag == .windows) try @import("../shared/windows_platform.zig").readStdin(io_mod.getIo(), &chunk) else try std.posix.read(std.posix.STDIN_FILENO, &chunk);
         if (read_len == 0) {
             self.closed = true;
             return if (self.len == 0) null else self.buffer[0..self.len];
