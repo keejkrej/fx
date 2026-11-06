@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 
 type Category =
   | "frame_commit"
@@ -39,18 +39,21 @@ type StdioProvenance = {
 const allowlist: AllowRule[] = [
   rule("src/ui/transcript/io.zig", "writeFrameBytes", /stdio_write/, "frame_commit", "normal interactive frame delivery"),
   rule("src/ui/transcript/runtime.zig", "<top-level>", /stdio_acquisition/, "interactive_terminal_owner", "stored interactive stdout handle"),
+  rule("src/ui/transcript/runtime.zig", "initBacking", /stdio_acquisition/, "interactive_terminal_owner", "initialize the Windows stdout handle after process startup"),
+  rule("src/core/shared/windows_platform.zig", "(?:screenInfo|capture)", /stdio_acquisition/, "terminal_probe", "Windows console geometry and mode queries"),
+  rule("src/core/shared/windows_platform.zig", "(?:enable|restore)", /stdio_acquisition/, "initialization_teardown", "Windows console mode setup and restoration"),
+  rule("src/core/shared/windows_test_runner.zig", "main", /debug_print/, "tests", "Windows unit test diagnostics"),
   rule("src/core/app/app_lifecycle.zig", "writeLifecycleTerminalBytes", /stdio_write/, "initialization_teardown", "interactive startup and teardown control"),
   rule("src/ui/shell_runtime.zig", "clearTmuxScreenAndHistory", /stdio_(?:acquisition|write)/, "terminal_reset", "tmux pane reset before history cleanup"),
   rule("src/ui/shell_runtime.zig", "enableThemeNotifications", /stdio_(?:acquisition|write)/, "initialization_teardown", "terminal theme notification control"),
   rule("src/core/app/app_lifecycle.zig", "abnormalExitHandlerWithRestore", /(?:fixed_descriptor|raw_fd_write)/, "crash_recovery", "async-signal-safe terminal restoration"),
   rule("src/core/hosts/wasm_panic.zig", "panicToStderr", /debug_print/, "crash_recovery", "WASM panic message before trap"),
-  rule("src/ui/shell_runtime.zig", "ensureInteractive", /fixed_descriptor/, "terminal_probe", "TTY capability probe"),
+  rule("src/ui/shell_runtime.zig", "ensureInteractive", /(?:fixed_descriptor|stdio_acquisition)/, "terminal_probe", "TTY capability probe"),
   rule("src/ui/shell_runtime.zig", "(?:query|requestResize)CursorPosition", /stdio_(?:acquisition|write)/, "terminal_probe", "cursor-position query"),
   rule("src/ui/shell_runtime.zig", "(?:requestThemeColorScheme|requestThemeResponseFence|requestThemeBackground)", /stdio_(?:acquisition|write)/, "terminal_probe", "terminal theme query"),
   rule("src/ui/terminal/theme_detection.zig", "queryTerminalBackground", /stdio_(?:acquisition|write)/, "terminal_probe", "terminal background query"),
-  rule("src/ui/ask_presentation.zig", "init", /fixed_descriptor/, "terminal_probe", "ask stdout geometry probe"),
   rule("src/ui/ask_presentation.zig", "init", /stdio_acquisition/, "interactive_terminal_owner", "stored ask presenter stdout handle"),
-  rule("src/ui/ask_presentation.zig", "refreshGeometry", /fixed_descriptor/, "terminal_probe", "ask stdout geometry refresh"),
+  rule("src/ui/ask_presentation.zig", "refreshGeometry", /(?:fixed_descriptor|stdio_acquisition)/, "terminal_probe", "ask stdout geometry refresh"),
   rule("src/ui/ask_presentation.zig", "writeTerminalBytes", /stdio_write/, "initialization_teardown", "ask terminal prepare and restore control"),
   rule("src/acp/jsonrpc.zig", ".+", /stdio_(?:acquisition|write)/, "acp_protocol_transport", "ACP JSON-RPC transport"),
   rule("src/core/execution/command_runner.zig", "(?:runForegroundSessionBootstrap|writeForegroundSessionReplaceFailure)", /stdio_acquisition_write/, "subprocess_protocol_transport", "foreground command bootstrap protocol"),
@@ -64,8 +67,8 @@ const allowlist: AllowRule[] = [
   rule("src/core/mcp_host/mcp_call_client.zig", "stdoutIsTerminal", /stdio_acquisition/, "terminal_probe", "fx mcp call result summary TTY probe"),
   rule("src/core/cli/cli_replay.zig", "(?:writeStdout|writeStderr)", /stdio_acquisition_write/, "noninteractive_output", "replay process output"),
   rule("src/core/cli/cli_surface.zig", "(?:writeRealStdout|writeRealStderr|writeFdAll)", /(?:stdio_acquisition_write|fixed_fd_write|raw_fd_write|delegated_fd_write)/, "noninteractive_output", "top-level CLI output"),
-  rule("src/core/cli/cli_surface.zig", "(?:setupTerminalAvailableDefault|enable)", /fixed_descriptor/, "terminal_probe", "masked setup prompt TTY and raw-mode setup"),
-  rule("src/core/auth/login_flow.zig", "(?:canUseInteractiveTeamPicker|enable)", /fixed_descriptor/, "terminal_probe", "auth login team-picker TTY probe"),
+  rule("src/core/cli/cli_surface.zig", "(?:setupTerminalAvailableDefault|enable)", /(?:fixed_descriptor|stdio_acquisition)/, "terminal_probe", "masked setup prompt TTY and raw-mode setup"),
+  rule("src/core/auth/login_flow.zig", "(?:canUseInteractiveTeamPicker|enable)", /(?:fixed_descriptor|stdio_acquisition)/, "terminal_probe", "auth login team-picker TTY probe"),
   rule("src/core/auth/login_flow.zig", "writeStdout", /stdio_acquisition_write/, "noninteractive_output", "CLI auth login output"),
   rule("src/core/auth/chatgpt_oauth.zig", "writeStdout", /stdio_acquisition_write/, "noninteractive_output", "Codex CLI login output"),
   rule("src/core/auth/grok_oauth.zig", "writeStdout", /stdio_acquisition_write/, "noninteractive_output", "Grok CLI login output"),
@@ -95,7 +98,7 @@ function listZigFiles(root: string, directory = "src"): string[] {
   if (!existsSync(absolute)) return [];
   const files: string[] = [];
   for (const entry of readdirSync(absolute)) {
-    const path = join(directory, entry);
+    const path = join(directory, entry).split(sep).join("/");
     const metadata = statSync(join(root, path));
     if (metadata.isDirectory()) files.push(...listZigFiles(root, path));
     else if (entry.endsWith(".zig")) files.push(path);
