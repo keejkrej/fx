@@ -19,6 +19,10 @@ pub const ShellKind = enum { bash, zsh };
 
 pub fn shellKind(path: []const u8) ?ShellKind {
     const basename = std.Io.Dir.path.basename(path);
+    if (comptime builtin.target.os.tag == .windows) {
+        if (std.ascii.eqlIgnoreCase(basename, "bash.exe")) return .bash;
+        if (std.ascii.eqlIgnoreCase(basename, "zsh.exe")) return .zsh;
+    }
     if (std.mem.eql(u8, basename, "bash")) return .bash;
     if (std.mem.eql(u8, basename, "zsh")) return .zsh;
     return null;
@@ -104,6 +108,22 @@ pub fn resolve(
 }
 
 pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
+    if (comptime builtin.target.os.tag == .windows) {
+        const io_mod = @import("../shared/io.zig");
+        if (io_mod.getenv("SHELL")) |shell| {
+            if (std.Io.Dir.path.isAbsolute(shell) and shellKind(shell) != null and shell.len <= buffer.len) {
+                @memcpy(buffer[0..shell.len], shell);
+                return buffer[0..shell.len];
+            }
+        }
+        for ([_][]const u8{ "ProgramFiles", "ProgramW6432", "LOCALAPPDATA" }) |key| {
+            const root = io_mod.getenv(key) orelse continue;
+            const path = std.mem.print(buffer, "{s}/{s}Git/bin/bash.exe", .{ root, if (std.mem.eql(u8, key, "LOCALAPPDATA")) "Programs/" else "" }) catch continue;
+            const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{}) catch continue;
+            if (stat.kind == .file) return path;
+        }
+        return null;
+    }
     if (comptime !builtin.link_libc or builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return null;
     }
@@ -223,7 +243,7 @@ pub fn capturedInvocation(
         },
         .user => |path| {
             var invocation = try resolve(path, .user_login);
-            if (std.mem.eql(u8, std.Io.Dir.path.basename(path), "bash")) {
+            if (shellKind(path) == .bash) {
                 removeInteractiveFlag(&invocation);
                 invocation.append("-O");
                 invocation.append("expand_aliases");

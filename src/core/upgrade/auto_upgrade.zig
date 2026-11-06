@@ -43,6 +43,7 @@ pub const RelaunchRequest = struct {
 };
 
 pub fn shouldEnableForCurrentExecutable() bool {
+    if (@import("builtin").target.os.tag == .windows) return false;
     var exe_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const n = std.process.executablePath(io_mod.getIo(), &exe_buf) catch return true;
     return !isDevelopmentBuildPath(exe_buf[0..n]);

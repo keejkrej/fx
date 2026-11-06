@@ -12,6 +12,7 @@
     "tui-performance.test.ts": "The suite is an opt-in percentile benchmark with a live-provider smoke; the Benchmarks workflow owns its deterministic gate.",
     "tui-render-lab.test.ts": "The suite validates render-lab infrastructure and owns separate native opt-in scenarios.",
     "tui-render-live-stress.test.ts": "The suite requires a real model credential and explicit live stress opt-in.",
+    "tui-windows-native.test.ts": "Windows console, ACL and process-job coverage runs on Windows CI; PGSO targets Linux and macOS.",
     "web-fetch-live.test.ts": "The suite requires explicit live-network opt-in.",
     "web-search-live.test.ts": "The suite requires a real model credential and live provider responses."
   },

@@ -19,6 +19,8 @@
 //! helper process stops what is left once the program is gone (`helper`).
 
 const std = @import("std");
+const is_windows = @import("builtin").target.os.tag == .windows;
+const windows_process = @import("windows_process.zig");
 const core = @import("../core/stdio_conn.zig");
 const wire = @import("../protocol/wire.zig");
 const lines = @import("lines.zig");
@@ -82,6 +84,7 @@ const helper = struct {
 
     /// Starts it, once, before the first server.
     fn start(io: std.Io) void {
+        if (comptime is_windows) return;
         mutex.lockUncancelable(io);
         defer mutex.unlock(io);
         if (started) return;
@@ -92,7 +95,7 @@ const helper = struct {
             .stdout = .ignore,
             .stderr = .ignore,
             // Its own group, so the terminal's Ctrl-C doesn't reach it.
-            .pgid = 0,
+            .pgid = if (is_windows) null else 0,
         }) catch return;
         const fd = child.stdin.?.handle;
         // A write never waits on it.
@@ -104,6 +107,7 @@ const helper = struct {
     /// Tells it a group started (`sign` '+') or was reaped ('-'). One that
     /// can't be told is stopped, so it never acts on a list out of date.
     fn tell(io: std.Io, sign: u8, group: std.posix.pid_t) void {
+        if (comptime is_windows) return;
         mutex.lockUncancelable(io);
         defer mutex.unlock(io);
         const fd = stdin orelse return;
@@ -261,6 +265,7 @@ pub const Process = struct {
     pid_lock: std.Io.Mutex = .init,
     /// Set while the current process is unreaped.
     pid: ?std.posix.pid_t = null,
+    windows_job: ?windows_process.Job = null,
     stdin: ?*Stdin = null,
     /// The bytes behind the last `message` or `stderr` returned by `next`.
     held: ?[]u8 = null,
@@ -318,8 +323,15 @@ pub const Process = struct {
         p.pid_lock.lockUncancelable(p.io);
         if (p.pid) |pid| {
             // The whole group, as `signal` does.
-            std.posix.kill(-pid, .KILL) catch std.posix.kill(pid, .KILL) catch {};
-            _ = std.c.waitpid(pid, null, 0);
+            if (comptime is_windows) {
+                if (p.windows_job) |job| job.terminate() else windows_process.terminate(pid);
+                windows_process.reap(pid);
+                if (p.windows_job) |job| job.close();
+                p.windows_job = null;
+            } else {
+                std.posix.kill(-pid, .KILL) catch std.posix.kill(pid, .KILL) catch {};
+                _ = std.c.waitpid(pid, null, 0);
+            }
             helper.tell(p.io, '-', pid);
             p.pid = null;
         }
@@ -488,7 +500,8 @@ pub const Process = struct {
         std.debug.assert(p.stdin == null);
         helper.start(p.io);
         const stdin = try p.gpa.create(Stdin);
-        const child = std.process.spawn(p.io, .{
+        var child = std.process.spawn(p.io, .{
+            .start_suspended = is_windows,
             .argv = p.options.argv,
             .environ_map = p.options.environ_map,
             .cwd = if (p.options.cwd) |dir| .{ .path = dir } else .inherit,
@@ -496,12 +509,20 @@ pub const Process = struct {
             .stdout = .pipe,
             .stderr = .pipe,
             // A new process group, led by the server.
-            .pgid = 0,
+            .pgid = if (is_windows) null else 0,
         }) catch |err| {
             p.gpa.destroy(stdin);
             return err;
         };
         const pid = child.id.?;
+        if (comptime is_windows) {
+            p.windows_job = windows_process.Job.attach(&child) catch {
+                child.kill(p.io);
+                p.gpa.destroy(stdin);
+                return error.AccessDenied;
+            };
+            std.os.windows.CloseHandle(child.thread_handle);
+        }
         p.pid_lock.lockUncancelable(p.io);
         p.pid = pid;
         p.pid_lock.unlock(p.io);
@@ -535,7 +556,11 @@ pub const Process = struct {
         p.signal(.kill);
         p.pid_lock.lockUncancelable(p.io);
         if (p.pid) |pid| {
-            _ = std.c.waitpid(pid, null, 0);
+            if (comptime is_windows) {
+                windows_process.reap(pid);
+                if (p.windows_job) |job| job.close();
+                p.windows_job = null;
+            } else _ = std.c.waitpid(pid, null, 0);
             helper.tell(p.io, '-', pid);
         }
         p.pid = null;
@@ -549,6 +574,10 @@ pub const Process = struct {
         p.pid_lock.lockUncancelable(p.io);
         defer p.pid_lock.unlock(p.io);
         const pid = p.pid orelse return;
+        if (comptime is_windows) {
+            if (p.windows_job) |job| job.terminate() else windows_process.terminate(pid);
+            return;
+        }
         const sig: std.posix.SIG = switch (which) {
             .term => .TERM,
             .kill => .KILL,
@@ -684,6 +713,29 @@ pub const Process = struct {
     }
 
     fn watch(p: *Process, generation: core.Generation, pid: std.posix.pid_t) std.Io.Cancelable!void {
+        if (comptime is_windows) {
+            while (true) {
+                p.pid_lock.lockUncancelable(p.io);
+                if (p.pid == null) {
+                    p.pid_lock.unlock(p.io);
+                    return;
+                }
+                const code = windows_process.exitCode(pid);
+                if (code) |value| {
+                    p.exit = .{ .code = @truncate(value) };
+                    if (p.windows_job) |job| job.close();
+                    p.windows_job = null;
+                    windows_process.reap(pid);
+                    p.pid = null;
+                }
+                p.pid_lock.unlock(p.io);
+                if (code != null) {
+                    try p.awaitStderr(generation);
+                    return p.post(.{ .exited = generation });
+                }
+                try p.io.sleep(.fromMilliseconds(p.options.poll_ms), .awake);
+            }
+        }
         while (true) {
             p.pid_lock.lockUncancelable(p.io);
             var status: c_int = 0;
@@ -1235,7 +1287,7 @@ fn stubbornGroup() !std.process.Child {
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .pipe,
-        .pgid = 0,
+        .pgid = if (is_windows) null else 0,
     });
     var buffer: [16]u8 = undefined;
     var reader = child.stderr.?.reader(testing.io, &buffer);

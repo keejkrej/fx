@@ -309,7 +309,7 @@ fn sameStat(a: std.Io.File.Stat, b: std.Io.File.Stat) bool {
 }
 
 fn addStat(hash: *Sha256, stat: std.Io.File.Stat) void {
-    const values = [_]u128{ stat.inode, stat.nlink, stat.size, @backingInt(stat.kind), stat.permissions.toMode(), @bitCast(@as(i128, stat.mtime.nanoseconds)), @bitCast(@as(i128, stat.ctime.nanoseconds)) };
+    const values = [_]u128{ @as(u64, @bitCast(stat.inode)), stat.nlink, stat.size, @backingInt(stat.kind), stat.permissions.toMode(), @bitCast(@as(i128, stat.mtime.nanoseconds)), @bitCast(@as(i128, stat.ctime.nanoseconds)) };
     var bytes: [16]u8 = undefined;
     for (values) |value| {
         std.mem.writeInt(u128, &bytes, value, .little);

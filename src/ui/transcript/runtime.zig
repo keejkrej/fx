@@ -4875,7 +4875,7 @@ pub const TranscriptSlot = blk: {
 };
 
 pub const TranscriptRuntime = struct {
-    stdout_file: std.Io.File = std.Io.File.stdout(),
+    stdout_file: std.Io.File = if (@import("builtin").target.os.tag == .windows) .{ .handle = std.os.windows.INVALID_HANDLE_VALUE, .flags = .{ .nonblocking = false } } else std.Io.File.stdout(),
     test_frame_sink: if (@import("builtin").is_test) ?render_engine.terminal_diff.FrameSink else void = if (@import("builtin").is_test) null else {},
     sync_updates_enabled: bool = true,
     history_reset_uses_ris: bool = false,
@@ -5270,6 +5270,9 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn initBacking(self: *TranscriptRuntime, alloc: Allocator) !void {
+        if (comptime @import("builtin").target.os.tag == .windows) {
+            if (self.stdout_file.handle == std.os.windows.INVALID_HANDLE_VALUE) self.stdout_file = std.Io.File.stdout();
+        }
         return transcript_store.initBacking(self, alloc);
     }
 

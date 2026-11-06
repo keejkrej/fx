@@ -99,6 +99,7 @@ EXCLUDED_E2E_TESTS = (
     "tui-performance.test.ts",
     "tui-render-lab.test.ts",
     "tui-render-live-stress.test.ts",
+    "tui-windows-native.test.ts",
     "web-fetch-live.test.ts",
     "web-search-live.test.ts",
 )

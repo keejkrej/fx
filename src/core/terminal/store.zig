@@ -397,7 +397,7 @@ pub const Record = struct {
             return error.InvalidTerminalRecord;
         }
         if (self.takeover_owner_pid) |pid| {
-            _ = std.fmt.parseInt(std.posix.pid_t, pid, 10) catch
+            _ = std.fmt.parseInt(if (@import("builtin").target.os.tag == .windows) u32 else std.posix.pid_t, pid, 10) catch
                 return error.InvalidTerminalRecord;
             _ = process_identity.ProcessInstanceToken.parse(
                 self.takeover_owner_process_token.?,
@@ -1361,7 +1361,7 @@ fn parse_owner_identity(text: []const u8) ?OwnerProcess {
     const instance = parts.next() orelse return null;
     if (instance.len != owner_instance_hex_len) return null;
     const pid = parts.next() orelse return null;
-    _ = std.fmt.parseInt(std.posix.pid_t, pid, 10) catch return null;
+    _ = std.fmt.parseInt(if (@import("builtin").target.os.tag == .windows) u32 else std.posix.pid_t, pid, 10) catch return null;
     const token = process_identity.ProcessInstanceToken.parse(parts.rest()) catch
         return null;
     return .{ .pid = pid, .token = token };

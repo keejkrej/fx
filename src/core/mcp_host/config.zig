@@ -199,7 +199,11 @@ fn heldFor(c: *const McpServerConfig) ?Held {
 
 /// What a stdio server gets of fx's environment, as the MCP SDKs give it:
 /// these, then its config's `env`. Never fx's credentials or the rest.
-const inherited_names = [_][]const u8{ "HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER" };
+const inherited_names = [_][]const u8{ "HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER" } ++
+    (if (@import("builtin").target.os.tag == .windows)
+        [_][]const u8{ "APPDATA", "LOCALAPPDATA", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "USERNAME", "PROGRAMFILES", "PROGRAMW6432" }
+    else
+        [_][]const u8{});
 
 /// The engine's transport, or null when the server must be held back (and
 /// `s` says why).
@@ -396,12 +400,15 @@ test "a stdio server gets only the MCP SDKs' few variables of fx's, then its own
         .{ "SHELL", "() { :; }" },      .{ "TERM", "xterm" },          .{ "USER", "me" },
         .{ "AI_GATEWAY_API_KEY", "k" }, .{ "VERCEL_OIDC_TOKEN", "t" }, .{ "HTTPS_PROXY", "http://p" },
     }) |pair| try inherited.put(pair[0], pair[1]);
+    try inherited.put("SystemRoot", "C:\\Windows");
     var env = [_]mcp_contract.McpEnvVar{ envVar("GITHUB_TOKEN", "g"), envVar("TERM", "dumb") };
     const configs = [_]McpServerConfig{.{ .name = "gh", .command = "gh-mcp", .env = &env }};
     const r = try resolve(arena_state.allocator(), &configs, &inherited, "/Users/example/repo");
     const got = r.engine[0].transport.stdio.environ_map.?;
     // SHELL held a function, so it isn't passed; the config's TERM wins.
-    try testing.expectEqual(@as(usize, 6), got.count());
+    const windows = @import("builtin").target.os.tag == .windows;
+    try testing.expectEqual(@as(usize, if (windows) 7 else 6), got.count());
+    if (windows) try testing.expectEqualStrings("C:\\Windows", got.get("SYSTEMROOT").?);
     for ([_][2][]const u8{ .{ "HOME", "/Users/me" }, .{ "LOGNAME", "me" }, .{ "PATH", "/usr/bin" }, .{ "USER", "me" }, .{ "TERM", "dumb" }, .{ "GITHUB_TOKEN", "g" } }) |pair| {
         try testing.expectEqualStrings(pair[1], got.get(pair[0]).?);
     }

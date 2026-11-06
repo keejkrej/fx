@@ -546,6 +546,8 @@ pub const Session = struct {
     fn stage(session: *Session, source_blobs: ?storage.Dir) AppendError!Live {
         const env = session.env;
         const s = env.s;
+        const publication = try lockWindowsPublication(env);
+        defer if (publication) |file| s.closeFile(file);
         const tmp = s.ensureDir(env.root, ".tmp") catch |io_err| return storage.ioFault(io_err);
         defer s.closeDir(tmp);
         // An import that staged blobs already has its folder.
@@ -561,18 +563,31 @@ pub const Session = struct {
             }
         }
         var log = Log.create(s, dir, "log.jsonl", .{}) catch |io_err| return storage.ioFault(io_err);
-        errdefer log.close();
+        var log_open = true;
+        errdefer if (log_open) log.close();
         session.writeFramed(&log, 1, .header) catch |io_err| return storage.ioFault(io_err);
 
         const rename_first = env.isPlanted(.rename_before_fsync);
         if (rename_first) try session.publishRename(tmp);
         s.sync(log.file) catch |io_err| return storage.ioFault(io_err);
         session.observe(.publish_synced);
-        const lock = s.createFile(dir, "lock") catch |io_err| return storage.ioFault(io_err);
-        errdefer s.closeFile(lock);
+        var lock = s.createFile(dir, "lock") catch |io_err| return storage.ioFault(io_err);
+        var lock_open = true;
+        errdefer if (lock_open) s.closeFile(lock);
         if (!(s.tryLock(lock) catch |io_err| return storage.ioFault(io_err))) return error.Io;
         s.syncDir(dir) catch |io_err| return storage.ioFault(io_err);
-        if (!rename_first) try session.publishRename(tmp);
+        if (comptime @import("builtin").target.os.tag == .windows) {
+            s.closeFile(log.file);
+            log_open = false;
+            s.closeFile(lock);
+            lock_open = false;
+            if (!rename_first) try session.publishRename(tmp);
+            log.file = s.openFile(dir, "log.jsonl", .read_write) catch |err| return storage.ioFault(err);
+            log_open = true;
+            lock = s.openFile(dir, "lock", .read_write) catch |err| return storage.ioFault(err);
+            lock_open = true;
+            if (!(s.tryLock(lock) catch |err| return storage.ioFault(err))) return error.Io;
+        } else if (!rename_first) try session.publishRename(tmp);
         s.syncDir(env.root) catch |io_err| return storage.ioFault(io_err);
         session.observe(.published);
         return .{ .dir = dir, .log = log, .lock = lock };
@@ -1212,6 +1227,8 @@ const Parts = struct {
 /// everything acquired so far is released here.
 fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
     const s = env.s;
+    const publication = try lockWindowsPublication(env);
+    defer if (publication) |file| s.closeFile(file);
     const gpa = env.gpa;
     if (!schema.validId(options.id)) return error.NotFound;
     const dir = s.openDir(env.root, options.id) catch |err| return switch (err) {
@@ -1283,6 +1300,29 @@ fn acquireLock(env: *const Env, lock: storage.File, wait_ms: u64) OpenError!void
         io.sleep(.fromMilliseconds(@intCast(step_ms)), .awake) catch return error.Busy;
         waited += step_ms;
     }
+}
+
+// Windows cannot rename a directory with open descendant files. Keep this
+// root-level lease while publishing, resuming, or deleting a session so a
+// publisher can reopen its log and lock without exposing an unlocked session.
+fn lockWindowsPublication(env: *const Env) storage.IoFault!?storage.File {
+    // Windows requires closing descendant handles before renaming a folder.
+    // Exclude open and trash until its writer lock is held again:
+    // tests/tla/session_manager/WindowsPublication.tla PublicationExcludesOpen.
+    if (comptime @import("builtin").target.os.tag != .windows) return null;
+    const s = env.s;
+    const file = s.createFile(env.root, ".publish.lock") catch |err| switch (err) {
+        error.AlreadyExists => s.openFile(env.root, ".publish.lock", .read_write) catch |cause| return storage.ioFault(cause),
+        else => return storage.ioFault(err),
+    };
+    errdefer s.closeFile(file);
+    var attempts: usize = 0;
+    while (!(s.tryLock(file) catch |err| return storage.ioFault(err))) {
+        if (attempts >= 1000) return error.Io;
+        s.io.sleep(.fromMilliseconds(10), .awake) catch return error.Io;
+        attempts += 1;
+    }
+    return file;
 }
 
 const Loaded = struct {
@@ -1893,6 +1933,8 @@ pub fn childrenOf(env: *const Env, id_: []const u8) DeleteError![][]u8 {
 /// so a Busy child never leaves an orphan.
 pub fn trashSession(env: *const Env, id_: []const u8) DeleteError!void {
     const s = env.s;
+    const publication = try lockWindowsPublication(env);
+    defer if (publication) |file| s.closeFile(file);
     if (!schema.validId(id_)) return error.NotFound;
     const dir = s.openDir(env.root, id_) catch |err| return notFoundOr(err);
     var dir_open = true;
@@ -1901,13 +1943,18 @@ pub fn trashSession(env: *const Env, id_: []const u8) DeleteError!void {
         error.NotFound => null,
         else => |io_err| return storage.ioFault(io_err),
     };
-    defer if (lock) |l| s.closeFile(l);
+    var lock_open = true;
+    defer if (lock_open) if (lock) |l| s.closeFile(l);
     if (lock) |l| if (!(s.tryLock(l) catch |io_err| return storage.ioFault(io_err))) return error.Busy;
     const trash = s.ensureDir(env.root, ".trash") catch |io_err| return storage.ioFault(io_err);
     defer s.closeDir(trash);
     s.deleteTree(trash, id_) catch |io_err| return storage.ioFault(io_err);
     s.closeDir(dir);
     dir_open = false;
+    if (comptime @import("builtin").target.os.tag == .windows) {
+        if (lock) |l| s.closeFile(l);
+        lock_open = false;
+    }
     s.rename(env.root, id_, trash, id_) catch |err| return notFoundOr(err);
     s.syncDir(env.root) catch |io_err| return storage.ioFault(io_err);
     env.observeCatalog(id_, .trashed);
@@ -1937,6 +1984,8 @@ pub fn discardStaging(env: *const Env, id_: []const u8) storage.IoFault!void {
 /// Whether a session with this id is open for writing anywhere.
 pub fn isBusy(env: *const Env, id_: []const u8) DeleteError!bool {
     const s = env.s;
+    const publication = try lockWindowsPublication(env);
+    defer if (publication) |file| s.closeFile(file);
     if (!schema.validId(id_)) return error.NotFound;
     const dir = s.openDir(env.root, id_) catch |err| return notFoundOr(err);
     defer s.closeDir(dir);

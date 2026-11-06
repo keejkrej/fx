@@ -672,6 +672,7 @@ fn stopMcpStoreInput(
     watch: *KeychainWatch,
     pid: std.posix.pid_t,
 ) void {
+    if (comptime builtin.target.os.tag == .windows) return;
     watch.stop(select.io);
     std.posix.kill(pid, .KILL) catch |err| {
         debug_trace.logf("keychain", "store write kill failed err={s}", .{@errorName(err)});
@@ -692,6 +693,7 @@ fn abandonMcpStore(
     watch: *KeychainWatch,
     pid: std.posix.pid_t,
 ) void {
+    if (comptime builtin.target.os.tag == .windows) return;
     watch.stop(select.io);
     var reaped = false;
     while (select.cancel()) |item| switch (item) {

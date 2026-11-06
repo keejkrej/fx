@@ -1159,10 +1159,14 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
 
 /// A complete line from stdin, waiting at most 100 ms for one.
 fn readPasted(arena: Allocator, line: *std.ArrayList(u8)) !?[]const u8 {
-    var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
-    if (try std.posix.poll(&fds, 100) == 0) return null;
+    if (comptime @import("builtin").target.os.tag == .windows) {
+        if (!try @import("../shared/windows_platform.zig").poll(std.Io.File.stdin().handle, 100)) return null;
+    } else {
+        var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
+        if (try std.posix.poll(&fds, 100) == 0) return null;
+    }
     var buffer: [1024]u8 = undefined;
-    const n = std.posix.read(std.posix.STDIN_FILENO, &buffer) catch return null;
+    const n = (if (comptime @import("builtin").target.os.tag == .windows) @import("../shared/windows_platform.zig").readStdin(io_mod.getIo(), &buffer) else std.posix.read(std.posix.STDIN_FILENO, &buffer)) catch return null;
     if (n == 0) {
         // stdin closed: wait for the browser instead.
         io_mod.sleep(100 * std.time.ns_per_ms);

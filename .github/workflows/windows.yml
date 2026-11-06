@@ -1,0 +1,63 @@
+name: Windows
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Windows ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2022
+            target: x86_64-windows
+          - arch: arm64
+            runner: windows-11-arm
+            target: aarch64-windows
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      FX_SOUND: "0"
+      FX_AUTO_UPGRADE: "0"
+      FX_E2E_DISABLE_DOTENV: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.17.1"
+          use-cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          architecture: ${{ matrix.arch }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+      - name: Build native executable
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+      - name: Test storage, sockets, and console input
+        run: zig build test-windows -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+      - name: Install test dependencies
+        working-directory: tests/e2e
+        run: bun install
+      - name: Exercise native runtime and console
+        run: bun test ./tests/e2e/tui-windows-native.test.ts
+      - name: Package executable
+        shell: pwsh
+        run: Compress-Archive -LiteralPath zig-out/bin/fx.exe -DestinationPath zig-out/fx-windows-${{ matrix.arch }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fx-windows-${{ matrix.arch }}
+          path: zig-out/fx-windows-${{ matrix.arch }}.zip

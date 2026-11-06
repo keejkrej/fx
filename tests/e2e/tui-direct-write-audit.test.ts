@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 import { describe, expect, test } from "bun:test";
 
 const repoRoot = join(import.meta.dir, "..", "..");
@@ -60,7 +60,7 @@ function zigSources(root: string): Array<{ path: string; source: string }> {
         visit(path);
       } else if (entry.isFile() && entry.name.endsWith(".zig")) {
         files.push({
-          path: relative(repoRoot, path),
+          path: relative(repoRoot, path).split(sep).join("/"),
           source: readFileSync(path, "utf8"),
         });
       }

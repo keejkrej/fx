@@ -10,7 +10,11 @@
     "test:tui": "bun test tui-*.test.ts"
   },
   "devDependencies": {
+    "@xterm/headless": "6.0.0",
     "@types/bun": "latest",
     "typescript": "latest"
+  },
+  "optionalDependencies": {
+    "node-pty": "1.1.0"
   }
 }

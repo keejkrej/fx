@@ -81,7 +81,7 @@ pub fn build(b: *std.Build) void {
             // A sanitized build keeps its frame pointers and symbols, so race
             // reports show whole stacks and name the code.
             .omit_frame_pointer = !sanitize_thread,
-            .unwind_tables = .none,
+            .unwind_tables = if (target.result.os.tag == .windows) .sync else .none,
             .error_tracing = false,
             .strip = optimize != .debug and !sanitize_thread,
             .sanitize_thread = sanitize_thread,
@@ -94,6 +94,29 @@ pub fn build(b: *std.Build) void {
     session_manager.sanitize_thread = sanitize_thread;
 
     b.installArtifact(exe);
+
+    if (target.result.os.tag == .windows) {
+        const windows_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/core/shared/windows_io.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+            .test_runner = .{
+                .path = b.path("src/core/shared/windows_test_runner.zig"),
+                .mode = .simple,
+            },
+        });
+        const windows_test_step = b.step("test-windows", "Test Windows storage, sockets, and console input");
+        windows_test_step.dependOn(&b.addRunArtifact(windows_tests).step);
+        const input_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/core/shared/windows_console_input.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) });
+        windows_test_step.dependOn(&b.addRunArtifact(input_tests).step);
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

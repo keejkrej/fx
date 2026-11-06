@@ -3742,7 +3742,16 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
     }
 }
 
+pub const std_options_FilePermissions = if (builtin.target.os.tag == .windows) @import("core/shared/windows_platform.zig").Permissions else null;
+
 pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) callconv(.c) c_int {
+    if (comptime builtin.target.os.tag == .windows) {
+        var arena = std.heap.ArenaAllocator.init(processAllocator());
+        defer arena.deinit();
+        const args = @import("core/shared/windows_startup.zig").Arguments.init(arena.allocator()) catch return 1;
+        mainC(@intCast(args.argv.len), @ptrCast(@constCast(args.argv.ptr)), @ptrCast(@constCast(args.env.ptr))) catch return 1;
+        return 0;
+    }
     io_mod.reserveClosedStandardStreams();
     mainC(c_argc, c_argv, c_envp) catch return 1;
     return 0;
@@ -3804,7 +3813,8 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
 /// fx before it reads or writes anything there.
 fn useFxHomeFromEnv(raw_env: RawEnviron) !void {
     const value = rawEnvValue(raw_env, "FX_HOME") orelse return;
-    profile_paths.useFxHome(value, rawEnvValue(raw_env, "HOME")) catch |err| {
+    const home = rawEnvValue(raw_env, "HOME") orelse if (builtin.target.os.tag == .windows) rawEnvValue(raw_env, "USERPROFILE") else null;
+    profile_paths.useFxHome(value, home) catch |err| {
         try writeStderrFast(switch (err) {
             error.FxHomeNotAbsolute => "fx: FX_HOME must be an absolute path\n",
             error.FxHomeIsRoot => "fx: FX_HOME can't be the root folder\n",
@@ -3825,6 +3835,10 @@ fn useFxHomeFromEnv(raw_env: RawEnviron) !void {
 /// nothing yet. Asking for `path/` makes the system resolve it as a folder.
 /// This runs before fx's I/O is set up, so it calls libc.
 fn namesNonFolderRaw(path: []const u8) bool {
+    if (comptime builtin.target.os.tag == .windows) {
+        const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{}) catch return false;
+        return stat.kind != .directory;
+    }
     var buffer: [std.Io.Dir.max_path_bytes + 2]u8 = undefined;
     const trimmed = std.mem.trimEnd(u8, path, "/");
     if (trimmed.len == 0 or trimmed.len + 2 > buffer.len) return false;
@@ -3862,6 +3876,10 @@ test "FX_HOME is refused only when it is a file or a path through one" {
 /// fx's I/O is set up, so it calls libc; a folder that already exists, or
 /// one fx can't create, is left for the first use to report.
 fn createFolderPathRaw(path: []const u8) void {
+    if (comptime builtin.target.os.tag == .windows) {
+        std.Io.Dir.cwd().createDirPath(io_mod.getIo(), path) catch {};
+        return;
+    }
     var buffer: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
     if (path.len == 0 or path.len >= buffer.len) return;
     var end: usize = 1;
@@ -3945,6 +3963,7 @@ fn rawArgs(c_argc: c_int, c_argv: [*][*:0]c_char) []const [*:0]const u8 {
 }
 
 fn argsFromRaw(raw_args: []const [*:0]const u8) std.process.Args {
+    if (comptime builtin.target.os.tag == .windows) return .{ .vector = std.os.windows.peb().ProcessParameters.CommandLine.Buffer.?[0 .. std.os.windows.peb().ProcessParameters.CommandLine.Length / 2] };
     return .{ .vector = raw_args };
 }
 
@@ -3962,6 +3981,7 @@ fn processIoOptions(process_args: std.process.Args, env_block: std.process.Envir
 }
 
 fn environBlockFromRaw(raw_env: RawEnviron) std.process.Environ.Block {
+    if (comptime builtin.target.os.tag == .windows) return .global;
     var count: usize = 0;
     while (raw_env[count] != null) : (count += 1) {}
     return .{ .slice = raw_env[0..count :null] };
@@ -3988,7 +4008,7 @@ fn rawEnvValue(raw_env: RawEnviron, comptime key: []const u8) ?[]const u8 {
     while (raw_env[i]) |entry_z| : (i += 1) {
         const entry = std.mem.sliceTo(entry_z, 0);
         if (entry.len <= key.len or entry[key.len] != '=') continue;
-        if (std.mem.eql(u8, entry[0..key.len], key)) return entry[key.len + 1 ..];
+        if (if (builtin.target.os.tag == .windows) std.ascii.eqlIgnoreCase(entry[0..key.len], key) else std.mem.eql(u8, entry[0..key.len], key)) return entry[key.len + 1 ..];
     }
     return null;
 }
@@ -4541,7 +4561,7 @@ fn handleSigWinchWeb() callconv(.c) void {
     resize_interlock.noteResizeSignal();
 }
 
-const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm)
+const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm or builtin.target.os.tag == .windows)
     handleSigWinchWeb
 else
     handleSigWinchNative;
